@@ -1,0 +1,94 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════════════════════
+// TXInvestor — RS Rating Panel
+//
+// Displays a Mansfield-style Relative Strength line in a separate pane.
+// Approximates IBD's RS Rating on a 1-99 scale by ranking the stock's
+// 12-month price performance percentile vs the benchmark.
+//
+// Add this as a SEPARATE indicator (not overlay) beneath the main chart.
+// ══════════════════════════════════════════════════════════════════════════════
+indicator("TXInvestor RS Rating", shorttitle="TXInv RS", overlay=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+bmSym   = input.symbol("SPY",  "Benchmark Symbol")
+rsLen   = input.int(252,       "RS Lookback (bars ≈ 12 months)", minval=20)
+smoothL = input.int(5,         "RS Smoothing Period",            minval=1)
+showRS  = input.bool(true,     "Show RS Rating Line")
+showBG  = input.bool(true,     "Show Overbought / Oversold Zones")
+rsHigh  = input.int(80,        "Strong RS Threshold",  minval=51, maxval=99)
+rsLow   = input.int(40,        "Weak RS Threshold",    minval=1,  maxval=49)
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+C_STRONG = color.new(#1B5E20, 75)
+C_WEAK   = color.new(#B71C1C, 75)
+C_LINE   = color.new(color.black, 0)
+
+// ── Relative Strength Calculation ───────────────────────────────────────────
+// Raw Mansfield RS: how much the stock has outperformed the benchmark
+// RS = (stock 12m return) - (benchmark 12m return)
+// Expressed as a ratio (> 1 = outperforming)
+
+benchClose  = request.security(bmSym, timeframe.period, close)
+benchPast   = nz(request.security(bmSym, timeframe.period, close[rsLen]), benchClose)
+stockPast   = nz(close[rsLen], close)
+
+stockPerf   = close / stockPast           // e.g. 1.30 = +30%
+benchPerf   = benchClose / benchPast      // e.g. 1.10 = +10%
+
+// Mansfield RS ratio (> 1 = outperforming benchmark)
+mansRS_raw  = stockPerf / math.max(benchPerf, 0.001)
+
+// Convert to a 1-99 scale using a rolling percentile approximation.
+// We track rolling min/max of mansRS_raw over a lookback window.
+// A true IBD RS Rating would rank against thousands of stocks; this
+// approximates using the stock's own historical RS range.
+rollLen     = input.int(504, "Percentile Window (bars ≈ 2 years)", minval=100, group="Advanced")
+
+rsMax       = ta.highest(mansRS_raw, rollLen)
+rsMin       = ta.lowest(mansRS_raw,  rollLen)
+rsRange     = rsMax - rsMin
+
+// Normalized 1-99 (avoid division by zero)
+rsNorm      = rsRange > 0.001 ?
+              math.round(1 + (mansRS_raw - rsMin) / rsRange * 98) : 50
+rsNorm      := math.min(math.max(rsNorm, 1), 99)
+
+// Smooth the rating slightly
+rsSmooth    = ta.ema(rsNorm, smoothL)
+
+// ── Alternative: raw Mansfield RS displayed as-is (not normalized) ──────────
+// Uncomment the line below and comment out rsNorm if you prefer the raw ratio
+// rsSmooth = ta.ema(mansRS_raw * 50, smoothL)  // scaled to be centered around 50
+
+// ── Plots ────────────────────────────────────────────────────────────────────
+// Background zones
+bgcolor(showBG and rsSmooth >= rsHigh ? C_STRONG : na, title="Strong RS Zone")
+bgcolor(showBG and rsSmooth <= rsLow  ? C_WEAK   : na, title="Weak RS Zone")
+
+// Threshold lines
+hline(rsHigh, "Strong RS",  color=color.new(color.green, 50), linestyle=hline.style_dashed, linewidth=1)
+hline(rsLow,  "Weak RS",    color=color.new(color.red,   50), linestyle=hline.style_dashed, linewidth=1)
+hline(50,     "Neutral",    color=color.new(color.gray,  60), linestyle=hline.style_dotted,  linewidth=1)
+
+// RS line
+lineColor = rsSmooth >= rsHigh ? color.new(color.green, 0) :
+            rsSmooth <= rsLow  ? color.new(color.red,   0) :
+            C_LINE
+
+plot(showRS ? rsSmooth : na, "RS Rating", color=lineColor, linewidth=2)
+
+// RS Rating label on last bar
+if barstate.islast
+    label.new(bar_index, rsSmooth,
+              text="RS Rating\n" + str.tostring(math.round(rsSmooth)),
+              style=label.style_label_left,
+              color=color.new(color.black, 10),
+              textcolor=color.white,
+              size=size.small)
+
+// ── Alert Conditions ─────────────────────────────────────────────────────────
+alertcondition(ta.crossover(rsSmooth,  rsHigh), "RS Enters Strong Zone", "{{ticker}} RS Rating crossed above " + str.tostring(rsHigh))
+alertcondition(ta.crossunder(rsSmooth, rsLow),  "RS Enters Weak Zone",   "{{ticker}} RS Rating crossed below " + str.tostring(rsLow))
+alertcondition(ta.crossover(rsSmooth,  50),     "RS Crosses 50 Up",      "{{ticker}} RS Rating crossed above 50 (outperforming benchmark)")
+alertcondition(ta.crossunder(rsSmooth, 50),     "RS Crosses 50 Down",    "{{ticker}} RS Rating crossed below 50 (underperforming benchmark)")

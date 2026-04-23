@@ -1,0 +1,433 @@
+//@version=5
+indicator("TXInvestor Dashboard", shorttitle="TXInv", overlay=true, max_lines_count=20, max_labels_count=5)
+
+// ============================================================
+// INPUTS
+// ============================================================
+var GRP1 = "Stage Analysis"
+wmaLen   = input.int(30,  "WMA Period",          minval=5,  group=GRP1)
+atrLen   = input.int(14,  "ATR Period",           minval=1,  group=GRP1)
+slopeLen = input.int(5,   "Slope Lookback (bars)",minval=1,  group=GRP1)
+
+var GRP2 = "Moving Averages"
+ema1Len  = input.int(10,  "Fast EMA",             minval=1,  group=GRP2)
+ema2Len  = input.int(20,  "Medium EMA",           minval=1,  group=GRP2)
+sma3Len  = input.int(50,  "Mid SMA",              minval=1,  group=GRP2)
+sma4Len  = input.int(200, "Slow SMA",             minval=1,  group=GRP2)
+
+var GRP3 = "Volume"
+volLen   = input.int(50,  "Volume Avg Period",    minval=1,  group=GRP3)
+
+var GRP4 = "Relative Strength"
+bmSym    = input.symbol("SPY", "Benchmark",                  group=GRP4)
+
+var GRP5 = "Display"
+showTable = input.bool(true,        "Show Dashboard Table",  group=GRP5)
+showBG    = input.bool(true,        "Show Stage Background", group=GRP5)
+showStops = input.bool(true,        "Show Stop Loss Line",   group=GRP5)
+showMAs   = input.bool(true,        "Show Moving Averages",  group=GRP5)
+showWMA   = input.bool(true,        "Show WMA30",            group=GRP5)
+tblPos    = input.string("top_left", "Table Position", options=["top_left","top_right","middle_left","middle_right","bottom_left","bottom_right"], group=GRP5)
+
+// ============================================================
+// COLORS
+// ============================================================
+C_BUY  = #1B5E20
+C_SELL = #B71C1C
+C_WARN = #E65100
+C_NEUT = #546E7A
+C_HEAD = #1A237E
+C_ROW  = color.new(color.black, 25)
+C_TXT  = color.white
+BG_S1  = color.new(#FFEB3B, 88)
+BG_S2  = color.new(#4CAF50, 90)
+BG_S3  = color.new(#FF9800, 88)
+BG_S4  = color.new(#F44336, 84)
+
+// ============================================================
+// HELPER FUNCTIONS  — must live at global scope
+// ============================================================
+f_stage(c, w, slope) =>
+    int r = 1
+    if c > w and slope > 0
+        r := 2
+    else if c < w and slope < 0
+        r := 4
+    else if c >= w
+        r := 3
+    r
+
+f_stageStr(s) =>
+    string r = "S1"
+    if s == 2
+        r := "S2"
+    else if s == 3
+        r := "S3"
+    else if s == 4
+        r := "S4"
+    r
+
+f_stageCol(s) =>
+    color r = color.new(#827717, 10)
+    if s == 2
+        r := C_BUY
+    else if s == 3
+        r := C_WARN
+    else if s == 4
+        r := C_SELL
+    r
+
+f_rating(pct) =>
+    string r = "STR SELL"
+    if pct >= 70
+        r := "STR BUY"
+    else if pct >= 55
+        r := "BUY"
+    else if pct >= 45
+        r := "NEUTRAL"
+    else if pct >= 30
+        r := "SELL"
+    r
+
+f_ratingCol(r) =>
+    color c = C_SELL
+    if r == "STR BUY"
+        c := C_BUY
+    else if r == "BUY"
+        c := #2E7D32
+    else if r == "NEUTRAL"
+        c := C_NEUT
+    else if r == "SELL"
+        c := C_WARN
+    c
+
+f_accumCol(a) =>
+    color c = C_SELL
+    if a == "A"
+        c := C_BUY
+    else if a == "B"
+        c := #2E7D32
+    else if a == "C"
+        c := C_WARN
+    c
+
+f_ynCol(b)   => b ? #2E7D32 : C_NEUT
+f_bbCol(b)   => b ? C_BUY   : C_SELL
+f_distCol(d) => math.abs(d) > 4.0 ? C_SELL : math.abs(d) > 2.0 ? C_WARN : #2E7D32
+
+f_tpos(s) =>
+    pos = position.top_left
+    if s == "top_right"
+        pos := position.top_right
+    else if s == "middle_left"
+        pos := position.middle_left
+    else if s == "middle_right"
+        pos := position.middle_right
+    else if s == "bottom_left"
+        pos := position.bottom_left
+    else if s == "bottom_right"
+        pos := position.bottom_right
+    pos
+
+// Table cell helpers
+tc(id, r, c, txt, bg, fg) => table.cell(id, c, r, txt, bgcolor=bg, text_color=fg, text_size=size.small, text_halign=text.align_center)
+
+th(id, r, lbl) =>
+    table.cell(id, 0, r, lbl,      bgcolor=C_HEAD, text_color=C_TXT, text_size=size.small, text_halign=text.align_left)
+    table.cell(id, 1, r, "Daily",  bgcolor=C_HEAD, text_color=C_TXT, text_size=size.small, text_halign=text.align_center)
+    table.cell(id, 2, r, "Weekly", bgcolor=C_HEAD, text_color=C_TXT, text_size=size.small, text_halign=text.align_center)
+
+// ============================================================
+// DAILY CALCULATIONS
+// ============================================================
+wma30  = ta.wma(close, wmaLen)
+ema1   = ta.ema(close, ema1Len)
+ema2   = ta.ema(close, ema2Len)
+sma3   = ta.sma(close, sma3Len)
+sma4   = ta.sma(close, sma4Len)
+atr14  = ta.atr(atrLen)
+volAvg = ta.sma(volume, volLen)
+
+wmaSlope  = wma30 - wma30[slopeLen]
+stage     = f_stage(close, wma30, wmaSlope)
+distATR   = (close - wma30) / atr14
+volRatio  = volume / volAvg
+wmaRising = wma30 > wma30[1]
+
+// S2 bar counter
+var int s2Bars = 0
+s2Bars := stage == 2 ? s2Bars + 1 : 0
+
+// Momentum
+wmaAccel  = (wma30 - wma30[1]) > (wma30[1] - wma30[2])
+momLabel  = wmaSlope > 0 ? (wmaAccel ? "Accelerating" : "Decelerating") : (wmaAccel ? "Decelerating" : "Accelerating")
+
+// PowerTrend
+powerTrend = ema1 > ema2 and ema2 > sma3 and ema1 > ema1[1] and ema2 > ema2[1] and sma3 > sma3[1]
+
+// MA alignment
+maAlign = close > ema1 and ema1 > ema2 and ema2 > sma3 and sma3 > sma4
+
+// Volume confirmation
+volConfS2 = stage == 2 and volRatio >= 1.5
+
+// Stop loss
+stopPrice = math.round(ta.lowest(low, 20) - atr14 * 0.5, 2)
+
+// M20
+m20Bull = close > ema2 and ema2 > ema2[1]
+
+// Benchmark
+bmClose   = request.security(bmSym, timeframe.period, close)
+bmClose1y = request.security(bmSym, timeframe.period, close[252])
+mansRS    = nz(((close / nz(close[252], close)) - (bmClose / nz(bmClose1y, bmClose))) * 100, 0.0)
+
+// MA score
+maScore    = (close > sma4 ? 1 : 0) + (close > sma3 ? 1 : 0) + (close > ema2 ? 1 : 0) + (close > ema1 ? 1 : 0) + (ema1 > ema2 ? 1 : 0) + (ema2 > sma3 ? 1 : 0) + (sma3 > sma4 ? 1 : 0)
+maScorePct = maScore / 7.0 * 100
+
+// Oscillator score
+rsi14        = ta.rsi(close, 14)
+[macdL, sigL, histL] = ta.macd(close, 12, 26, 9)
+stochK       = ta.stoch(close, high, low, 14)
+stochD       = ta.sma(stochK, 3)
+oscScore     = (rsi14 > 50 ? 1 : 0) + (rsi14 > 60 ? 1 : 0) + (macdL > sigL ? 1 : 0) + (histL > 0 ? 1 : 0) + (histL > histL[1] ? 1 : 0) + (stochK > 50 ? 1 : 0) + (stochK > stochD ? 1 : 0)
+oscScorePct  = oscScore / 7.0 * 100
+
+techLabel = f_rating((maScorePct + oscScorePct) / 2)
+maLabel   = f_rating(maScorePct)
+oscLabel  = f_rating(oscScorePct)
+
+// Accumulation (Chaikin Money Flow)
+cmfMult = (high != low) ? ((close - low) - (high - close)) / (high - low) : 0.0
+cmf20   = ta.sma(cmfMult * volume, 20) / math.max(ta.sma(volume, 20), 1)
+accumA  = cmf20 >= 0.05 ? "A" : cmf20 >= 0.0 ? "B" : cmf20 >= -0.05 ? "C" : "D"
+
+// TI65 & MDT
+ti65   = nz((close / nz(close[65], close)) / math.max(bmClose / nz(bmClose[65], bmClose), 0.001), 1.0)
+mdt    = nz((close - close[20]) / math.max(math.abs(close[20] - close[40]), 0.001), 1.0)
+mdt   := math.min(math.max(mdt, -5.0), 5.0)
+
+// ML Score & B3
+mlScore    = (stage == 2 ? 1 : 0) + (volRatio > 1.2 ? 1 : 0) + (maAlign ? 1 : 0) + (rsi14 > 50 ? 1 : 0) + (mansRS > 0 ? 1 : 0)
+close52wHi = ta.highest(close, 252)
+b3Score    = (close >= close52wHi * 0.98 ? 3 : 0) + (volRatio > 2.0 ? 3 : 0) + (stage == 2 ? 2 : 0) + (maAlign ? 2 : 0)
+b3Signal   = b3Score >= 7
+aPlusSetup = stage == 2 and maAlign and volRatio > 1.5 and rsi14 > 60 and mansRS > 10
+
+// ============================================================
+// WEEKLY CALCULATIONS
+// ============================================================
+wma30_w   = request.security(syminfo.tickerid, "W", ta.wma(close, wmaLen))
+wmaSlp_w  = request.security(syminfo.tickerid, "W", ta.wma(close, wmaLen) - ta.wma(close, wmaLen)[slopeLen])
+close_w   = request.security(syminfo.tickerid, "W", close)
+atr14_w   = request.security(syminfo.tickerid, "W", ta.atr(atrLen))
+vol_w     = request.security(syminfo.tickerid, "W", volume)
+volAvg_w  = request.security(syminfo.tickerid, "W", ta.sma(volume, volLen))
+ema1_w    = request.security(syminfo.tickerid, "W", ta.ema(close, ema1Len))
+ema2_w    = request.security(syminfo.tickerid, "W", ta.ema(close, ema2Len))
+sma3_w    = request.security(syminfo.tickerid, "W", ta.sma(close, sma3Len))
+sma4_w    = request.security(syminfo.tickerid, "W", ta.sma(close, sma4Len))
+rsi14_w   = request.security(syminfo.tickerid, "W", ta.rsi(close, 14))
+stochKw   = request.security(syminfo.tickerid, "W", ta.stoch(close, high, low, 14))
+stochDw   = request.security(syminfo.tickerid, "W", ta.sma(ta.stoch(close, high, low, 14), 3))
+[macdLw, sigLw, histLw] = request.security(syminfo.tickerid, "W", ta.macd(close, 12, 26, 9))
+swLow20_w = request.security(syminfo.tickerid, "W", ta.lowest(low, 20))
+close_w52 = request.security(syminfo.tickerid, "W", close[52])
+bmClose_w = request.security(bmSym, "W", close)
+bmCls_w52 = request.security(bmSym, "W", close[52])
+wmaRsng_w = request.security(syminfo.tickerid, "W", ta.wma(close, wmaLen) > ta.wma(close, wmaLen)[1])
+cmfMw     = request.security(syminfo.tickerid, "W", ta.sma(((high != low ? ((close - low) - (high - close)) / (high - low) : 0.0) * volume), 20) / math.max(ta.sma(volume, 20), 1))
+hi52_w    = request.security(syminfo.tickerid, "W", ta.highest(close, 52))
+
+stage_w   = f_stage(close_w, wma30_w, wmaSlp_w)
+distATR_w = (close_w - wma30_w) / math.max(atr14_w, 0.001)
+volRatio_w = vol_w / math.max(volAvg_w, 1)
+stopPrc_w  = math.round(swLow20_w - atr14_w * 0.5, 2)
+maAlign_w  = close_w > ema1_w and ema1_w > ema2_w and ema2_w > sma3_w and sma3_w > sma4_w
+volConfS2w = stage_w == 2 and volRatio_w >= 1.5
+m20Bull_w  = close_w > ema2_w
+mansRS_w   = nz(((close_w / nz(close_w52, close_w)) - (bmClose_w / nz(bmCls_w52, bmClose_w))) * 100, 0.0)
+
+wmaAcclw   = request.security(syminfo.tickerid, "W", (ta.wma(close, wmaLen) - ta.wma(close, wmaLen)[1]) > (ta.wma(close, wmaLen)[1] - ta.wma(close, wmaLen)[2]))
+momLbl_w   = wmaSlp_w > 0 ? (wmaAcclw ? "Accelerating" : "Decelerating") : (wmaAcclw ? "Decelerating" : "Accelerating")
+powerTnd_w = request.security(syminfo.tickerid, "W", ta.ema(close, 10) > ta.ema(close, 20) and ta.ema(close, 20) > ta.sma(close, 50) and ta.ema(close, 10) > ta.ema(close, 10)[1] and ta.ema(close, 20) > ta.ema(close, 20)[1])
+
+maScr_w    = (close_w > sma4_w ? 1 : 0) + (close_w > sma3_w ? 1 : 0) + (close_w > ema2_w ? 1 : 0) + (close_w > ema1_w ? 1 : 0) + (ema1_w > ema2_w ? 1 : 0) + (ema2_w > sma3_w ? 1 : 0) + (sma3_w > sma4_w ? 1 : 0)
+oscScr_w   = (rsi14_w > 50 ? 1 : 0) + (rsi14_w > 60 ? 1 : 0) + (macdLw > sigLw ? 1 : 0) + (histLw > 0 ? 1 : 0) + (histLw > histLw[1] ? 1 : 0) + (stochKw > 50 ? 1 : 0) + (stochKw > stochDw ? 1 : 0)
+techLbl_w  = f_rating((maScr_w / 7.0 * 100 + oscScr_w / 7.0 * 100) / 2)
+maLbl_w    = f_rating(maScr_w / 7.0 * 100)
+oscLbl_w   = f_rating(oscScr_w / 7.0 * 100)
+accumW     = cmfMw >= 0.05 ? "A" : cmfMw >= 0.0 ? "B" : cmfMw >= -0.05 ? "C" : "D"
+mlScore_w  = (stage_w == 2 ? 1 : 0) + (volRatio_w > 1.2 ? 1 : 0) + (maAlign_w ? 1 : 0) + (rsi14_w > 50 ? 1 : 0) + (mansRS_w > 0 ? 1 : 0)
+b3Scr_w    = (close_w >= hi52_w * 0.98 ? 3 : 0) + (volRatio_w > 2.0 ? 3 : 0) + (stage_w == 2 ? 2 : 0) + (maAlign_w ? 2 : 0)
+b3Sig_w    = b3Scr_w >= 7
+aPlusSu_w  = stage_w == 2 and maAlign_w and volRatio_w > 1.5 and rsi14_w > 60 and mansRS_w > 10
+
+// TI65 & MDT weekly (simplified)
+ti65_w = nz((close_w / nz(request.security(syminfo.tickerid, "W", close[13]), close_w)) / math.max(bmClose_w / nz(request.security(bmSym, "W", close[13]), bmClose_w), 0.001), 1.0)
+mdt_w  = 1.0  // simplified placeholder
+
+// ============================================================
+// ACTION LABEL
+// ============================================================
+var string actionText = "MIXED"
+var color  actionCol  = C_NEUT
+
+if stage == 2 and stage_w == 2
+    actionText := "STAGE 2 - BUY"
+    actionCol  := C_BUY
+else if stage == 1 and stage_w == 2
+    actionText := "WATCH - STAGE 1"
+    actionCol  := C_NEUT
+else if stage == 4 or stage_w == 4
+    actionText := "STAGE 4 - AVOID"
+    actionCol  := C_SELL
+else if stage == 3 or stage_w == 3
+    actionText := "STAGE 3 - SELL"
+    actionCol  := C_WARN
+else if stage == 1
+    actionText := "STAGE 1 - WATCH"
+    actionCol  := C_NEUT
+else
+    actionText := "MIXED - CAUTION"
+    actionCol  := C_NEUT
+
+// ============================================================
+// CHART OVERLAYS
+// ============================================================
+plot(showWMA ? wma30 : na, "WMA 30", color=color.red, linewidth=2)
+plot(showMAs ? ema2  : na, "EMA 20", color=color.blue,   linewidth=1)
+plot(showMAs ? sma3  : na, "SMA 50", color=color.orange, linewidth=1)
+plot(showMAs ? sma4  : na, "SMA 200",color=color.purple, linewidth=1)
+plot(showStops ? stopPrice : na, "Daily Stop", color=color.new(color.orange, 20), style=plot.style_circles, linewidth=1)
+
+// Stage background
+var color stageBg = na
+if showBG
+    if stage == 1
+        stageBg := BG_S1
+    else if stage == 2
+        stageBg := BG_S2
+    else if stage == 3
+        stageBg := BG_S3
+    else
+        stageBg := BG_S4
+else
+    stageBg := na
+bgcolor(stageBg, title="Stage Background")
+
+// Signal markers
+s2Entry = stage == 2 and stage[1] != 2
+s4Entry = stage == 4 and stage[1] != 4
+plotshape(s2Entry, title="S2 Entry",   style=shape.triangleup,   location=location.belowbar, color=C_BUY,  size=size.small)
+plotshape(s4Entry, title="S4 Warning", style=shape.triangledown, location=location.abovebar, color=C_SELL, size=size.small)
+plotshape(b3Signal and not b3Signal[1], title="B3 Signal", style=shape.labelup, location=location.belowbar, color=color.new(C_BUY, 20), text="B3", textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// DASHBOARD TABLE
+// ============================================================
+var table tbl = na
+
+if showTable and barstate.islast
+    tbl := table.new(f_tpos(tblPos), 3, 31, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 55), frame_width=2, frame_color=color.new(color.gray, 40))
+
+    th(tbl, 0, "TREND & STAGE")
+    tc(tbl, 1, 0, "STAGE",        C_ROW, C_TXT)
+    tc(tbl, 1, 1, f_stageStr(stage),   f_stageCol(stage),   C_TXT)
+    tc(tbl, 1, 2, f_stageStr(stage_w), f_stageCol(stage_w), C_TXT)
+    tc(tbl, 2, 0, "S2 Duration",  C_ROW, C_TXT)
+    tc(tbl, 2, 1, str.tostring(s2Bars) + " bars", color.new(color.gray, 60), C_TXT)
+    tc(tbl, 2, 2, "0 bars",       color.new(color.gray, 60), C_TXT)
+    tc(tbl, 3, 0, "30WMA Trend",  C_ROW, C_TXT)
+    tc(tbl, 3, 1, wmaRising ? "Rising" : "Falling", wmaRising ? C_BUY : C_SELL, C_TXT)
+    tc(tbl, 3, 2, wmaRsng_w ? "Rising" : "Falling", wmaRsng_w ? C_BUY : C_SELL, C_TXT)
+    momClr  = str.contains(momLabel, "Accel") ? #2E7D32 : C_WARN
+    momClrW = str.contains(momLbl_w, "Accel") ? #2E7D32 : C_WARN
+    tc(tbl, 4, 0, "Momentum",     C_ROW, C_TXT)
+    tc(tbl, 4, 1, momLabel,       momClr,  C_TXT)
+    tc(tbl, 4, 2, momLbl_w,       momClrW, C_TXT)
+    tc(tbl, 5, 0, "PowerTrend",   C_ROW, C_TXT)
+    tc(tbl, 5, 1, powerTrend  ? "ON" : "OFF", f_ynCol(powerTrend),  C_TXT)
+    tc(tbl, 5, 2, powerTnd_w  ? "ON" : "OFF", f_ynCol(powerTnd_w),  C_TXT)
+
+    th(tbl, 6, "EXTENSION (x ATR14d)")
+    tc(tbl, 7, 0, "Dist from MA", C_ROW, C_TXT)
+    tc(tbl, 7, 1, str.tostring(math.round(distATR,   2)) + "x", f_distCol(distATR),   C_TXT)
+    tc(tbl, 7, 2, str.tostring(math.round(distATR_w, 2)) + "x", f_distCol(distATR_w), C_TXT)
+
+    th(tbl, 8, "CONFIRMATION")
+    vClr  = volRatio   > 2.0 ? C_BUY : volRatio   > 1.5 ? #2E7D32 : color.new(color.gray, 50)
+    vClrW = volRatio_w > 2.0 ? C_BUY : volRatio_w > 1.5 ? #2E7D32 : color.new(color.gray, 50)
+    tc(tbl, 9,  0, "Vol Ratio",           C_ROW, C_TXT)
+    tc(tbl, 9,  1, str.tostring(math.round(volRatio,   2)) + "x", vClr,  C_TXT)
+    tc(tbl, 9,  2, str.tostring(math.round(volRatio_w, 2)) + "x", vClrW, C_TXT)
+    tc(tbl, 10, 0, "Vol Confirmed (S2)",  C_ROW, C_TXT)
+    tc(tbl, 10, 1, volConfS2  ? "YES" : "NO", f_ynCol(volConfS2),  C_TXT)
+    tc(tbl, 10, 2, volConfS2w ? "YES" : "NO", f_ynCol(volConfS2w), C_TXT)
+
+    th(tbl, 11, "INITIAL STOPLOSS")
+    tc(tbl, 12, 0, "Stop Price ($)", C_ROW, C_TXT)
+    tc(tbl, 12, 1, str.tostring(stopPrice), color.new(color.orange, 20), C_TXT)
+    tc(tbl, 12, 2, str.tostring(stopPrc_w), color.new(color.orange, 20), C_TXT)
+
+    table.cell(tbl, 0, 13, "ACTION",   bgcolor=actionCol, text_color=C_TXT, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 13, actionText, bgcolor=actionCol, text_color=C_TXT, text_size=size.small, text_halign=text.align_center)
+    table.cell(tbl, 2, 13, "",         bgcolor=actionCol, text_color=C_TXT, text_size=size.small)
+    table.merge_cells(tbl, 1, 13, 2, 13)
+
+    th(tbl, 14, "MULTI-TF RATINGS")
+    tc(tbl, 15, 0, "Tech Rating",      C_ROW, C_TXT)
+    tc(tbl, 15, 1, techLabel,  f_ratingCol(techLabel),  C_TXT)
+    tc(tbl, 15, 2, techLbl_w,  f_ratingCol(techLbl_w),  C_TXT)
+    tc(tbl, 16, 0, "Oscillator Rating",C_ROW, C_TXT)
+    tc(tbl, 16, 1, oscLabel,   f_ratingCol(oscLabel),   C_TXT)
+    tc(tbl, 16, 2, oscLbl_w,   f_ratingCol(oscLbl_w),   C_TXT)
+    tc(tbl, 17, 0, "MA Rating",        C_ROW, C_TXT)
+    tc(tbl, 17, 1, maLabel,    f_ratingCol(maLabel),    C_TXT)
+    tc(tbl, 17, 2, maLbl_w,    f_ratingCol(maLbl_w),    C_TXT)
+    tc(tbl, 18, 0, "MA Align",         C_ROW, C_TXT)
+    tc(tbl, 18, 1, maAlign   ? "YES" : "NO", f_ynCol(maAlign),   C_TXT)
+    tc(tbl, 18, 2, maAlign_w ? "YES" : "NO", f_ynCol(maAlign_w), C_TXT)
+    tc(tbl, 19, 0, "Mansfield RS",     C_ROW, C_TXT)
+    tc(tbl, 19, 1, str.tostring(math.round(mansRS,   1)), mansRS   > 0 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 19, 2, str.tostring(math.round(mansRS_w, 1)), mansRS_w > 0 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 20, 0, "TI65",             C_ROW, C_TXT)
+    tc(tbl, 20, 1, str.tostring(math.round(ti65,   2)), ti65   > 1 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 20, 2, str.tostring(math.round(ti65_w, 2)), ti65_w > 1 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 21, 0, "MDT",              C_ROW, C_TXT)
+    tc(tbl, 21, 1, str.tostring(math.round(mdt,   2)), mdt   > 1 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 21, 2, str.tostring(math.round(mdt_w, 2)), mdt_w > 1 ? #2E7D32 : C_SELL, C_TXT)
+    tc(tbl, 22, 0, "M20",              C_ROW, C_TXT)
+    tc(tbl, 22, 1, m20Bull   ? "BULL" : "BEAR", f_bbCol(m20Bull),   C_TXT)
+    tc(tbl, 22, 2, m20Bull_w ? "BULL" : "BEAR", f_bbCol(m20Bull_w), C_TXT)
+    tc(tbl, 23, 0, "Accumulation",     C_ROW, C_TXT)
+    tc(tbl, 23, 1, accumA, f_accumCol(accumA), C_TXT)
+    tc(tbl, 23, 2, accumW, f_accumCol(accumW), C_TXT)
+    mlClr  = mlScore   >= 4 ? C_BUY : mlScore   >= 2 ? C_WARN : C_SELL
+    mlClrW = mlScore_w >= 4 ? C_BUY : mlScore_w >= 2 ? C_WARN : C_SELL
+    tc(tbl, 24, 0, "ML Score (0-5)",   C_ROW, C_TXT)
+    tc(tbl, 24, 1, str.tostring(mlScore),   mlClr,  C_TXT)
+    tc(tbl, 24, 2, str.tostring(mlScore_w), mlClrW, C_TXT)
+    tc(tbl, 25, 0, "A+ Setup",         C_ROW, C_TXT)
+    tc(tbl, 25, 1, aPlusSetup ? "YES" : "NO", f_ynCol(aPlusSetup), C_TXT)
+    tc(tbl, 25, 2, aPlusSu_w  ? "YES" : "NO", f_ynCol(aPlusSu_w),  C_TXT)
+    b3Clr  = b3Score >= 7 ? C_BUY : b3Score >= 4 ? C_WARN : C_SELL
+    b3ClrW = b3Scr_w >= 7 ? C_BUY : b3Scr_w >= 4 ? C_WARN : C_SELL
+    tc(tbl, 26, 0, "B3 Score",         C_ROW, C_TXT)
+    tc(tbl, 26, 1, str.tostring(b3Score), b3Clr,  C_TXT)
+    tc(tbl, 26, 2, str.tostring(b3Scr_w), b3ClrW, C_TXT)
+    tc(tbl, 27, 0, "B3 Signals",       C_ROW, C_TXT)
+    tc(tbl, 27, 1, b3Signal ? "YES" : "NO", f_ynCol(b3Signal), C_TXT)
+    tc(tbl, 27, 2, b3Sig_w  ? "YES" : "NO", f_ynCol(b3Sig_w),  C_TXT)
+    table.cell(tbl, 0, 28, "v1.0 - TXInvestor Clone", bgcolor=color.new(color.black, 30), text_color=color.new(color.gray, 40), text_size=size.tiny, text_halign=text.align_left)
+    table.merge_cells(tbl, 0, 28, 2, 28)
+
+// ============================================================
+// ALERTS
+// ============================================================
+alertcondition(stage == 2 and stage[1] != 2,                      "S2 Entry",    "{{ticker}} Stage 2 Breakout")
+alertcondition(stage == 4 and stage[1] != 4,                      "S4 Warning",  "{{ticker}} Entering Stage 4")
+alertcondition(b3Signal and not b3Signal[1],                       "B3 Signal",   "{{ticker}} B3 Breakout Signal")
+alertcondition(aPlusSetup and not aPlusSetup[1],                   "A+ Setup",    "{{ticker}} A+ Setup")
+alertcondition(stage == 2 and volRatio > 2 and rsi14 > 60,        "High-Vol S2", "{{ticker}} High-Volume Stage 2")
