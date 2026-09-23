@@ -1,0 +1,179 @@
+// KB POC Levels
+// Naked POCs plus prior-day and prior-week POC, drawn sparingly.
+// Companion to "KB Vol Profile" - kept as a separate indicator so it toggles independently
+// and does not compete for the 500 drawing-object budget the profile already uses.
+
+//@version=6
+indicator(title = 'KB POC Levels', shorttitle = 'KB_POC', overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// INPUTS
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+bkt_ticks   = input.int(defval = 4, minval = 1, maxval = 200, title = 'Bucket Size (ticks)', group = 'Engine', tooltip = 'Price resolution used to find the POC. 4 ticks suits MNQ/MES. Raise it on wide-range instruments so a day spans a few hundred buckets rather than tens of thousands.')
+day_mode    = input.string(defval = 'Calendar Day', title = 'Day Boundary', options = ['Calendar Day', 'Exchange Session'], group = 'Engine', tooltip = 'What a day and a week mean. Calendar Day rolls at midnight exchange time, matching the thinkScript ladder whose levels are dated 08/27 Thu and so on. Exchange Session rolls at the 17:00 CT futures open, folding the prior evening Globex into the same day.')
+right_pad   = input.int(defval = 2, minval = 0, maxval = 200, title = 'Extend Past Last Bar (bars)', group = 'Engine', tooltip = 'How far the level lines run past the newest candle. Keep this at or below the volume profile Gap From Last Candle setting, default 5, so the lines stop short of the profile instead of cutting straight across it.')
+
+show_npoc   = input.bool(defval = true, title = 'Naked POCs', group = 'Naked POC', tooltip = 'A POC price has not traded back through since it formed. Deleted automatically the moment price touches it, so the chart prunes itself.')
+max_npoc    = input.int(defval = 5, minval = 1, maxval = 30, title = 'Keep Most Recent', group = 'Naked POC', tooltip = 'Hard cap. Older untouched POCs drop off so the chart cannot silt up during a long trend.')
+max_age_d   = input.int(defval = 10, minval = 0, maxval = 250, title = 'Max Age (days, 0 = no limit)', group = 'Naked POC', tooltip = 'Drops untouched POCs older than this. Without a cap a level from weeks ago that price simply never revisited stays on the chart forever - technically a naked POC, rarely useful intraday. Counted in wall-clock days, not trading days.')
+c_npoc      = input.color(defval = #78909C, title = 'Naked POC Color', group = 'Naked POC')
+
+show_td     = input.bool(defval = true, title = "Today's POC (developing)", group = 'Reference Levels', tooltip = 'The current day POC as it forms. This is Target 1 in the thinkScript study.')
+c_td        = input.color(defval = #FFEB3B, title = 'Today Color', group = 'Reference Levels')
+show_pd     = input.bool(defval = true, title = 'Prior Day POC', group = 'Reference Levels')
+c_pd        = input.color(defval = #FFB300, title = 'Prior Day Color', group = 'Reference Levels')
+show_pw     = input.bool(defval = true, title = 'Prior Week POC', group = 'Reference Levels')
+c_pw        = input.color(defval = #B388FF, title = 'Prior Week Color', group = 'Reference Levels')
+
+show_labels = input.bool(defval = true, title = 'Show Labels', group = 'Appearance')
+lbl_place   = input.string(defval = 'Left Of Last Bar', title = 'Label Placement', options = ['Left Of Last Bar', 'End Of Line'], group = 'Appearance', tooltip = 'Left Of Last Bar anchors labels to the newest candle with the text running left, which keeps them clear of a volume profile drawn in the right margin. End Of Line puts them at the line tip, which disappears under that profile unless Extend Past Last Bar clears its full width.')
+lbl_size    = input.string(defval = 'normal', title = 'Label Size', options = ['tiny', 'small', 'normal', 'large', 'huge'], group = 'Appearance')
+show_price  = input.bool(defval = false, title = 'Include Price In Label', group = 'Appearance', tooltip = 'Off keeps labels to a short tag. The price is already on the axis when you hover the line.')
+
+lbl_textsize() =>
+    lbl_size == 'small' ? size.small : lbl_size == 'normal' ? size.normal : lbl_size == 'large' ? size.large : lbl_size == 'huge' ? size.huge : size.tiny
+
+float bkt = syminfo.mintick * bkt_ticks
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// ENGINE
+//// One map per period, keyed by price bucket. Volume is spread across each bar's range the same way
+//// the profile script does it, so these POCs agree with what the profile shows.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+add_vol(m, b) =>
+    if volume > 0 and not na(volume)
+        int j_lo = int(math.floor(low / b))
+        int j_hi = int(math.floor(high / b))
+        if j_hi - j_lo > 500
+            // Bucket size is far too fine for this instrument. Dump the bar at one price rather
+            // than spinning through thousands of iterations.
+            int j = int(math.floor(hlc3 / b))
+            map.put(m, j, (map.contains(m, j) ? map.get(m, j) : 0.0) + volume)
+        else
+            float per = volume / (j_hi - j_lo + 1)
+            for j = j_lo to j_hi
+                map.put(m, j, (map.contains(m, j) ? map.get(m, j) : 0.0) + per)
+    map.size(m)
+
+// Highest-volume bucket in a map, as a price. na when the map is empty.
+poc_of(m, b) =>
+    float best_v = 0.0
+    float best_p = float(na)
+    ks = map.keys(m)
+    for k in ks
+        float v = map.get(m, k)
+        if v > best_v
+            best_v := v
+            best_p := (k + 0.5) * b
+    best_p
+
+var map<int, float> dayMap = map.new<int, float>()
+var map<int, float> wkMap  = map.new<int, float>()
+
+var float pdPOC    = na
+var float pwPOC    = na
+var int   day_open = 0
+var int   wk_open  = 0
+var int   pd_open  = 0
+var int   pw_open  = 0
+
+// Untouched POCs awaiting a retest. Parallel arrays: price, the bar the period started on, and its
+// timestamp so the label can name the session the level came from.
+var float[] npoc_p = array.new_float()
+var int[]   npoc_x = array.new_int()
+var int[]   npoc_t = array.new_int()
+var int     day_open_t = 0
+
+// Calendar rollover is a date change in exchange time, which is what GetYYYYMMDD/countTradingDays give
+// you in thinkScript. timeframe.change is the session roll instead - 17:00 CT on CME, not midnight.
+bool calDay  = na(time[1]) or dayofmonth(time, syminfo.timezone) != dayofmonth(time[1], syminfo.timezone)
+bool calWeek = na(time[1]) or weekofyear(time, syminfo.timezone) != weekofyear(time[1], syminfo.timezone)
+bool newDay  = day_mode == 'Calendar Day' ? calDay  : timeframe.change('D')
+bool newWeek = day_mode == 'Calendar Day' ? calWeek : timeframe.change('W')
+
+// Close out the finished period BEFORE the new bar's volume lands in the map.
+if newDay and bar_index > 0
+    pdPOC   := poc_of(dayMap, bkt)
+    pd_open := day_open
+    if not na(pdPOC)
+        array.push(npoc_p, pdPOC)
+        array.push(npoc_x, day_open)
+        array.push(npoc_t, day_open_t)
+    map.clear(dayMap)
+    day_open   := bar_index
+    day_open_t := time
+
+if newWeek and bar_index > 0
+    pwPOC   := poc_of(wkMap, bkt)
+    pw_open := wk_open
+    map.clear(wkMap)
+    wk_open := bar_index
+
+// Assigned, not left bare: a top-level expression statement gets auto-plotted and shows up as a
+// stray number in the status line.
+int _dayBuckets = add_vol(dayMap, bkt)
+int _wkBuckets  = add_vol(wkMap, bkt)
+
+// Retest check. Walking backwards so removals do not shift indices we have yet to visit.
+if array.size(npoc_p) > 0
+    for i = array.size(npoc_p) - 1 to 0
+        float p = array.get(npoc_p, i)
+        if low <= p and high >= p
+            array.remove(npoc_p, i)
+            array.remove(npoc_x, i)
+            array.remove(npoc_t, i)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// DRAW
+//// Nothing is drawn during history. State lives in arrays, and the whole picture is rebuilt once on
+//// the last bar, so touched levels simply never appear and the object count stays tiny.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var line[]  drw_ln = array.new_line()
+var label[] drw_lb = array.new_label()
+
+draw_level(float p, int x1, int x2, color c, int w, string style, string tag) =>
+    line ln = line.new(x1, p, x2, p, color = c, width = w, style = style)
+    array.push(drw_ln, ln)
+    if show_labels
+        bool   left = lbl_place == 'Left Of Last Bar'
+        int    lx   = left ? bar_index : x2
+        string ls   = left ? label.style_label_right : label.style_label_left
+        label lb = label.new(lx, p, show_price ? tag + '  ' + str.tostring(p, format.mintick) : tag, xloc = xloc.bar_index, style = ls, color = color.new(color.black, 100), textcolor = c, size = lbl_textsize())
+        array.push(drw_lb, lb)
+    ln
+
+if barstate.islast
+    for l in drw_ln
+        line.delete(l)
+    array.clear(drw_ln)
+    for lb in drw_lb
+        label.delete(lb)
+    array.clear(drw_lb)
+
+    int x_right = bar_index + right_pad
+
+    if show_npoc
+        int n = array.size(npoc_p)
+        if n > 0
+            for i = math.max(0, n - max_npoc) to n - 1
+                float p = array.get(npoc_p, i)
+                // Yesterday's POC is in this list too. If it is still naked it would draw twice,
+                // so let the dedicated PD/PW line win and skip the duplicate here.
+                bool dupe = (show_pd and not na(pdPOC) and p == pdPOC) or (show_pw and not na(pwPOC) and p == pwPOC)
+                float age_d = (time - array.get(npoc_t, i)) / 86400000.0
+                bool stale = max_age_d > 0 and age_d > max_age_d
+                if not dupe and not stale
+                    // Every naked POC here is a daily one. Naming the session it came from is the
+                    // difference between "a level" and "Wednesday's level".
+                    draw_level(p, array.get(npoc_x, i), x_right, c_npoc, 1, line.style_dotted, 'Naked POC ' + str.format_time(array.get(npoc_t, i), 'MMM d', syminfo.timezone))
+
+    if show_td
+        float tdPOC = poc_of(dayMap, bkt)
+        if not na(tdPOC)
+            draw_level(tdPOC, day_open, x_right, c_td, 2, line.style_dashed, 'TODAY POC')
+
+    if show_pd and not na(pdPOC)
+        draw_level(pdPOC, pd_open, x_right, c_pd, 2, line.style_solid, 'DAILY POC')
+
+    if show_pw and not na(pwPOC)
+        draw_level(pwPOC, pw_open, x_right, c_pw, 2, line.style_solid, 'WEEKLY POC')

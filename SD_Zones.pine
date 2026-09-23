@@ -1,0 +1,294 @@
+//@version=6
+// =============================================================================
+//  Supply & Demand Zones  (James Sibbet Demand Index)
+//  Pine v6 port of the thinkorswim study
+//  "Supply & Demand Zones with Resistance Bands".
+//
+//  Volume is split into buying vs. selling pressure by the direction of the
+//  weighted close, smoothed, then ratioed into a normalised oscillator (DMI).
+//  A threshold crossing stamps a zone; the zone ratchets while pressure stays
+//  extreme and extends right until price closes through it. By default only the
+//  current demand and supply zone are drawn -- see "Zones kept per side".
+// =============================================================================
+// max_bars_back is required because the TOS band rescan indexes history with a
+// loop variable (close[i]); Pine can't infer the buffer depth from that on its own.
+indicator("Supply & Demand Zones", "S/D Zones", overlay = true,
+     max_boxes_count = 500, max_labels_count = 100, max_bars_back = 3100)
+
+string G_CALC  = "Calculation"
+string G_ZONE  = "Zones"
+string G_STYLE = "Style"
+
+// -----------------------------------------------------------------------------
+//  INPUTS
+// -----------------------------------------------------------------------------
+nDI     = input.int(5,      "Lookback", minval = 1, group = G_CALC,
+     tooltip = "Smoothing period for the pressure averages and the volume ratio.")
+diThr   = input.float(0.35, "Sensitivity", minval = 0.05, maxval = 1.0, step = 0.05, group = G_CALC,
+     tooltip = "Demand Index threshold. LOWER = more zones, HIGHER = fewer and stronger. Raise this on fast intraday charts.")
+atrMult = input.float(1.5,  "Resistance band ATR ×", minval = 0.1, step = 0.1, group = G_CALC)
+
+showDemand  = input.bool(true, "Demand zones",   inline = "s1", group = G_ZONE)
+showSupply  = input.bool(true, "Supply zones",   inline = "s1", group = G_ZONE)
+maxZones    = input.int(1, "Zones kept per side", minval = 1, maxval = 20, group = G_ZONE,
+     tooltip = "1 = only the current zone is on the chart; a new zone replaces it. Raise this if you want recent history back.")
+onBreak     = input.string("Ignore", "When price closes through a zone",
+     options = ["Remove", "Fade and keep", "Ignore"], group = G_ZONE,
+     tooltip = "Ignore (TOS behaviour): zones never expire and keep extending right — thinkScript has no mitigation concept.\nRemove: the zone is deleted the moment it is mitigated.\nFade and keep: it greys out and stays as a record.")
+bool breakRemove = onBreak == "Remove"
+bool breakFade   = onBreak == "Fade and keep"
+showResBand = input.bool(true,  "ATR resistance band above supply", group = G_ZONE)
+resFallback = input.bool(false, "  └ draw it before the first breakout", group = G_ZONE,
+     tooltip = "TOS hides the band until close first crosses above the supply high. Enable to draw it from live ATR instead.")
+tosMatch    = input.bool(true,  "  └ match TOS band exactly", group = G_ZONE,
+     tooltip = "thinkScript tests close against HighestAll(SupplyH) — the FINAL supply high — so it captures the ATR at the most recent bar where close crossed THAT level. Pine is causal and can only compare against the running supply high, which lands on a different bar and a different ATR.\n\nOn: rescan history on the last bar to reproduce the TOS value.\nOff: causal behaviour.")
+resScanMax  = input.int(2000, "     scan limit (bars)", minval = 50, maxval = 3000, group = G_ZONE,
+     tooltip = "How far back the rescan will look for the crossover. Only runs on the last bar.")
+
+theme      = input.string("Standard", "Weight", options = ["Subtle", "Standard", "Bold"], group = G_STYLE)
+showLabels = input.bool(true, "Label the live zones",     group = G_STYLE)
+showTags   = input.bool(true, "Price-scale tags on edges", group = G_STYLE,
+     tooltip = "Adds the near edge of each live zone to the price axis.")
+cDemand    = input.color(color.rgb(0, 188, 212),  "Demand", inline = "c", group = G_STYLE)
+cSupply    = input.color(color.rgb(255, 193, 7),  "Supply", inline = "c", group = G_STYLE)
+cBand      = input.color(color.rgb(239, 83, 80),  "Band",   inline = "c", group = G_STYLE)
+
+int bgT   = theme == "Subtle" ? 93 : theme == "Bold" ? 82 : 88   // live fill
+int deadT = math.min(96, bgT + 5)                                 // mitigated fill
+int bordW = theme == "Bold" ? 2 : 1
+
+// -----------------------------------------------------------------------------
+//  DEMAND INDEX ENGINE
+// -----------------------------------------------------------------------------
+float wc     = (high + low + 2 * close) * 0.25              // weighted close
+float wcRate = (wc - wc[1]) / math.min(wc, wc[1])           // its rate of change
+
+float rngAvg = ta.sma(ta.highest(high, 2) - ta.lowest(low, 2), nDI)
+float volatilityRatio = rngAvg != 0 ? 3 * wc / rngAvg * math.abs(nz(wcRate)) : 0.0
+
+float volAvg      = ta.sma(volume, nDI)
+float volumeRatio = volAvg != 0 ? volume / volAvg : 0.0
+float volPerRange = volumeRatio / math.exp(math.min(88, volatilityRatio))
+
+float atrDI = ta.sma(ta.tr(true), nDI) * atrMult
+
+float buyP  = nz(wcRate) > 0 ? volumeRatio : volPerRange
+float sellP = nz(wcRate) > 0 ? volPerRange : volumeRatio
+
+var float buyPres  = na
+var float sellPres = na
+float buyRaw  = (nz(buyPres[1])  * (nDI - 1) + nz(buyP))  / nDI
+float sellRaw = (nz(sellPres[1]) * (nDI - 1) + nz(sellP)) / nDI
+buyPres  := na(buyPres[1])  ? 0.0 : buyRaw
+sellPres := na(sellPres[1]) ? 0.0 : sellRaw
+
+float DI = (sellRaw - buyRaw) > 0
+     ? -(sellPres != 0 ? buyPres / sellPres : 1.0)
+     :  (buyPres  != 0 ? sellPres / buyPres : 1.0)
+float DMI = DI < 0 ? -1 - DI : 1 - DI
+
+// -----------------------------------------------------------------------------
+//  ZONE TRACKING  (unchanged TOS logic — cross to stamp, ratchet while extreme)
+// -----------------------------------------------------------------------------
+var float demandL = na
+var float demandH = na
+var int   demandX = na
+
+bool dTrig = ta.crossunder(DMI, -diThr)
+demandL := dTrig ? low
+     : (DMI < -0.2 and not na(demandL[1]) and low < demandL[1]) ? low
+     : demandL[1]
+bool dSet = not na(demandL) and low == demandL
+demandH := dSet ? high      : demandH[1]
+demandX := dSet ? bar_index : demandX[1]
+
+var float supplyH = na
+var float supplyL = na
+var int   supplyX = na
+
+bool sTrig = ta.crossover(DMI, diThr)
+supplyH := sTrig ? high
+     : (DMI > 0.5 and not na(supplyH[1]) and high > supplyH[1]) ? high
+     : supplyH[1]
+bool sSet = not na(supplyH) and high == supplyH
+supplyL := sSet ? low       : supplyL[1]
+supplyX := sSet ? bar_index : supplyX[1]
+
+// Causal version: compares close against the supply high as it stood at the time.
+var float res = na
+res := ta.crossover(close, supplyH) ? atrDI : res[1]
+
+// TOS version. thinkScript's `SH` is HighestAll(SupplyH) — a constant equal to the
+// FINAL supply high, broadcast to every bar — so `c crosses above SH` is evaluated
+// against a level that isn't known until the chart ends, and `res` ends up holding
+// the ATR from the most recent bar that crossed it. Pine can't reference forward,
+// so reproduce it by rescanning history once, on the last bar.
+var float resTOS = na
+if barstate.islast and not na(supplyX) and not na(supplyH)
+    // SH is NaN before supplyX, so the earliest possible cross is supplyX + 1,
+    // which caps the offset at (bar_index - supplyX - 1).
+    int scanLen = math.min(bar_index - supplyX - 1, resScanMax)
+    if scanLen >= 0
+        for i = 0 to scanLen
+            if close[i] > supplyH and close[i + 1] <= supplyH
+                resTOS := atrDI[i]      // most recent cross wins, matching res[1] carry-forward
+                break
+
+float resRaw = tosMatch and barstate.islast ? resTOS : res
+float resUse = na(resRaw) and resFallback ? atrDI : resRaw
+
+// -----------------------------------------------------------------------------
+//  ZONE OBJECTS
+// -----------------------------------------------------------------------------
+type Zone
+    box   bx
+    float top
+    float bot
+    bool  dead
+
+var array<Zone> dZones = array.new<Zone>()
+var array<Zone> sZones = array.new<Zone>()
+
+open_(array<Zone> zs, color col) =>
+    if array.size(zs) >= maxZones
+        Zone gone = array.shift(zs)
+        box.delete(gone.bx)
+    box bx = box.new(bar_index, high, bar_index, low, border_color = color.new(col, 20),
+         border_width = bordW, bgcolor = color.new(col, bgT), extend = extend.right)
+    array.push(zs, Zone.new(bx, high, low, false))
+
+// keep the newest zone's bounds in sync while the TOS ratchet is still running
+track(array<Zone> zs, float hi, float lo, int x) =>
+    if array.size(zs) > 0 and not na(x)
+        Zone z = array.get(zs, array.size(zs) - 1)
+        if not z.dead
+            z.top := math.max(hi, lo)
+            z.bot := math.min(hi, lo)
+            box.set_lefttop(z.bx, x, z.top)
+            box.set_rightbottom(z.bx, bar_index, z.bot)
+
+// A demand zone dies on a close below it, a supply zone on a close above it.
+// Walk the array backwards so removing an element cannot skip the next one.
+mitigate(array<Zone> zs, color col, bool below) =>
+    if (breakRemove or breakFade) and array.size(zs) > 0
+        for i = array.size(zs) - 1 to 0
+            Zone z = array.get(zs, i)
+            if not z.dead and (below ? close < z.bot : close > z.top)
+                z.dead := true
+                if breakRemove
+                    // array.remove() returns the dropped Zone, so it must not be
+                    // the last statement here -- both branches have to end void.
+                    array.remove(zs, i)
+                    box.delete(z.bx)
+                else
+                    box.set_right(z.bx, bar_index)
+                    box.set_extend(z.bx, extend.none)
+                    box.set_bgcolor(z.bx, color.new(col, deadT))
+                    box.set_border_color(z.bx, color.new(col, 75))
+                    box.set_border_width(z.bx, 0)
+
+// newest zone still alive?
+alive(array<Zone> zs) =>
+    bool r = false
+    if array.size(zs) > 0
+        r := not array.get(zs, array.size(zs) - 1).dead
+    r
+
+if dTrig and showDemand
+    open_(dZones, cDemand)
+if sTrig and showSupply
+    open_(sZones, cSupply)
+
+track(dZones, demandH, demandL, demandX)
+track(sZones, supplyH, supplyL, supplyX)
+mitigate(dZones, cDemand, true)
+mitigate(sZones, cSupply, false)
+
+bool dLive = alive(dZones)
+bool sLive = alive(sZones)
+
+// -----------------------------------------------------------------------------
+//  RESISTANCE BAND  (tied to the live supply zone)
+// -----------------------------------------------------------------------------
+var box bxRes = na
+// NB: deliberately not gated on sLive — the band exists to project resistance
+// ABOVE a supply breakout, i.e. exactly when that supply zone has been mitigated.
+bool bandOn = showResBand and not na(supplyX) and not na(supplyH) and not na(resUse)
+if bandOn
+    if na(bxRes)
+        bxRes := box.new(supplyX, supplyH + 2 * resUse, bar_index, supplyH + resUse,
+             border_color = color.new(cBand, 40), border_width = 1,
+             bgcolor = color.new(cBand, math.min(96, bgT + 4)), extend = extend.right)
+    box.set_lefttop(bxRes, supplyX, supplyH + 2 * resUse)
+    box.set_rightbottom(bxRes, bar_index, supplyH + resUse)
+if not bandOn and not na(bxRes)
+    box.delete(bxRes)
+    bxRes := na
+
+// -----------------------------------------------------------------------------
+//  LABELS  (one per side, on the live zone only, redrawn at the right edge)
+// -----------------------------------------------------------------------------
+var label dLab = na
+var label sLab = na
+
+if barstate.islast
+    label.delete(dLab)
+    label.delete(sLab)
+    if showLabels and dLive
+        Zone zd = array.get(dZones, array.size(dZones) - 1)
+        dLab := label.new(bar_index + 3, (zd.top + zd.bot) / 2,
+             "Demand  " + str.tostring(zd.top, format.mintick),
+             style = label.style_none, textcolor = cDemand, size = size.small,
+             textalign = text.align_left)
+    if showLabels and sLive
+        Zone zs2 = array.get(sZones, array.size(sZones) - 1)
+        sLab := label.new(bar_index + 3, (zs2.top + zs2.bot) / 2,
+             "Supply  " + str.tostring(zs2.bot, format.mintick),
+             style = label.style_none, textcolor = cSupply, size = size.small,
+             textalign = text.align_left)
+
+// -----------------------------------------------------------------------------
+//  PRICE-SCALE TAGS + DATA WINDOW VALUES
+// -----------------------------------------------------------------------------
+float dTop = na
+float dBot = na
+float sTop = na
+float sBot = na
+if dLive
+    Zone zdl = array.get(dZones, array.size(dZones) - 1)
+    dTop := zdl.top
+    dBot := zdl.bot
+if sLive
+    Zone zsl = array.get(sZones, array.size(sZones) - 1)
+    sTop := zsl.top
+    sBot := zsl.bot
+
+plot(showTags ? dTop : na, "Demand edge", cDemand, 1, display = display.price_scale)
+plot(showTags ? sBot : na, "Supply edge", cSupply, 1, display = display.price_scale)
+
+plot(DMI,  "Demand Index", display = display.data_window)
+plot(dTop, "Demand High",  display = display.data_window)
+plot(dBot, "Demand Low",   display = display.data_window)
+plot(sTop, "Supply High",  display = display.data_window)
+plot(sBot, "Supply Low",   display = display.data_window)
+plot(bandOn ? supplyH + resUse     : na, "Band Low",  display = display.data_window)
+plot(bandOn ? supplyH + 2 * resUse : na, "Band High", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+bool inD     = dLive and close <= dTop and close >= dBot
+bool inS     = sLive and close <= sTop and close >= sBot
+bool intoD   = inD and not inD[1]
+bool intoS   = inS and not inS[1]
+bool dBroken = dLive[1] and not dLive
+bool sBroken = sLive[1] and not sLive
+bool bandHit = ta.crossover(close, supplyH + 2 * resUse)
+
+alertcondition(dTrig,   "New demand zone",   "New demand zone formed")
+alertcondition(sTrig,   "New supply zone",   "New supply zone formed")
+alertcondition(intoD,   "Price into demand", "Price entered the demand zone")
+alertcondition(intoS,   "Price into supply", "Price entered the supply zone")
+alertcondition(dBroken, "Demand zone broken", "Close below the demand zone — zone mitigated")
+alertcondition(sBroken, "Supply zone broken", "Close above the supply zone — zone mitigated")
+alertcondition(bandOn and bandHit, "Above resistance band", "Close broke above the ATR resistance band")

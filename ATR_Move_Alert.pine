@@ -1,0 +1,51 @@
+//@version=6
+indicator("ATR Move Alert (2.5x)", overlay=true, max_labels_count=500)
+
+// ── Inputs ──────────────────────────────────────────────
+atrLen     = input.int(14, "ATR Length", minval=1)
+atrMult    = input.float(2.5, "ATR Multiplier", minval=0.1, step=0.1)
+moveSrc    = input.string("True Range", "Move Measured As", options=["True Range", "Close-to-Close"])
+showBg     = input.bool(true, "Highlight Bars")
+showMarks  = input.bool(true, "Show Triangle Markers")
+showLabels = input.bool(true, "Show Multiple Labels (e.g. 3.1x ATR)")
+upColor    = input.color(color.new(color.lime, 70), "Up Move Highlight")
+dnColor    = input.color(color.new(color.red, 70), "Down Move Highlight")
+labelSizeInput  = input.string("Large", "Label Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"])
+markerSizeInput = input.string("Small", "Marker Size", options=["Tiny", "Small", "Normal", "Large", "Huge"])
+
+labelSize = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Small" ? size.small : labelSizeInput == "Normal" ? size.normal : labelSizeInput == "Large" ? size.large : size.huge
+
+// ── Calculation ─────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+move   = moveSrc == "True Range" ? ta.tr(true) : math.abs(close - close[1])
+isUp   = moveSrc == "True Range" ? close >= open : close >= close[1]
+
+isBigMove = move > atrVal * atrMult
+multiple  = atrVal != 0 ? move / atrVal : na
+
+// ── Visuals ──────────────────────────────────────────────
+bgcolor(showBg and isBigMove ? (isUp ? upColor : dnColor) : na, title="Big Move Highlight")
+
+showUpMark = showMarks and isBigMove and isUp
+showDnMark = showMarks and isBigMove and not isUp
+
+plotshape(showUpMark and markerSizeInput == "Tiny",   title="Big Up Move (Tiny)",   style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(showUpMark and markerSizeInput == "Small",  title="Big Up Move (Small)",  style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(showUpMark and markerSizeInput == "Normal", title="Big Up Move (Normal)", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.normal)
+plotshape(showUpMark and markerSizeInput == "Large",  title="Big Up Move (Large)",  style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.large)
+plotshape(showUpMark and markerSizeInput == "Huge",   title="Big Up Move (Huge)",   style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.huge)
+
+plotshape(showDnMark and markerSizeInput == "Tiny",   title="Big Down Move (Tiny)",   style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(showDnMark and markerSizeInput == "Small",  title="Big Down Move (Small)",  style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(showDnMark and markerSizeInput == "Normal", title="Big Down Move (Normal)", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.normal)
+plotshape(showDnMark and markerSizeInput == "Large",  title="Big Down Move (Large)",  style=shape.triangledown, location=location.abovebar, color=color.red, size=size.large)
+plotshape(showDnMark and markerSizeInput == "Huge",   title="Big Down Move (Huge)",   style=shape.triangledown, location=location.abovebar, color=color.red, size=size.huge)
+
+if showLabels and isBigMove
+    label.new(bar_index, isUp ? high : low, str.tostring(multiple, "#.##") + "x ATR",
+         style=isUp ? label.style_label_down : label.style_label_up,
+         color=isUp ? color.new(color.lime, 20) : color.new(color.red, 20),
+         textcolor=color.white, size=labelSize)
+
+// ── Alert ────────────────────────────────────────────────
+alertcondition(isBigMove, title="ATR Move > Threshold", message="Bar move exceeded the ATR multiplier threshold")

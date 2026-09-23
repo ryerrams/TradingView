@@ -1,0 +1,116 @@
+//@version=6
+// LASOMA Scan - Long/Short Candidates (Pine Screener source)
+// Standalone, lightweight reimplementation of LASOMA's Smart Trail + ML Confidence logic,
+// hardcoded to the Scalping preset (matching the live ThinkOrSwim configuration this was
+// built to parallel). Not a reference to the full LASOMA indicator — deliberately self-contained
+// so it stays fast enough to run across the whole market in TradingView's Pine Screener.
+//
+// IMPORTANT: Scalping preset uses "Trend Investor" signal mode, whose trail is an ATR ratchet
+// stop (InvestorTrailingStop) — NOT the simple Highest/Lowest-based "SmartTrail" used by other
+// presets. This is what the chart's Smart Trail band and ActiveLongSignal/ActiveShortSignal
+// actually key off for Scalping. An earlier version of this script used the wrong trail.
+//
+// Fires ONLY ONCE PER TREND LEG: after price flips from below the Investor Trailing Stop
+// (red/bearish) to above it (green/bullish), we want the very FIRST candle in that new leg
+// where ML Confidence reaches >= MinConfidence (3/4/5) -- not every time confidence dips
+// below the threshold and climbs back within the SAME leg. Once it has fired once for a
+// leg, it stays silent for the rest of that leg, even if confidence drops and re-crosses
+// >= MinConfidence again -- only a fresh trend flip (leg) can re-arm it.
+//   - Long Candidate  = 1 on the first bar since the last bearish->bullish flip where
+//                        confidence >= MinConfidence (only once per bullish leg)
+//   - Short Candidate = 1 on the first bar since the last bullish->bearish flip where
+//                        confidence >= MinConfidence (only once per bearish leg)
+//
+// Usage in TradingView Screener: add this script as a column source, filter "Long Candidate is 1"
+// OR "Short Candidate is 1", and add TradingView's built-in Market Cap fundamental filter (>= 1B)
+// alongside it.
+
+indicator("LASOMA Scan - Long/Short Candidates", overlay = true)
+
+MinConfidence = input.int(3, "Minimum Confidence (1-5)")
+
+// Scalping preset constants (mirrors TradingPreset = "Scalping" on the full LASOMA indicator)
+atrLen            = 5
+catcherFastLen    = 5
+catcherSlowLen    = 13
+tracerLen         = 14
+cloudLen          = 34
+trailMult         = 2.0
+signalSensitivity = 12.0  // Scalping preset's ActiveSignalSensitivity
+mlSensitivity     = 1.8
+
+tick     = syminfo.mintick
+tr       = ta.tr(true)
+atrValue = ta.rma(tr, atrLen)
+atrAvg   = ta.sma(atrValue, 50)
+atrSafe  = math.max(atrValue, tick)
+
+emaFast = ta.ema(close, catcherFastLen)
+emaSlow = ta.ema(close, catcherSlowLen)
+
+// Trend Investor trailing stop (the trail Scalping preset actually uses)
+investorTrailOffset = atrValue * trailMult * (1.0 + (signalSensitivity - 12.0) / 10.0)
+var float investorTrailingStop = na
+investorTrailingStop := close[1] >= nz(investorTrailingStop[1], close) ?
+     (close < nz(investorTrailingStop[1], close) ? close + investorTrailOffset : math.max(nz(investorTrailingStop[1], close), close - investorTrailOffset)) :
+     (close > nz(investorTrailingStop[1], close) ? close - investorTrailOffset : math.min(nz(investorTrailingStop[1], close), close + investorTrailOffset))
+investorTrend = close >= investorTrailingStop ? 1 : -1
+
+// TOS built-in Inertia(price, length): linear regression of a 10/14 Relative Vigor Index.
+f_inertia(_src, _length) =>
+    _stdev   = ta.stdev(_src, 10)
+    _upDev   = _src > _src[1] ? _stdev : 0.0
+    _downDev = _src < _src[1] ? _stdev : 0.0
+    _num     = ta.sma(_upDev, 14)
+    _den     = _num + ta.sma(_downDev, 14)
+    _rvi     = _den != 0 ? _num / _den * 100.0 : 50.0
+    ta.linreg(_rvi, _length, 0)
+
+tracerValue = f_inertia(close, tracerLen)
+cloudBasis  = ta.sma(close, cloudLen)
+rsiValue    = ta.rsi(close, 14)
+volAvg      = ta.sma(volume, 20)
+volSafe     = math.max(volAvg, 1.0)
+
+f_clamp(_v) => math.max(-1.0, math.min(1.0, _v))
+
+trendFeature     = f_clamp((emaFast - emaSlow) / atrSafe)
+momentumFeature  = f_clamp((close - close[5]) / (atrSafe * 2.0))
+tracerFeature    = f_clamp((tracerValue - tracerValue[1]) / atrSafe)
+cloudFeature     = f_clamp((close - cloudBasis) / (atrSafe * 2.0))
+rsiFeature       = f_clamp((rsiValue - 50.0) / 30.0)
+volumeFeature    = f_clamp((close - open) / atrSafe * (volume / volSafe))
+volatilityRatio  = atrAvg == 0 ? 1.0 : atrValue / atrAvg
+adaptiveWeight   = f_clamp(2.0 - volatilityRatio)
+
+ensembleRaw = trendFeature * 0.25 + momentumFeature * 0.20 + tracerFeature * 0.15 +
+              cloudFeature * 0.15 + rsiFeature * 0.15 + volumeFeature * 0.10
+mlRaw   = ensembleRaw * mlSensitivity * (0.85 + adaptiveWeight * 0.15)
+mlScore = 100.0 / (1.0 + math.exp(-mlRaw))
+
+distance = math.abs(mlScore - 50.0) * 2.0
+confidence = distance >= 80.0 ? 5 : distance >= 60.0 ? 4 : distance >= 30.0 ? 3 : distance >= 10.0 ? 2 : 1
+
+// One-shot-per-leg latches: reset exactly on the trend-flip bar, so the very first
+// confidence >= MinConfidence bar of the new leg (whether it's the flip bar itself or a
+// few bars later) is free to fire once, then stays suppressed for the rest of that leg.
+var bool longFiredThisLeg  = false
+var bool shortFiredThisLeg = false
+
+if investorTrend == 1 and investorTrend[1] == -1
+    longFiredThisLeg := false
+if investorTrend == -1 and investorTrend[1] == 1
+    shortFiredThisLeg := false
+
+longCandidate  = investorTrend == 1  and confidence >= MinConfidence and not longFiredThisLeg
+shortCandidate = investorTrend == -1 and confidence >= MinConfidence and not shortFiredThisLeg
+
+if longCandidate
+    longFiredThisLeg := true
+if shortCandidate
+    shortFiredThisLeg := true
+
+plot(longCandidate ? 1 : 0, "Long Candidate")
+plot(shortCandidate ? 1 : 0, "Short Candidate")
+plot(confidence, "Confidence", display = display.data_window)
+plot(investorTrailingStop, "Smart Trail (Investor)", display = display.data_window)

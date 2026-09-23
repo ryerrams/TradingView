@@ -1,0 +1,336 @@
+//@version=6
+// Trend Investment System — TradingView port of the thinkScript study
+// original: bulusufinances
+indicator("Trend Investment System", shorttitle="TIS", overlay = true,
+     max_labels_count = 500, max_lines_count = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+trendymode        = input.bool(true,  "Trendy mode",        group = "Trend", tooltip = "Turn on/off trendymode for the cloud")
+superfast_length  = input.int(9,      "Superfast EMA",      group = "Trend", minval = 1)
+fast_length       = input.int(13,     "Fast EMA",           group = "Trend", minval = 1)
+slow_length       = input.int(22,     "Slow EMA",           group = "Trend", minval = 1)
+tr3nd_length      = input.int(44,     "Tr3nd EMA",          group = "Trend", minval = 1)
+
+color_bars        = input.bool(true,  "Color bars",         group = "Display", tooltip = "Candles change color based on momentum")
+color_lines       = input.bool(false, "Color MA lines",     group = "Display", tooltip = "MA lines change color based on momentum")
+arrows            = input.bool(true,  "Candle formation arrows", group = "Display")
+cloud             = input.bool(true,  "EMA cloud",          group = "Display")
+alerts            = input.bool(false, "Enable alerts",      group = "Display")
+
+// --- line visibility (the cloud and all signal logic run regardless) ---
+show_superfast    = input.bool(true,  "Superfast EMA line", group = "Lines")
+show_slow         = input.bool(true,  "Slow EMA line",      group = "Lines")
+show_tr3nd        = input.bool(true,  "Tr3nd EMA line",     group = "Lines")
+show_ma_stack     = input.bool(false, "EMA 5 / 10 / 21 stack", group = "Lines",
+     tooltip = "Off by default — these overlap the trend EMAs heavily. The 'B' signal still uses them either way.")
+show_sma50        = input.bool(true,  "SMA 50",             group = "Lines")
+show_sma200       = input.bool(true,  "SMA 200 (weekly equiv)", group = "Lines")
+
+htf_confirmed     = input.bool(false, "Use confirmed HTF bar", group = "Higher timeframe",
+     tooltip = "Off = matches thinkScript exactly (higher-timeframe values update live and can repaint intrabar).\nOn = uses the last CLOSED higher-timeframe bar, which never repaints.")
+
+restrict_ma_daily = input.bool(true,  "Restrict MA stack to Daily/Weekly", group = "Moving averages",
+     tooltip = "On = faithful to the thinkScript (EMA5/10/21 exist only on Daily, so the 'B' and '+' marks only appear on Daily).\nOff = evaluate the MA stack on every timeframe.")
+
+show_sr           = input.bool(false, "Show support / resistance", group = "Support / Resistance",
+     tooltip = "Off by default to keep the chart clean. Levels still appear in the Data Window.")
+sr_strength       = input.int(10,     "Pivot strength",     group = "Support / Resistance", minval = 1, tooltip = "Bars on each side that define a swing pivot")
+sr_lookback       = input.int(300,    "Lookback bars",      group = "Support / Resistance", minval = 10)
+sr_ray_len        = input.int(60,     "Level length (bars)", group = "Support / Resistance", minval = 5)
+sr_bubbles        = input.bool(true,  "Label the levels",   group = "Support / Resistance")
+
+// ============================================================
+// Colors
+// ============================================================
+// The green / white / red bar state is the core read of this study:
+//   green = trend up, red = trend down, WHITE = change of character (EMAs tangled)
+c_bull    = input.color(color.green, "Bull bar",    group = "Bar colors", inline = "bc")
+c_neutral = input.color(color.white, "CHoCH bar",   group = "Bar colors", inline = "bc")
+c_bear    = input.color(color.red,   "Bear bar",    group = "Bar colors", inline = "bc")
+c_super   = color.green
+c_slow    = color.yellow
+c_tr3nd   = #DDA0DD           // PLUM
+c_tbull   = #34B3A7           // CreateColor(52, 179, 167)
+c_ltred   = #FFB2B2           // LIGHT_RED
+
+// ============================================================
+// Core EMAs and momentum state
+// ============================================================
+price = close
+
+mov_superfast = ta.ema(price, superfast_length)
+mov_fast      = ta.ema(price, fast_length)
+mov_slow      = ta.ema(price, slow_length)
+mov_tr3nd     = ta.ema(price, tr3nd_length)
+
+buy  = mov_superfast > mov_fast and mov_fast > mov_slow
+sell = mov_superfast < mov_fast and mov_fast < mov_slow
+
+// 1 = bull, 2 = bear, 3 = neutral
+tState = buy ? 1 : sell ? 2 : 3
+
+// ============================================================
+// Timeframe mapping  (GetAggregationPeriod equivalent)
+// ============================================================
+curSec  = timeframe.in_seconds(timeframe.period)
+higherTF = curSec < 3600     ? "60" :
+           curSec < 86400    ? "D"  :
+           timeframe.isdaily ? "W"  : "M"
+
+htfEmas() =>
+    sf = ta.ema(close, superfast_length)
+    ff = ta.ema(close, fast_length)
+    sw = ta.ema(close, slow_length)
+    [sf, ff, sw, sf[1], ff[1], sw[1]]
+
+[sfLive, fLive, swLive, sfPrev, fPrev, swPrev] =
+     request.security(syminfo.tickerid, higherTF, htfEmas(), lookahead = barmerge.lookahead_off)
+
+superfastEMA_HTF = htf_confirmed ? sfPrev : sfLive
+fastEMA_HTF      = htf_confirmed ? fPrev  : fLive
+slowEMA_HTF      = htf_confirmed ? swPrev : swLive
+
+buySignal_HTF  = superfastEMA_HTF > fastEMA_HTF and fastEMA_HTF > slowEMA_HTF
+sellSignal_HTF = superfastEMA_HTF < fastEMA_HTF and fastEMA_HTF < slowEMA_HTF
+changeOfBehavior_HTF = not buySignal_HTF and not sellSignal_HTF
+
+// ============================================================
+// Bar coloring
+// ============================================================
+plainColor = close > open ? color.new(color.teal, 0) : close < open ? color.new(color.red, 0) : color.gray
+barColor   = not color_bars ? plainColor :
+             tState == 1 ? c_bull : tState == 2 ? c_bear : c_neutral
+barcolor(barColor)
+
+// ============================================================
+// Trend lines
+// ============================================================
+lineColor(baseColor) =>
+    (not color_lines and not trendymode) ? baseColor :
+     (tState == 1 and trendymode)        ? c_tbull   :
+      tState == 1                        ? c_bull    :
+       tState == 2                       ? c_bear    : c_neutral
+
+plot(show_superfast ? mov_superfast : na, "Superfast", color = lineColor(c_super), linewidth = 1)
+plot(show_slow      ? mov_slow      : na, "Slow",      color = lineColor(c_slow),  linewidth = 1)
+plot(show_tr3nd     ? mov_tr3nd     : na, "Tr3nd",     color = lineColor(c_tr3nd), linewidth = 1)
+
+// ============================================================
+// Clouds  (AddCloud equivalent)
+// ============================================================
+cloudUp = color.new(trendymode ? c_tbull : c_bull, 80)
+cloudDn = color.new(c_ltred, 80)
+
+c1a = plot(cloud ? mov_slow      : na, "", display = display.none, editable = false)
+c1b = plot(cloud ? mov_tr3nd     : na, "", display = display.none, editable = false)
+fill(c1a, c1b, color = mov_slow > mov_tr3nd ? cloudUp : cloudDn, title = "Slow / Tr3nd cloud")
+
+c2a = plot(cloud and trendymode ? mov_superfast : na, "", display = display.none, editable = false)
+c2b = plot(cloud and trendymode ? mov_slow      : na, "", display = display.none, editable = false)
+fill(c2a, c2b, color = mov_superfast > mov_slow ? color.new(c_tbull, 80) : cloudDn, title = "Superfast / Slow cloud")
+
+// ============================================================
+// Candle formation (inside-bar coil + break)
+// ============================================================
+h = high
+l = low
+c = close
+o = open
+
+A = o < c
+Z = o > c
+
+th = c > o ? c : o
+tl = c > o ? o : c
+
+X    = h[1] >= o and th[1] >= c and tl[1] <= c and l[1] <= o
+XX   = X[1]  and h[2] >= c and l[2] <= c
+XXX  = XX[1] and h[3] >= c and l[3] <= c
+
+ZXZ = (Z[2] and X[1]   and c < l[2] and c < o) or
+      (Z[3] and XX[1]  and c < l[3] and c < o) or
+      (Z[4] and XXX[1] and c < l[4] and c < o)
+
+AXA = (A[2] and X[1]   and c > h[2] and c > o) or
+      (A[3] and XX[1]  and c > h[3] and c > o) or
+      (A[4] and XXX[1] and c > h[4] and c > o)
+
+bullFormation = AXA and tState == 1
+bearFormation = ZXZ and tState == 2
+
+plotshape(arrows and bullFormation, "Bullish Candle Formation", shape.triangleup,   location.belowbar, color.new(c_bull, 0), size = size.tiny)
+plotshape(arrows and bearFormation, "Bearish Candle Formation", shape.triangledown, location.abovebar, color.new(c_bear, 0), size = size.tiny)
+
+// ============================================================
+// BUY / SELL state machine
+// ============================================================
+rawSignal = (buy and buySignal_HTF) ? 1 : sell ? -1 : 0
+
+var int lastSignal = 0
+prevSignal = lastSignal            // value carried in from the previous bar
+lastSignal := rawSignal != 0 ? rawSignal : prevSignal
+
+buySig  = rawSignal ==  1 and prevSignal !=  1
+sellSig = rawSignal == -1 and prevSignal != -1
+
+plotshape(buySig  ? low  : na, "Buy Triangle",  shape.triangleup,   location.absolute, color.new(c_bull, 0), size = size.small)
+plotshape(sellSig ? high : na, "Sell Triangle", shape.triangledown, location.absolute, color.new(c_bear, 0), size = size.small)
+
+// ============================================================
+// Moving-average stack
+// ============================================================
+isDaily  = timeframe.isdaily
+isWeekly = timeframe.isweekly
+
+adjust(len) => isWeekly ? math.max(1, int(math.round(len / 5.0))) : len
+
+ema5_len   = adjust(5)
+ema10_len  = adjust(10)
+ema21_len  = adjust(21)
+sma50_len  = adjust(50)
+
+ema5v   = ta.ema(close, ema5_len)
+ema10v  = ta.ema(close, ema10_len)
+ema21v  = ta.ema(close, ema21_len)
+sma50v  = ta.sma(close, sma50_len)
+sma200w = ta.sma(close, 40)        // 200 daily ≈ 40 weekly
+
+plot(show_ma_stack and isDaily ? ema5v  : na, "EMA5",  color = color.aqua,  linewidth = 1)
+plot(show_ma_stack and isDaily ? ema10v : na, "EMA10", color = color.green, linewidth = 2)
+plot(show_ma_stack and isDaily ? ema21v : na, "EMA21", color = color.blue,  linewidth = 2)
+plot(show_sma50 ? sma50v : na, "SMA50", color = color.orange, linewidth = 1)
+plot(show_sma200 and isWeekly ? sma200w : na, "SMA200 (weekly equiv)", color = color.maroon, linewidth = 2, style = plot.style_linebr)
+
+// thinkScript computes EMA5/10/21 only on Daily, so the stack is Daily-only there.
+maContextOK = restrict_ma_daily ? (isDaily or isWeekly) : true
+
+crossAboveEMA10 = ta.crossover(close, ema10v) and (restrict_ma_daily ? isDaily : true)
+crossAboveEMA21 = ta.crossover(close, ema21v) and (restrict_ma_daily ? isDaily : true)
+
+showPlusMark = buy and buySignal_HTF and (crossAboveEMA10 or crossAboveEMA21)
+
+MAAlignmentRaw = isWeekly ?
+     (ema5v > ema10v and ema10v > ema21v and ema21v > sma50v and sma50v > sma200w) :
+     (ema5v > ema10v and ema10v > ema21v and ema21v > sma50v)
+MAAlignment = maContextOK and MAAlignmentRaw
+
+bullish = MAAlignment and buy and not MAAlignment[1]
+
+var int bullishState = 0
+prevBullishState = bullishState
+bullishState := sell ? 0 : bullish ? 1 : prevBullishState
+
+bullish_scan = bullishState == 1 and prevBullishState == 0
+
+if bullish_scan
+    label.new(bar_index, low, "B", style = label.style_label_up, color = color.new(c_bull, 20), textcolor = color.white, size = size.small)
+
+if showPlusMark
+    label.new(bar_index, high, "+", style = label.style_label_down, color = color.new(c_bull, 20), textcolor = color.white, size = size.small)
+
+// ============================================================
+// Support / Resistance — next 2 resistances + next support
+// ============================================================
+var array<float> phVals = array.new_float()
+var array<int>   phBars = array.new_int()
+var array<float> plVals = array.new_float()
+var array<int>   plBars = array.new_int()
+
+ph = ta.pivothigh(sr_strength, sr_strength)
+pl = ta.pivotlow(sr_strength, sr_strength)
+
+if not na(ph)
+    array.push(phVals, ph)
+    array.push(phBars, bar_index)
+if not na(pl)
+    array.push(plVals, pl)
+    array.push(plBars, bar_index)
+
+// drop pivots older than the lookback window
+while array.size(phBars) > 0 and bar_index - array.get(phBars, 0) > sr_lookback
+    array.shift(phBars)
+    array.shift(phVals)
+while array.size(plBars) > 0 and bar_index - array.get(plBars, 0) > sr_lookback
+    array.shift(plBars)
+    array.shift(plVals)
+
+// R1 = lowest pivot high still above price
+float R1 = na
+for i = 0 to math.max(array.size(phVals) - 1, 0)
+    if array.size(phVals) > 0
+        v = array.get(phVals, i)
+        if v > close and (na(R1) or v < R1)
+            R1 := v
+
+// R2 = next pivot high above R1
+float R2 = na
+if not na(R1)
+    for i = 0 to math.max(array.size(phVals) - 1, 0)
+        if array.size(phVals) > 0
+            v = array.get(phVals, i)
+            if v > R1 and (na(R2) or v < R2)
+                R2 := v
+
+// S1 = highest pivot low still below price
+float S1 = na
+for i = 0 to math.max(array.size(plVals) - 1, 0)
+    if array.size(plVals) > 0
+        v = array.get(plVals, i)
+        if v < close and (na(S1) or v > S1)
+            S1 := v
+
+// Values stay readable in the Data Window even when the levels are hidden.
+plot(R1, "Res1", color = color.red,    display = display.data_window)
+plot(R2, "Res2", color = color.maroon, display = display.data_window)
+plot(S1, "Sup1", color = color.green,  display = display.data_window)
+
+// Drawn as short horizontal rays anchored to the current bar rather than as a
+// plotted series — the series version steps vertically every time the nearest
+// pivot changes, which produced the square-wave look.
+var line  lnR1  = na
+var line  lnR2  = na
+var line  lnS1  = na
+var label lblR1 = na
+var label lblR2 = na
+var label lblS1 = na
+
+drawLine(lv, col) =>
+    line.new(bar_index - sr_ray_len, lv, bar_index + 5, lv,
+         color = color.new(col, 30), width = 1, style = line.style_dashed)
+
+drawTag(lv, txt, col) =>
+    label.new(bar_index + 5, lv, txt, style = label.style_label_left,
+         color = color.new(col, 20), textcolor = color.white, size = size.small)
+
+if barstate.islast
+    line.delete(lnR1)
+    line.delete(lnR2)
+    line.delete(lnS1)
+    label.delete(lblR1)
+    label.delete(lblR2)
+    label.delete(lblS1)
+    if show_sr and not na(R1)
+        lnR1 := drawLine(R1, color.red)
+        lblR1 := sr_bubbles ? drawTag(R1, "R1", color.red) : na
+    if show_sr and not na(R2)
+        lnR2 := drawLine(R2, color.maroon)
+        lblR2 := sr_bubbles ? drawTag(R2, "R2", color.maroon) : na
+    if show_sr and not na(S1)
+        lnS1 := drawLine(S1, color.green)
+        lblS1 := sr_bubbles ? drawTag(S1, "S1", color.green) : na
+
+// ============================================================
+// Alerts
+// ============================================================
+alertcondition(bullFormation, "Bullish Candle Formation", "Bullish Candle Formation on {{ticker}}")
+alertcondition(bearFormation, "Bearish Candle Formation", "Bearish Candle Formation on {{ticker}}")
+alertcondition(buySig,        "Buy Signal",               "BUY signal on {{ticker}} at {{close}}")
+alertcondition(sellSig,       "Sell Signal",              "SELL signal on {{ticker}} at {{close}}")
+alertcondition(bullish_scan,  "Bullish Scan (B)",         "MA stack aligned + trend up on {{ticker}}")
+
+if alerts and bullFormation
+    alert("Bullish Candle Formation", alert.freq_once_per_bar_close)
+if alerts and bearFormation
+    alert("Bearish Candle Formation", alert.freq_once_per_bar_close)

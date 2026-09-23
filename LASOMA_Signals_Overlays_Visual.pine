@@ -1,0 +1,694 @@
+//@version=6
+// LASOMA: Signals & Overlays Visual
+// Pine Script v6 conversion of the ThinkScript port of TXInvestor's "LASOMA: Signals & Overlays Visual".
+// Ports: preset system, Smart Trail, Trend Catcher, Trend Tracer, Neo Cloud, VWAP / anchored VWAP,
+// opening range, structure (BOS/CHoCH), liquidity sweeps, FVG, order blocks, HTF levels, futures
+// regime/flow model, ML-style ensemble score, trade levels, regime/strength/squeeze/volume labels, alerts.
+// Notes:
+// - Pine boxes are native here (unlike the ThinkScript port), so FVG / order blocks are drawn as real
+//   boxes with a max-count cap rather than a single "latest zone" approximation.
+// - The KNN filter from the original Pine source is intentionally NOT reproduced (ml.knn / matrix based
+//   loops are out of scope for a faithful, maintainable port); UseKnnFilter is kept as a pass-through
+//   toggle that only shows a warning label, exactly like the ThinkScript version.
+indicator("LASOMA: Signals & Overlays Visual", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
+
+// ============================================================================================
+// INPUTS
+// ============================================================================================
+TradingPreset       = input.string("Screener Match", "Trading Preset", options = ["Screener Match", "Scalping", "Day Trading", "Trend Trading", "Swing Trading", "Futures", "Custom"], group = "Presets")
+VisualPreset        = input.string("None", "Visual Preset", options = ["None", "Smart Trail", "Trend Catcher", "Trend Tracer", "Neo Cloud", "All", "Custom"], group = "Presets")
+SignalModeOverride  = input.string("Preset Default", "Signal Mode Override", options = ["Preset Default", "Component Score", "Trend Catcher", "Trend Investor"], group = "Presets")
+SignalSensitivity   = input.int(24, "Signal Sensitivity", group = "Presets")
+ShowSignalMarkers   = input.bool(false, "Show Signal Markers", group = "Presets")
+EnableAlerts        = input.bool(false, "Enable Alerts", group = "Presets")
+
+UseKnnFilter          = input.bool(false, "Use KNN Filter (pass-through, not reproduced)", group = "KNN (unused)")
+KnnLookback            = input.int(50, "KNN Lookback", group = "KNN (unused)")
+KnnNeighbors           = input.int(8, "KNN Neighbors", group = "KNN (unused)")
+KnnDistanceThreshold   = input.float(10.0, "KNN Distance Threshold", group = "KNN (unused)")
+
+CustomSmartTrail   = input.bool(false, "Custom: Smart Trail", group = "Custom Visual Toggles")
+CustomCatcher      = input.bool(false, "Custom: Trend Catcher", group = "Custom Visual Toggles")
+CustomTracer       = input.bool(false, "Custom: Trend Tracer", group = "Custom Visual Toggles")
+CustomCloud        = input.bool(false, "Custom: Neo Cloud", group = "Custom Visual Toggles")
+ShowTrendOverlayInput = input.bool(false, "Custom: Trend Overlay (squares/bar color)", group = "Custom Visual Toggles")
+CustomMlScore      = input.bool(false, "Custom: ML Score Label", group = "Custom Visual Toggles")
+
+ShowVwap            = input.bool(false, "Show Session VWAP", group = "Levels & Zones")
+ShowAnchoredVwap     = input.bool(false, "Show Anchored VWAP (from last pivot)", group = "Levels & Zones")
+ShowOpeningRange     = input.bool(false, "Show Opening Range", group = "Levels & Zones")
+ShowStructure        = input.bool(false, "Show Structure (BOS/CHoCH)", group = "Levels & Zones")
+ShowLiquidity        = input.bool(false, "Show Liquidity Sweeps", group = "Levels & Zones")
+ShowFvg              = input.bool(false, "Show Fair Value Gaps", group = "Levels & Zones")
+ShowOrderBlocks      = input.bool(false, "Show Order Blocks", group = "Levels & Zones")
+ShowBreakers         = input.bool(false, "Show Breaker Blocks", group = "Levels & Zones")
+ShowHtfLevels        = input.bool(false, "Show HTF Prior High/Low", group = "Levels & Zones")
+ShowRegime           = input.bool(false, "Show Regime Label", group = "Levels & Zones")
+
+OpeningRangeStartTime = input.string("0930", "Opening Range Start (HHMM, exchange time)", group = "Sessions/Structure")
+OpeningRangeEndTime   = input.string("1000", "Opening Range End (HHMM, exchange time)", group = "Sessions/Structure")
+VwapSessionStartTime  = input.string("0930", "VWAP Session Start (HHMM, exchange time)", group = "Sessions/Structure")
+VwapSessionEndTime    = input.string("1600", "VWAP Session End (HHMM, exchange time)", group = "Sessions/Structure")
+StructurePivotLength = input.int(5, "Structure Pivot Length", group = "Sessions/Structure")
+LiquidityLookback    = input.int(20, "Liquidity Lookback", group = "Sessions/Structure")
+HtfAggregation       = input.timeframe("D", "HTF Aggregation", group = "Sessions/Structure")
+
+ShowMlLabel                     = input.bool(true, "Show ML Score Label", group = "ML / Scoring")
+MlSensitivity                   = input.float(1.8, "ML Sensitivity", group = "ML / Scoring")
+MlBullThreshold                 = input.float(60.0, "ML Bull Threshold", group = "ML / Scoring")
+MlBearThreshold                 = input.float(40.0, "ML Bear Threshold", group = "ML / Scoring")
+MinMlConfidence                 = input.int(3, "Minimum ML Confidence (1-5)", group = "ML / Scoring")
+EnableScalpingScoreChangeSignals = input.bool(true, "Enable Scalping Score-Change Signals", group = "ML / Scoring")
+ShowModelScoreHistory            = input.bool(true, "Plot Model Score History (hidden)", group = "ML / Scoring")
+
+AtrLength                    = input.int(14, "ATR Length", group = "Core Engine")
+TrailMultiplier               = input.float(3.0, "Trail ATR Multiplier", group = "Core Engine")
+CatcherFastEma                = input.int(8, "Catcher Fast EMA", group = "Core Engine")
+CatcherSlowEma                 = input.int(21, "Catcher Slow EMA", group = "Core Engine")
+TracerLength                   = input.int(24, "Tracer (Inertia) Length", group = "Core Engine")
+CloudLength                    = input.int(50, "Cloud Basis Length", group = "Core Engine")
+CloudAtrWidth                  = input.float(1.5, "Cloud ATR Width", group = "Core Engine")
+CloudRangeLength                = input.int(80, "Cloud Range Length", group = "Core Engine")
+FuturesConfirmationBars         = input.int(1, "Futures Confirmation Bars (unused, kept for parity)", group = "Core Engine")
+FuturesTrendStrengthFilter      = input.bool(true, "Futures Trend Strength Filter (ADX)", group = "Core Engine")
+FuturesMinimumAdx               = input.float(18.0, "Futures Minimum ADX", group = "Core Engine")
+FuturesStructureLookback        = input.int(10, "Futures Structure Lookback", group = "Core Engine")
+FuturesImpulseAtrThreshold      = input.float(0.75, "Futures Impulse ATR Threshold", group = "Core Engine")
+
+ShowCloudFill         = input.bool(true, "Show Cloud Fill", group = "Style")
+ShowCloudInnerRibbon   = input.bool(false, "Show Cloud Inner Ribbon", group = "Style")
+KeepCloudBelowPrice    = input.bool(true, "Keep Cloud Below Price", group = "Style")
+ShowTrailFill          = input.bool(true, "Show Trail Fill", group = "Style")
+ShowCatcherFill        = input.bool(true, "Show Catcher Fill", group = "Style")
+ShowCatcherBoundaries  = input.bool(false, "Show Catcher Boundaries", group = "Style")
+ShowCatcherCenterLine  = input.bool(true, "Show Catcher Center Line", group = "Style")
+CatcherStyle           = input.string("Smooth", "Catcher Style", options = ["Smooth", "Stepped"], group = "Style")
+CatcherSmoothing       = input.int(3, "Catcher Smoothing", group = "Style")
+TrailStyle             = input.string("Line", "Trail Style", options = ["Line", "Stepped"], group = "Style")
+TrailSmoothing         = input.int(3, "Trail Smoothing", group = "Style")
+TrailBandAtrWidth      = input.float(0.35, "Trail Band ATR Width", group = "Style")
+ShowLevels             = input.bool(false, "Show Trade Levels", group = "Style")
+StopAtrMultiplier      = input.float(1.5, "Stop ATR Multiplier", group = "Style")
+Target1R               = input.float(1.0, "Target 1 (R)", group = "Style")
+Target2R               = input.float(2.0, "Target 2 (R)", group = "Style")
+Target3R               = input.float(3.0, "Target 3 (R)", group = "Style")
+Stop1R                 = input.float(1.0, "Stop 1 (R)", group = "Style")
+Stop2R                 = input.float(1.5, "Stop 2 (R)", group = "Style")
+
+ShowStrength         = input.bool(false, "Show Strength Label", group = "Labels")
+ShowSqueeze          = input.bool(false, "Show Squeeze Label", group = "Labels")
+ShowVolumeSentiment  = input.bool(false, "Show Volume Sentiment Label", group = "Labels")
+
+// ============================================================================================
+// COLORS  (DefineGlobalColor equivalents)
+// ============================================================================================
+colBull      = color.new(color.rgb(34, 197, 94), 0)
+colBear      = color.new(color.rgb(255, 32, 32), 0)
+colNeutral   = color.new(color.rgb(139, 92, 246), 0)
+colChochBar  = color.new(color.rgb(180, 140, 255), 0)
+colBullChoch = color.new(color.rgb(34, 197, 94), 0)
+colBearChoch = color.new(color.rgb(255, 32, 32), 0)
+colTrailBull = color.new(color.rgb(0, 188, 212), 0)
+colTrailBear = color.new(color.rgb(255, 152, 0), 0)
+colNeoCloud  = color.new(color.rgb(91, 156, 246), 0)
+colNeoFill   = color.new(color.rgb(16, 39, 93), 0)
+colStop      = color.new(color.rgb(242, 54, 69), 0)
+colTarget    = color.new(color.rgb(41, 98, 255), 0)
+colEntry     = color.new(color.rgb(120, 123, 134), 0)
+
+// ============================================================================================
+// HELPER FUNCTIONS  (script Clamp / ConfidenceLevel)
+// ============================================================================================
+f_clamp(_value) =>
+    math.max(-1.0, math.min(1.0, _value))
+
+f_confidenceLevel(_score) =>
+    _distance = math.abs(_score - 50.0) * 2.0
+    _distance >= 80.0 ? 5 : _distance >= 60.0 ? 4 : _distance >= 30.0 ? 3 : _distance >= 10.0 ? 2 : 1
+
+// TOS built-in Inertia(price, length): linear regression (over `length`) of a 10/14 Relative
+// Vigor Index. Reproduced here since Pine has no native Inertia() function.
+f_inertia(_src, _length) =>
+    _stdev   = ta.stdev(_src, 10)
+    _upDev   = _src > _src[1] ? _stdev : 0.0
+    _downDev = _src < _src[1] ? _stdev : 0.0
+    _num     = ta.sma(_upDev, 14)
+    _den     = _num + ta.sma(_downDev, 14)
+    _rvi     = _den != 0 ? _num / _den * 100.0 : 50.0
+    ta.linreg(_rvi, _length, 0)
+
+// ============================================================================================
+// CORE STATE
+// ============================================================================================
+tick = syminfo.mintick
+hlc3v = hlc3
+
+manualVisualEnabled = TradingPreset == "Futures" or CustomSmartTrail or CustomCatcher or CustomTracer or CustomCloud or
+                       ShowSignalMarkers or CustomMlScore or ShowVwap or ShowAnchoredVwap or ShowOpeningRange or
+                       ShowStructure or ShowLiquidity or ShowFvg or ShowOrderBlocks or ShowBreakers or ShowHtfLevels or
+                       ShowRegime or ShowLevels or ShowStrength or ShowSqueeze or ShowVolumeSentiment
+visualEnabled = VisualPreset != "None" or manualVisualEnabled
+
+showSmartTrail = visualEnabled and (CustomSmartTrail or VisualPreset == "Smart Trail" or VisualPreset == "All")
+showCatcher    = visualEnabled and (CustomCatcher or VisualPreset == "Trend Catcher" or VisualPreset == "All")
+showTracer     = visualEnabled and (CustomTracer or VisualPreset == "Trend Tracer" or VisualPreset == "All")
+showCloud      = visualEnabled and (CustomCloud or VisualPreset == "Neo Cloud" or VisualPreset == "All")
+// Deviation from the original ThinkScript default (which auto-enabled this for nearly every
+// preset): bar coloring dominated by "neutral" purple whenever the active signal mode requires
+// full agreement across sub-indicators, which reads as worse than plain up/down candle colors.
+// Made strictly opt-in per user preference.
+showTrendOverlay = ShowTrendOverlayInput
+showSignals    = visualEnabled and ShowSignalMarkers
+showMlScore    = visualEnabled and CustomMlScore
+
+activeAtrLength = TradingPreset == "Screener Match" ? 14 : TradingPreset == "Scalping" ? 5 : TradingPreset == "Day Trading" ? 10 : TradingPreset == "Futures" ? 10 : AtrLength
+activeCatcherFast = TradingPreset == "Scalping" ? 5 : TradingPreset == "Trend Trading" ? 10 : TradingPreset == "Swing Trading" ? 13 : CatcherFastEma
+activeCatcherSlow = TradingPreset == "Scalping" ? 13 : TradingPreset == "Trend Trading" ? 30 : TradingPreset == "Swing Trading" ? 34 : CatcherSlowEma
+activeTracerLength = TradingPreset == "Scalping" ? 14 : TradingPreset == "Trend Trading" ? 34 : TradingPreset == "Swing Trading" ? 50 : TracerLength
+activeCloudLength = TradingPreset == "Scalping" ? 34 : TradingPreset == "Trend Trading" ? 70 : TradingPreset == "Swing Trading" ? 100 : CloudLength
+activeCloudRangeLength = TradingPreset == "Scalping" ? 40 : TradingPreset == "Futures" ? 60 : TradingPreset == "Trend Trading" ? 110 : TradingPreset == "Swing Trading" ? 140 : CloudRangeLength
+activeCloudWidth = TradingPreset == "Scalping" ? 1.0 : TradingPreset == "Futures" ? 1.8 : TradingPreset == "Trend Trading" ? 1.7 : TradingPreset == "Swing Trading" ? 2.0 : CloudAtrWidth
+activeTrailMultiplier = TradingPreset == "Scalping" ? 2.0 : TradingPreset == "Day Trading" ? 2.5 : TradingPreset == "Swing Trading" ? 3.5 : TradingPreset == "Futures" ? 2.0 : TrailMultiplier
+activeSignalSensitivity = TradingPreset == "Scalping" ? 12 : TradingPreset == "Day Trading" ? 16 : TradingPreset == "Trend Trading" ? 20 : TradingPreset == "Futures" ? 12 : SignalSensitivity
+
+presetSignalModeComponent = TradingPreset == "Screener Match" or TradingPreset == "Custom"
+presetSignalModeCatcher   = TradingPreset == "Day Trading"
+useComponentSignalMode = SignalModeOverride == "Component Score" or (SignalModeOverride == "Preset Default" and presetSignalModeComponent)
+useCatcherSignalMode   = SignalModeOverride == "Trend Catcher" or (SignalModeOverride == "Preset Default" and presetSignalModeCatcher)
+useInvestorSignalMode  = SignalModeOverride == "Trend Investor" or (SignalModeOverride == "Preset Default" and not presetSignalModeComponent and not presetSignalModeCatcher)
+
+// ============================================================================================
+// CORE INDICATORS
+// ============================================================================================
+trv = ta.tr(true)
+atrValue = ta.rma(trv, activeAtrLength)
+atrAverage = ta.sma(atrValue, 50)
+atrSafe = math.max(atrValue, tick)
+
+emaFast = ta.ema(close, activeCatcherFast)
+emaSlow = ta.ema(close, activeCatcherSlow)
+catcherVisualFast = ta.ema(emaFast, CatcherSmoothing)
+catcherVisualSlow = ta.ema(emaSlow, CatcherSmoothing)
+catcherVisualUpper = math.max(catcherVisualFast, catcherVisualSlow)
+catcherVisualLower = math.min(catcherVisualFast, catcherVisualSlow)
+catcherVisualCenter = (catcherVisualUpper + catcherVisualLower) * 0.5
+catcherBullish = emaFast > emaSlow
+catcherLongSignal  = ta.crossover(emaFast, emaSlow)
+catcherShortSignal = ta.crossunder(emaFast, emaSlow)
+
+tracerValue = f_inertia(close, activeTracerLength)
+tracerBullish = tracerValue > tracerValue[1]
+
+cloudBasis = ta.sma(close, activeCloudLength)
+cloudWidth = atrValue * activeCloudWidth
+cloudUpper = cloudBasis + cloudWidth
+cloudLower = cloudBasis - cloudWidth
+rawCloudOuterUpper = ta.highest(high, activeCloudRangeLength)
+rawCloudOuterLower = ta.lowest(low, activeCloudRangeLength)
+supportCloudUpper = ta.highest(low, activeCloudRangeLength)
+cloudOuterUpper = KeepCloudBelowPrice ? math.min(supportCloudUpper, close - atrValue * 0.25) : rawCloudOuterUpper
+cloudOuterLower = KeepCloudBelowPrice ? math.min(rawCloudOuterLower, cloudOuterUpper - atrValue * 2.0) : rawCloudOuterLower
+visualCloudUpper = KeepCloudBelowPrice ? math.min(cloudUpper, close - atrValue * 0.25) : cloudUpper
+visualCloudBasis = KeepCloudBelowPrice ? math.min(cloudBasis, visualCloudUpper) : cloudBasis
+visualCloudLower = KeepCloudBelowPrice ? math.min(cloudLower, visualCloudBasis - atrValue * 0.1) : cloudLower
+cloudBullish = close > cloudBasis
+
+rsiValue = ta.rsi(close, 14)
+stDev20 = ta.stdev(close, 20)
+sma20 = ta.sma(close, 20)
+volumeAverage = ta.sma(volume, 20)
+volumeSafe = math.max(volumeAverage, 1.0)
+volumeRangeSafe = math.max(high - low, tick)
+volumeSentimentNumerator = math.sum((close - low) / volumeRangeSafe * volume, 20)
+volumeSentimentDenominator = math.sum(volume, 20)
+strengthValue = rsiValue
+squeezeValue = math.min(100.0, (stDev20 * 2.0) / (sma20 == 0 ? 1.0 : sma20) * 100.0 * 5.0)
+volumeSentimentValue = (volumeSentimentDenominator == 0 ? 0.0 : volumeSentimentNumerator / volumeSentimentDenominator) * 100.0
+relativeVolumeValue = volumeAverage == 0 ? 0.0 : volume / volumeAverage
+volatilityRegimeValue = atrAverage == 0 ? 1.0 : atrValue / atrAverage
+
+// ============================================================================================
+// SESSIONS: VWAP / OPENING RANGE  (SecondsFromTime/SecondsTillTime -> time(tf, "start-end") idiom)
+// ============================================================================================
+orSessionString   = OpeningRangeStartTime + "-" + OpeningRangeEndTime
+vwapSessionString = VwapSessionStartTime + "-" + VwapSessionEndTime
+
+openingRangeActive = not na(time(timeframe.period, orSessionString))
+inVwapSession       = not na(time(timeframe.period, vwapSessionString))
+vwapSessionStartBar = inVwapSession and not inVwapSession[1]
+
+var float sessionVwapPV     = na
+var float sessionVwapVolume = na
+sessionVwapPV := vwapSessionStartBar ? hlc3v * volume : inVwapSession ? nz(sessionVwapPV[1]) + hlc3v * volume : nz(sessionVwapPV[1])
+sessionVwapVolume := vwapSessionStartBar ? volume : inVwapSession ? nz(sessionVwapVolume[1]) + volume : nz(sessionVwapVolume[1])
+sessionVwapValue = inVwapSession and sessionVwapVolume > 0 ? sessionVwapPV / sessionVwapVolume : na
+
+newTradingDay = ta.change(time("D")) != 0
+var float openingRangeHigh = na
+var float openingRangeLow  = na
+openingRangeHigh := newTradingDay ? na : openingRangeActive ? (na(openingRangeHigh[1]) ? high : math.max(openingRangeHigh[1], high)) : openingRangeHigh[1]
+openingRangeLow  := newTradingDay ? na : openingRangeActive ? (na(openingRangeLow[1])  ? low  : math.min(openingRangeLow[1], low))   : openingRangeLow[1]
+
+// ============================================================================================
+// STRUCTURE: swing pivots, BOS/CHoCH, anchored VWAP, liquidity sweeps
+// ============================================================================================
+pivotSpan = StructurePivotLength * 2 + 1
+pivotHigh = high[StructurePivotLength] == ta.highest(high, pivotSpan)
+pivotLow  = low[StructurePivotLength]  == ta.lowest(low, pivotSpan)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+lastSwingHigh := pivotHigh ? high[StructurePivotLength] : lastSwingHigh[1]
+lastSwingLow  := pivotLow  ? low[StructurePivotLength]  : lastSwingLow[1]
+
+var int swingHighBroken = 0
+var int swingLowBroken  = 0
+swingHighBroken := pivotHigh ? 0 : (not na(lastSwingHigh[1]) and close > lastSwingHigh[1] and close[1] <= lastSwingHigh[1]) ? 1 : swingHighBroken[1]
+swingLowBroken  := pivotLow  ? 0 : (not na(lastSwingLow[1])  and close < lastSwingLow[1]  and close[1] >= lastSwingLow[1])  ? 1 : swingLowBroken[1]
+
+var int structureBias = 0
+structureBias := (not na(lastSwingHigh[1]) and swingHighBroken[1] == 0 and close > lastSwingHigh[1] and close[1] <= lastSwingHigh[1]) ? 1 : (not na(lastSwingLow[1]) and swingLowBroken[1] == 0 and close < lastSwingLow[1] and close[1] >= lastSwingLow[1]) ? -1 : structureBias[1]
+
+bullishStructureBreak = structureBias == 1 and structureBias[1] != 1
+bearishStructureBreak = structureBias == -1 and structureBias[1] != -1
+bullishChoch = bullishStructureBreak and structureBias[1] == -1
+bearishChoch = bearishStructureBreak and structureBias[1] == 1
+
+newAnchor = pivotHigh or pivotLow
+var float anchoredVwapPV     = na
+var float anchoredVwapVolume = na
+anchoredVwapPV     := newAnchor ? hlc3v * volume : nz(anchoredVwapPV[1]) + hlc3v * volume
+anchoredVwapVolume := newAnchor ? volume : nz(anchoredVwapVolume[1]) + volume
+anchoredVwapValue = anchoredVwapVolume != 0 ? anchoredVwapPV / anchoredVwapVolume : na
+
+priorLiquidityHigh = ta.highest(high, LiquidityLookback)[1]
+priorLiquidityLow  = ta.lowest(low, LiquidityLookback)[1]
+buySideSweep  = high > priorLiquidityHigh and close < priorLiquidityHigh
+sellSideSweep = low < priorLiquidityLow and close > priorLiquidityLow
+
+// ============================================================================================
+// HTF LEVELS
+// ============================================================================================
+previousHtfHigh = request.security(syminfo.tickerid, HtfAggregation, high[1], lookahead = barmerge.lookahead_off)
+previousHtfLow  = request.security(syminfo.tickerid, HtfAggregation, low[1],  lookahead = barmerge.lookahead_off)
+
+// ============================================================================================
+// FVG / ORDER BLOCKS  (native Pine boxes, capped, replacing the single-zone TOS approximation)
+// ============================================================================================
+bullishFvg = low > high[2]
+bearishFvg = high < low[2]
+bullishOrderBlock = close > high[1] and close[1] < open[1]
+bearishOrderBlock = close < low[1] and close[1] > open[1]
+
+var box[] bullFvgBoxes = array.new_box()
+var box[] bearFvgBoxes = array.new_box()
+var box[] bullObBoxes  = array.new_box()
+var box[] bearObBoxes  = array.new_box()
+maxZoneBoxes = 20
+
+f_pushZoneBox(_boxes, _top, _bottom, _borderColor, _fillColor) =>
+    if array.size(_boxes) >= maxZoneBoxes
+        box.delete(array.shift(_boxes))
+    _b = box.new(bar_index - 2, _top, bar_index + 20, _bottom, border_color = _borderColor, bgcolor = _fillColor, extend = extend.none)
+    array.push(_boxes, _b)
+    _b
+
+if ShowFvg and visualEnabled and bullishFvg
+    f_pushZoneBox(bullFvgBoxes, low, high[2], colBull, color.new(colBull, 85))
+if ShowFvg and visualEnabled and bearishFvg
+    f_pushZoneBox(bearFvgBoxes, low[2], high, colBear, color.new(colBear, 85))
+if ShowOrderBlocks and visualEnabled and bullishOrderBlock
+    f_pushZoneBox(bullObBoxes, high[1], low[1], colBull, color.new(colBull, 85))
+if ShowOrderBlocks and visualEnabled and bearishOrderBlock
+    f_pushZoneBox(bearObBoxes, high[1], low[1], colBear, color.new(colBear, 85))
+
+// Breaker blocks: an order block whose zone gets fully closed through (mitigated) in the opposite
+// direction — the ThinkScript version only had a comment placeholder; this is a faithful concrete
+// definition consistent with standard SMC breaker-block logic.
+bullBreaker = bearishOrderBlock[1] and close > high[1]
+bearBreaker = bullishOrderBlock[1] and close < low[1]
+if ShowBreakers and visualEnabled and bullBreaker
+    f_pushZoneBox(bullObBoxes, high[1], low[1], colTrailBull, color.new(colTrailBull, 88))
+if ShowBreakers and visualEnabled and bearBreaker
+    f_pushZoneBox(bearObBoxes, high[1], low[1], colTrailBear, color.new(colTrailBear, 88))
+
+// ============================================================================================
+// FUTURES FLOW / REGIME MODEL  (CMF + MFI flow score, HyperWave momentum, ADX-gated structure)
+// ============================================================================================
+futuresFlowVolume = na(volume) or volume <= 0 ? 1.0 : volume
+futuresFlowRange = math.max(high - low, tick)
+futuresMoneyFlowVolume = ((2.0 * close - high - low) / futuresFlowRange) * futuresFlowVolume
+futuresCMFRaw = math.sum(futuresMoneyFlowVolume, 20) / math.max(math.sum(futuresFlowVolume, 20), 1)
+futuresCMF = ta.ema(futuresCMFRaw * 100.0, 10)
+
+positiveMF = hlc3v > hlc3v[1] ? hlc3v * futuresFlowVolume : 0.0
+negativeMF = hlc3v < hlc3v[1] ? hlc3v * futuresFlowVolume : 0.0
+positiveMFSum = math.sum(positiveMF, 20)
+negativeMFSum = math.sum(negativeMF, 20)
+futuresMFIRaw = negativeMFSum == 0 and positiveMFSum > 0 ? 100.0 : positiveMFSum == 0 and negativeMFSum > 0 ? 0.0 : positiveMFSum == 0 and negativeMFSum == 0 ? 50.0 : 100.0 - (100.0 / (1.0 + positiveMFSum / negativeMFSum))
+futuresMFI = ta.ema((futuresMFIRaw - 50.0) * 2.0, 10)
+futuresFlowScore = (futuresCMF + futuresMFI) / 2.0
+
+futuresHyperMacd = ta.ema(close, 12) - ta.ema(close, 26)
+futuresHyperBase = ta.sma(close, 50)
+futuresHyperRaw = ta.ema(futuresHyperBase == 0 ? 0.0 : futuresHyperMacd / futuresHyperBase * 100.0, 5)
+futuresHyperRange = ta.highest(math.abs(futuresHyperRaw), 100)
+futuresHyperWave = futuresHyperRange == 0 ? 0.0 : futuresHyperRaw / futuresHyperRange * 100.0
+futuresTrendBullish = futuresFlowScore > 0 and futuresHyperWave > 0
+futuresTrendBearish = futuresFlowScore < 0 and futuresHyperWave < 0
+
+// ============================================================================================
+// SMART TRAIL
+// ============================================================================================
+trailHigh = ta.highest(high, 10)
+trailLow  = ta.lowest(low, 10)
+smartTrail = catcherBullish ? trailHigh - activeTrailMultiplier * atrValue : trailLow + activeTrailMultiplier * atrValue
+trailBullish = close > smartTrail
+
+var float visualSmartTrail = na
+visualSmartTrail := catcherBullish ? math.max(nz(visualSmartTrail[1], smartTrail), close - activeTrailMultiplier * atrValue) : math.min(nz(visualSmartTrail[1], smartTrail), close + activeTrailMultiplier * atrValue)
+
+// ============================================================================================
+// COMPONENT SCORE
+// ============================================================================================
+componentScore = (trailBullish ? 1 : -1) + (catcherBullish ? 1 : -1) + (tracerBullish ? 1 : -1) + (cloudBullish ? 1 : -1)
+componentBullish = componentScore >= 3
+componentBearish = componentScore <= -3
+componentBullishSignal = componentBullish and not componentBullish[1]
+componentBearishSignal = componentBearish and not componentBearish[1]
+
+// KNN loops (ml.knn / matrix-based) are not reproduced — pass-through, exactly like the ThinkScript port.
+longFilterPass = true
+shortFilterPass = true
+
+// ============================================================================================
+// ML-STYLE ENSEMBLE SCORE
+// ============================================================================================
+signalTrendFeature     = f_clamp((emaFast - emaSlow) / atrSafe)
+signalMomentumFeature  = f_clamp((close - close[5]) / (atrSafe * 2.0))
+signalTracerFeature    = f_clamp((tracerValue - tracerValue[1]) / atrSafe)
+signalCloudFeature     = f_clamp((close - cloudBasis) / (atrSafe * 2.0))
+signalRsiFeature       = f_clamp((rsiValue - 50.0) / 30.0)
+signalVolumeFeature    = f_clamp((close - open) / atrSafe * (volume / volumeSafe))
+signalVolatilityRatio  = atrAverage == 0 ? 1.0 : atrValue / atrAverage
+signalAdaptiveWeight   = f_clamp(2.0 - signalVolatilityRatio)
+signalEnsembleRaw = signalTrendFeature * 0.25 + signalMomentumFeature * 0.20 + signalTracerFeature * 0.15 +
+                     signalCloudFeature * 0.15 + signalRsiFeature * 0.15 + signalVolumeFeature * 0.10
+signalMlRaw = signalEnsembleRaw * MlSensitivity * (0.85 + signalAdaptiveWeight * 0.15)
+signalMlScore = 100.0 / (1.0 + math.exp(-signalMlRaw))
+signalMlConfidenceLevel = f_confidenceLevel(signalMlScore)
+signalMlConfidencePass = signalMlConfidenceLevel >= MinMlConfidence
+
+// ============================================================================================
+// TREND INVESTOR TRAILING STOP
+// ============================================================================================
+investorTrailOffset = atrValue * activeTrailMultiplier * (1.0 + (activeSignalSensitivity - 12.0) / 10.0)
+var float investorTrailingStop = na
+investorTrailingStop := close[1] >= nz(investorTrailingStop[1], close) ? (close < nz(investorTrailingStop[1], close) ? close + investorTrailOffset : math.max(nz(investorTrailingStop[1], close), close - investorTrailOffset)) : (close > nz(investorTrailingStop[1], close) ? close - investorTrailOffset : math.min(nz(investorTrailingStop[1], close), close + investorTrailOffset))
+investorTrend = close >= investorTrailingStop ? 1 : -1
+
+componentLongCandidate  = componentBullishSignal and longFilterPass
+componentShortCandidate = componentBearishSignal and shortFilterPass
+investorLongCandidate   = investorTrend == 1  and investorTrend[1] == -1 and longFilterPass
+investorShortCandidate  = investorTrend == -1 and investorTrend[1] == 1  and shortFilterPass
+trendCatcherLongCandidate  = catcherLongSignal and longFilterPass
+trendCatcherShortCandidate = catcherShortSignal and shortFilterPass
+
+visualTrailReference   = ta.ema(visualSmartTrail, TrailSmoothing)
+investorTrailReference = ta.ema(investorTrailingStop, TrailSmoothing)
+futuresTrailReference = useInvestorSignalMode ? investorTrailReference : visualTrailReference
+futuresTrailUpper = futuresTrailReference + atrValue * TrailBandAtrWidth
+futuresTrailLower = futuresTrailReference - atrValue * TrailBandAtrWidth
+
+// ============================================================================================
+// DMI / ADX
+// ============================================================================================
+upMove = high - high[1]
+downMove = low[1] - low
+plusDM  = upMove > downMove and upMove > 0 ? upMove : 0.0
+minusDM = downMove > upMove and downMove > 0 ? downMove : 0.0
+dmiAtr = ta.rma(trv, 14)
+plusDMRma = ta.rma(plusDM, 14)
+minusDMRma = ta.rma(minusDM, 14)
+diPlus  = dmiAtr != 0 ? 100.0 * plusDMRma / dmiAtr : 0.0
+diMinus = dmiAtr != 0 ? 100.0 * minusDMRma / dmiAtr : 0.0
+dx = (diPlus + diMinus) != 0 ? 100.0 * math.abs(diPlus - diMinus) / (diPlus + diMinus) : 0.0
+adxValue = ta.rma(dx, 14)
+
+// ============================================================================================
+// FUTURES REGIME
+// ============================================================================================
+futuresPriorHigh = ta.highest(high, FuturesStructureLookback)[1]
+futuresPriorLow  = ta.lowest(low, FuturesStructureLookback)[1]
+futuresQualityBull = not FuturesTrendStrengthFilter or (adxValue >= FuturesMinimumAdx and diPlus > diMinus)
+futuresQualityBear = not FuturesTrendStrengthFilter or (adxValue >= FuturesMinimumAdx and diMinus > diPlus)
+futuresStructureBreakBull = close > futuresPriorHigh
+futuresStructureBreakBear = close < futuresPriorLow
+futuresImpulseBull = close > close[1] and (close - close[1]) >= atrValue * FuturesImpulseAtrThreshold
+futuresImpulseBear = close < close[1] and (close[1] - close) >= atrValue * FuturesImpulseAtrThreshold
+futuresRawRegime = (close > futuresTrailUpper and futuresQualityBull and (futuresStructureBreakBull or futuresImpulseBull)) ? 1 : (close < futuresTrailLower and futuresQualityBear and (futuresStructureBreakBear or futuresImpulseBear)) ? -1 : 0
+
+var int futuresRegime = 0
+futuresRegime := futuresRegime[1] == 1 ? (futuresRawRegime == -1 ? -1 : 1) : futuresRegime[1] == -1 ? (futuresRawRegime == 1 ? 1 : -1) : futuresRawRegime
+
+futuresTrailBullish = futuresRegime == 1
+futuresTrailBearish = futuresRegime == -1
+futuresBullAlignment = futuresTrailBullish and futuresTrendBullish
+futuresBearAlignment = futuresTrailBearish and futuresTrendBearish
+futuresBullConfirmed = futuresTrailBullish and futuresRegime[1] != 1
+futuresBearConfirmed = futuresTrailBearish and futuresRegime[1] != -1
+
+futuresTrendFeature = futuresRegime == 1 ? 1.0 : futuresRegime == -1 ? -1.0 : 0.0
+futuresThreeBarFeature = f_clamp((close - close[3]) / (atrSafe * 1.5))
+futuresOneBarFeature = f_clamp((close - close[1]) / atrSafe)
+futuresPressureFeature = f_clamp((close - open) / atrSafe * (volume / volumeSafe))
+futuresRawScore = futuresTrendFeature * 0.50 + futuresThreeBarFeature * 0.25 + futuresOneBarFeature * 0.15 + futuresPressureFeature * 0.10
+futuresScore = futuresRegime == 0 ? 50.0 : 50.0 + f_clamp(futuresRawScore) * 50.0
+
+futuresTrailLongCandidate  = TradingPreset == "Futures" and futuresBullConfirmed and futuresBullAlignment and longFilterPass
+futuresTrailShortCandidate = TradingPreset == "Futures" and futuresBearConfirmed and futuresBearAlignment and shortFilterPass
+activeModelScore = TradingPreset == "Futures" ? futuresScore : signalMlScore
+activeModelConfidenceLevel = f_confidenceLevel(activeModelScore)
+activeModelConfidencePass = activeModelConfidenceLevel >= MinMlConfidence
+
+scalpingBullishScoreChange = TradingPreset == "Scalping" and EnableScalpingScoreChangeSignals and signalMlScore >= MlBullThreshold and (signalMlScore[1] < MlBullThreshold or signalMlConfidenceLevel != signalMlConfidenceLevel[1])
+scalpingBearishScoreChange = TradingPreset == "Scalping" and EnableScalpingScoreChangeSignals and signalMlScore <= MlBearThreshold and (signalMlScore[1] > MlBearThreshold or signalMlConfidenceLevel != signalMlConfidenceLevel[1])
+
+sharedTrendState = TradingPreset == "Futures" ? (futuresBullAlignment ? 1 : futuresBearAlignment ? -1 : 0) : useInvestorSignalMode ? investorTrend : useCatcherSignalMode ? (catcherBullish ? 1 : -1) : componentScore >= 3 ? 1 : componentScore <= -3 ? -1 : 0
+sharedTrendBullish = sharedTrendState == 1
+sharedTrendBearish = sharedTrendState == -1
+
+rawLongCandidate = TradingPreset == "Futures" ? futuresTrailLongCandidate : TradingPreset == "Scalping" ? (investorLongCandidate or scalpingBullishScoreChange) : useInvestorSignalMode ? investorLongCandidate : useCatcherSignalMode ? trendCatcherLongCandidate : componentLongCandidate
+rawShortCandidate = TradingPreset == "Futures" ? futuresTrailShortCandidate : TradingPreset == "Scalping" ? (investorShortCandidate or scalpingBearishScoreChange) : useInvestorSignalMode ? investorShortCandidate : useCatcherSignalMode ? trendCatcherShortCandidate : componentShortCandidate
+
+activeLongSignal  = rawLongCandidate  and activeModelConfidencePass and sharedTrendBullish
+activeShortSignal = rawShortCandidate and activeModelConfidencePass and sharedTrendBearish
+activeConfidenceLevel = activeModelConfidenceLevel
+
+// ============================================================================================
+// TRADE LEVELS
+// ============================================================================================
+var int tradeDirection = 0
+tradeDirection := activeLongSignal ? 1 : activeShortSignal ? -1 : tradeDirection[1]
+var float tradeEntry = close
+tradeEntry := (activeLongSignal or activeShortSignal) ? close : nz(tradeEntry[1], close)
+var float tradeRisk = atrValue * StopAtrMultiplier
+tradeRisk := (activeLongSignal or activeShortSignal) ? atrValue * StopAtrMultiplier : nz(tradeRisk[1], atrValue * StopAtrMultiplier)
+
+stop1Level   = tradeDirection == 1 ? tradeEntry - tradeRisk * Stop1R   : tradeDirection == -1 ? tradeEntry + tradeRisk * Stop1R   : na
+stop2Level   = tradeDirection == 1 ? tradeEntry - tradeRisk * Stop2R   : tradeDirection == -1 ? tradeEntry + tradeRisk * Stop2R   : na
+target1Level = tradeDirection == 1 ? tradeEntry + tradeRisk * Target1R : tradeDirection == -1 ? tradeEntry - tradeRisk * Target1R : na
+target2Level = tradeDirection == 1 ? tradeEntry + tradeRisk * Target2R : tradeDirection == -1 ? tradeEntry - tradeRisk * Target2R : na
+target3Level = tradeDirection == 1 ? tradeEntry + tradeRisk * Target3R : tradeDirection == -1 ? tradeEntry - tradeRisk * Target3R : na
+
+activeTrailBullish = TradingPreset == "Futures" ? futuresTrailBullish : useInvestorSignalMode ? investorTrend == 1 : useCatcherSignalMode ? catcherBullish : trailBullish
+activeTrailVisual = useInvestorSignalMode ? investorTrailReference : visualTrailReference
+trailBandWidth = atrValue * TrailBandAtrWidth
+trailBandUpper = activeTrailVisual + trailBandWidth
+trailBandLower = activeTrailVisual - trailBandWidth
+
+// ============================================================================================
+// PLOTS: SMART TRAIL
+// ============================================================================================
+bullTrailUpperPlot = plot(showSmartTrail and ShowTrailFill and activeTrailBullish ? trailBandUpper : na, "Smart Trail Bull Upper", display = display.none)
+bullTrailLowerPlot = plot(showSmartTrail and ShowTrailFill and activeTrailBullish ? trailBandLower : na, "Smart Trail Bull Lower", display = display.none)
+bearTrailUpperPlot = plot(showSmartTrail and ShowTrailFill and not activeTrailBullish ? trailBandUpper : na, "Smart Trail Bear Upper", display = display.none)
+bearTrailLowerPlot = plot(showSmartTrail and ShowTrailFill and not activeTrailBullish ? trailBandLower : na, "Smart Trail Bear Lower", display = display.none)
+fill(bullTrailUpperPlot, bullTrailLowerPlot, color = color.new(colTrailBull, 70), title = "Smart Trail Bull Fill")
+fill(bearTrailUpperPlot, bearTrailLowerPlot, color = color.new(colTrailBear, 70), title = "Smart Trail Bear Fill")
+
+plot(showSmartTrail ? trailBandUpper : na, "Smart Trail Upper", color = color.new(chart.fg_color, 100), display = display.none)
+plot(showSmartTrail ? trailBandLower : na, "Smart Trail Lower", color = color.new(chart.fg_color, 100), display = display.none)
+
+// ============================================================================================
+// PLOTS: TREND CATCHER
+// ============================================================================================
+catcherTrendColor = catcherBullish ? colBull : colBear
+plot(showCatcher and ShowCatcherBoundaries ? catcherVisualUpper : na, "Catcher Upper", color = catcherTrendColor)
+plot(showCatcher and ShowCatcherBoundaries ? catcherVisualLower : na, "Catcher Lower", color = catcherTrendColor)
+plot(showCatcher and ShowCatcherCenterLine ? catcherVisualCenter : na, "Catcher Center", color = catcherTrendColor, linewidth = 1)
+
+bullCatcherUpperPlot = plot(showCatcher and ShowCatcherFill and catcherBullish ? catcherVisualUpper : na, "Catcher Bull Upper", display = display.none)
+bullCatcherLowerPlot = plot(showCatcher and ShowCatcherFill and catcherBullish ? catcherVisualLower : na, "Catcher Bull Lower", display = display.none)
+bearCatcherUpperPlot = plot(showCatcher and ShowCatcherFill and not catcherBullish ? catcherVisualUpper : na, "Catcher Bear Upper", display = display.none)
+bearCatcherLowerPlot = plot(showCatcher and ShowCatcherFill and not catcherBullish ? catcherVisualLower : na, "Catcher Bear Lower", display = display.none)
+fill(bullCatcherUpperPlot, bullCatcherLowerPlot, color = color.new(colBull, 75), title = "Catcher Bull Fill")
+fill(bearCatcherUpperPlot, bearCatcherLowerPlot, color = color.new(colBear, 75), title = "Catcher Bear Fill")
+
+// ============================================================================================
+// PLOTS: TREND TRACER
+// ============================================================================================
+plot(showTracer ? tracerValue : na, "Trend Tracer", color = tracerBullish ? colBull : colBear, linewidth = 2)
+
+// ============================================================================================
+// PLOTS: NEO CLOUD
+// ============================================================================================
+plot(showCloud ? cloudOuterUpper : na, "Neo Cloud Outer Upper", color = colNeoCloud, style = plot.style_linebr)
+plot(showCloud ? cloudOuterLower : na, "Neo Cloud Outer Lower", color = colNeoCloud, style = plot.style_linebr)
+neoOuterFillUpper = plot(showCloud and ShowCloudFill ? cloudOuterUpper : na, "Neo Cloud Outer Fill Upper", display = display.none)
+neoOuterFillLower = plot(showCloud and ShowCloudFill ? cloudOuterLower : na, "Neo Cloud Outer Fill Lower", display = display.none)
+fill(neoOuterFillUpper, neoOuterFillLower, color = color.new(colNeoFill, 55), title = "Neo Cloud Fill")
+
+neoInnerUpperPlot = plot(showCloud and ShowCloudInnerRibbon ? visualCloudUpper : na, "Neo Cloud Inner Upper", color = colNeoCloud, display = showCloud and ShowCloudInnerRibbon ? display.all : display.none)
+neoBasisPlot       = plot(showCloud and ShowCloudInnerRibbon ? visualCloudBasis : na, "Neo Cloud Basis", color = colNeoCloud, display = showCloud and ShowCloudInnerRibbon ? display.all : display.none)
+neoInnerLowerPlot  = plot(showCloud and ShowCloudInnerRibbon ? visualCloudLower : na, "Neo Cloud Inner Lower", color = colNeoCloud, display = showCloud and ShowCloudInnerRibbon ? display.all : display.none)
+fill(neoInnerUpperPlot, neoBasisPlot, color = color.new(cloudBullish ? colBull : colTrailBear, 80), title = "Neo Cloud Ribbon Upper")
+fill(neoBasisPlot, neoInnerLowerPlot, color = color.new(cloudBullish ? colBull : colBear, 80), title = "Neo Cloud Ribbon Lower")
+
+// ============================================================================================
+// PLOTS: VWAP / ANCHORED VWAP / OPENING RANGE / HTF LEVELS
+// ============================================================================================
+plot(visualEnabled and ShowVwap ? sessionVwapValue : na, "Session VWAP", color = colTrailBull, linewidth = 2)
+plot(visualEnabled and ShowAnchoredVwap ? anchoredVwapValue : na, "Anchored VWAP", color = colTrailBear, linewidth = 2)
+plot(visualEnabled and ShowOpeningRange ? openingRangeHigh : na, "Opening Range High", color = colTrailBear, style = plot.style_linebr, linewidth = 1)
+plot(visualEnabled and ShowOpeningRange ? openingRangeLow  : na, "Opening Range Low",  color = colTrailBear, style = plot.style_linebr, linewidth = 1)
+plot(visualEnabled and ShowHtfLevels ? previousHtfHigh : na, "Previous HTF High", color = colBear, style = plot.style_linebr)
+plot(visualEnabled and ShowHtfLevels ? previousHtfLow  : na, "Previous HTF Low",  color = colBull, style = plot.style_linebr)
+
+// ============================================================================================
+// BAR COLOR  (AssignPriceColor)
+// ============================================================================================
+barColor = not showTrendOverlay ? na : (bullishChoch or bearishChoch) ? colChochBar : sharedTrendState == 1 ? colBull : sharedTrendState == -1 ? colBear : colNeutral
+barcolor(barColor, title = "Trend Overlay Bar Color")
+
+// ============================================================================================
+// TREND SQUARES  (SetPaintingStrategy SQUARES rail along the bottom of the chart)
+// ============================================================================================
+// Bar-relative placement (location.belowbar), not an absolute price coordinate: an all-time
+// chartLow/chartHigh tracked via location.absolute can lock onto a stray extreme from deep,
+// back-adjusted continuous-futures history and permanently distort the visible price axis.
+plotshape(showTrendOverlay and not na(close), "Trend Squares", style = shape.square,
+     location = location.belowbar, size = size.tiny,
+     color = sharedTrendBullish ? colBull : sharedTrendBearish ? colBear : colNeutral)
+
+// ============================================================================================
+// SIGNAL / STRUCTURE / LIQUIDITY BUBBLES  (AddChartBubble)
+// ============================================================================================
+if showSignals and activeLongSignal
+    label.new(bar_index, low, str.tostring(activeConfidenceLevel), color = colBull, textcolor = color.white, style = label.style_label_up, size = size.small)
+if showSignals and activeShortSignal
+    label.new(bar_index, high, str.tostring(activeConfidenceLevel), color = colBear, textcolor = color.white, style = label.style_label_down, size = size.small)
+if visualEnabled and ShowStructure and bullishStructureBreak
+    label.new(bar_index, low, bullishChoch ? "CHoCH" : "BOS", color = bullishChoch ? colBullChoch : colBull, textcolor = color.white, style = label.style_label_up, size = size.small)
+if visualEnabled and ShowStructure and bearishStructureBreak
+    label.new(bar_index, high, bearishChoch ? "CHoCH" : "BOS", color = bearishChoch ? colBearChoch : colBear, textcolor = color.white, style = label.style_label_down, size = size.small)
+if visualEnabled and ShowLiquidity and buySideSweep
+    label.new(bar_index, high, "X", color = colTrailBear, textcolor = color.white, style = label.style_label_down, size = size.small)
+if visualEnabled and ShowLiquidity and sellSideSweep
+    label.new(bar_index, low, "X", color = colNeoCloud, textcolor = color.white, style = label.style_label_up, size = size.small)
+
+// ============================================================================================
+// ML SCORE LABEL  (persistent, updates on the last bar only)
+// ============================================================================================
+plot(visualEnabled and ShowModelScoreHistory ? activeModelScore : na, "Model Score History", display = display.none)
+
+var label mlScoreLabel = na
+if showMlScore and ShowMlLabel and barstate.islast
+    label.delete(mlScoreLabel)
+    mlScoreText = "Model Score  " + str.tostring(math.round(activeModelScore * 10) / 10) + "\n" +
+         (activeModelScore >= MlBullThreshold ? "Bullish" : activeModelScore <= MlBearThreshold ? "Bearish" : "Neutral") + "\n" +
+         "Confidence  " + str.tostring(activeConfidenceLevel) + "/5"
+    mlScoreColor = activeModelScore >= MlBullThreshold ? colBull : activeModelScore <= MlBearThreshold ? colBear : colNeutral
+    mlScoreLabel := label.new(bar_index, high + atrValue, mlScoreText, color = mlScoreColor, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// ============================================================================================
+// TRADE LEVEL LINES + BUBBLES  (last bar only, persistent)
+// ============================================================================================
+var line sl1Line = na
+var line sl2Line = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+var label entryLabel = na
+var label sl1Label = na
+var label sl2Label = na
+var label tp1Label = na
+var label tp2Label = na
+var label tp3Label = na
+
+if visualEnabled and ShowLevels and barstate.islast
+    line.delete(sl1Line)
+    line.delete(sl2Line)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    label.delete(entryLabel)
+    label.delete(sl1Label)
+    label.delete(sl2Label)
+    label.delete(tp1Label)
+    label.delete(tp2Label)
+    label.delete(tp3Label)
+
+    lineFrom = bar_index - 20
+    if not na(stop1Level)
+        sl1Line := line.new(lineFrom, stop1Level, bar_index, stop1Level, color = colStop, style = line.style_dashed)
+        sl1Label := label.new(bar_index, stop1Level, "SL1 " + str.tostring(math.round(stop1Level * 100) / 100), color = colStop, textcolor = color.white, style = tradeDirection == -1 ? label.style_label_up : label.style_label_down, size = size.small)
+    if not na(stop2Level)
+        sl2Line := line.new(lineFrom, stop2Level, bar_index, stop2Level, color = colStop, style = line.style_dashed)
+        sl2Label := label.new(bar_index, stop2Level, "SL2 " + str.tostring(math.round(stop2Level * 100) / 100), color = colStop, textcolor = color.white, style = tradeDirection == -1 ? label.style_label_up : label.style_label_down, size = size.small)
+    if not na(target1Level)
+        tp1Line := line.new(lineFrom, target1Level, bar_index, target1Level, color = colTarget, style = line.style_dashed)
+        tp1Label := label.new(bar_index, target1Level, "TP1 " + str.tostring(math.round(target1Level * 100) / 100), color = colTarget, textcolor = color.white, style = tradeDirection == 1 ? label.style_label_down : label.style_label_up, size = size.small)
+    if not na(target2Level)
+        tp2Line := line.new(lineFrom, target2Level, bar_index, target2Level, color = colTarget, style = line.style_dashed)
+        tp2Label := label.new(bar_index, target2Level, "TP2 " + str.tostring(math.round(target2Level * 100) / 100), color = colTarget, textcolor = color.white, style = tradeDirection == 1 ? label.style_label_down : label.style_label_up, size = size.small)
+    if not na(target3Level)
+        tp3Line := line.new(lineFrom, target3Level, bar_index, target3Level, color = colTarget, style = line.style_dashed)
+        tp3Label := label.new(bar_index, target3Level, "TP3 " + str.tostring(math.round(target3Level * 100) / 100), color = colTarget, textcolor = color.white, style = tradeDirection == 1 ? label.style_label_down : label.style_label_up, size = size.small)
+    if not na(tradeEntry)
+        entryLabel := label.new(bar_index, tradeEntry, "Entry " + str.tostring(math.round(tradeEntry * 100) / 100), color = colEntry, textcolor = color.white, style = tradeDirection == -1 ? label.style_label_up : label.style_label_down, size = size.small)
+
+// ============================================================================================
+// INFO TABLE  (AddLabel equivalents: Regime / Strength / Squeeze / Volume Sentiment / KNN note)
+// ============================================================================================
+var table infoTable = table.new(position.top_right, 1, 5, border_width = 0)
+
+if barstate.islast
+    row = 0
+    if ShowRegime and visualEnabled
+        table.cell(infoTable, 0, row, "RVOL " + str.tostring(math.round(relativeVolumeValue * 100) / 100) + " | ATR Regime " + str.tostring(math.round(volatilityRegimeValue * 100) / 100), text_color = color.white, bgcolor = colNeutral)
+        row += 1
+    if ShowStrength and visualEnabled
+        table.cell(infoTable, 0, row, "Strength " + str.tostring(math.round(strengthValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
+        row += 1
+    if ShowSqueeze and visualEnabled
+        table.cell(infoTable, 0, row, "Squeeze " + str.tostring(math.round(squeezeValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
+        row += 1
+    if ShowVolumeSentiment and visualEnabled
+        table.cell(infoTable, 0, row, "Volume " + str.tostring(math.round(volumeSentimentValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
+        row += 1
+    if UseKnnFilter
+        table.cell(infoTable, 0, row, "KNN filter omitted in Pine conversion: pass-through", text_color = color.gray, bgcolor = color.new(color.gray, 85))
+        row += 1
+
+// ============================================================================================
+// ALERTS
+// ============================================================================================
+alertcondition(activeLongSignal, title = "Bullish ML Confidence Signal", message = "Bullish ML Confidence Signal")
+alertcondition(activeShortSignal, title = "Bearish ML Confidence Signal", message = "Bearish ML Confidence Signal")
+
+if EnableAlerts and activeLongSignal
+    alert("Bullish ML Confidence Signal", alert.freq_once_per_bar_close)
+if EnableAlerts and activeShortSignal
+    alert("Bearish ML Confidence Signal", alert.freq_once_per_bar_close)
+

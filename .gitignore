@@ -1,1 +1,9 @@
+*.pyc
+*.sqlite
 .DS_Store
+.claude/
+.env
+__pycache__/
+replay/*.csv
+replay/*.mp4
+venv/

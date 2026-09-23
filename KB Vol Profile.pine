@@ -1,0 +1,307 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org
+// © kv4coins (Time-Reversed 24-Hour Horizontally-Stacked Volume Profile)
+// Modified: split session/display timezones, high-contrast bucket palette, legend table, segment hairlines.
+
+//@version=6
+indicator(title = 'Volume Profile - Time Sorted (Recent Left)', shorttitle = 'KB Vol Profile', overlay = true, max_bars_back = 5000, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 100)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// INPUTS
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+vp_tz            = input.string(defval = 'America/Los_Angeles', title = 'Timezone', options = ['Exchange (auto)', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'UTC', 'Europe/London', 'Europe/Berlin', 'Asia/Kolkata', 'Asia/Tokyo', 'Australia/Sydney'], group = 'Session', tooltip = 'The one clock this indicator runs on. Both hour settings below are read in this zone and the legend reports it. Exchange (auto) follows whatever zone the symbol itself trades in.')
+vp_sess_hour     = input.int(defval = 15, minval = 0, maxval = 23, title = 'Session Start Hour (0-23)', group = 'Session', tooltip = 'Read in the Timezone above. The CME futures open is 17:00 Central, which is 15 Pacific, 16 Mountain, 18 Eastern.')
+vp_bucket_anchor = input.int(defval = 6, minval = 0, maxval = 23, title = 'Bucket Anchor Hour (0-23)', group = 'Session', tooltip = 'Read in the Timezone above. Where the first 2-hour color block begins. Keep it just under the cash open so blocks line up with market structure rather than cutting across it: 08:00 Central is 6 Pacific, 7 Mountain, 9 Eastern. Even numbers keep the blocks on clean hours.')
+vp_scan_depth    = input.int(defval = 300, minval = 20, maxval = 3000, title = 'Max Scan Depth (bars)', group = 'Session', tooltip = 'How far back to look for the session open. Not the profile length. A 23 hour CME session is about 92 bars on 15m, 276 on 5m.')
+
+vp_style         = input.string(defval = 'Boxes', title = 'Render Style', options = ['Boxes', 'Lines'], group = 'Appearance', tooltip = 'Boxes fill the full price interval of each row and stay solid at any zoom. Lines are thinner and fixed in pixels.')
+vp_num_bars      = input.int(defval = 28, minval = 10, maxval = 40, title = 'Precision Rows [10-40]', group = 'Appearance', tooltip = 'Fewer rows means taller, more readable blocks. Capped at 40 so rows x 12 segments stays under the 500 object limit.')
+vp_anchor        = input.string(defval = 'Last Candle', title = 'Profile Anchor', options = ['Last Candle', 'Right Edge Of Screen'], group = 'Appearance', tooltip = 'Last Candle pins the profile a fixed number of bars past the newest candle, so it scrolls out of view when you pan back through history. Right Edge Of Screen re-anchors it to the visible window on every pan and zoom so it stays put, using the two percentage widths below instead of the bar counts. The cost is a full recalculation every time the viewport moves.')
+vp_edge_width    = input.float(defval = 22.0, minval = 2.0, maxval = 60.0, step = 1.0, title = 'Widest Row (% of screen)', group = 'Appearance', tooltip = 'Right Edge Of Screen mode only. Widths scale with the visible window rather than counting bars, so the profile keeps its proportions at any zoom.')
+vp_edge_gap      = input.float(defval = 1.0, minval = 0.0, maxval = 20.0, step = 0.5, title = 'Gap From Right Edge (%)', group = 'Appearance', tooltip = 'Right Edge Of Screen mode only.')
+vp_max_width     = input.int(defval = 60, minval = 10, maxval = 400, title = 'Widest Row (bars)', group = 'Appearance', tooltip = 'Last Candle mode only. Absolute width of the highest volume row, in chart bars. Widest Row plus Gap is how much empty space the profile needs to the right of the last candle, so raise it only as far as your right margin allows.')
+vp_gap           = input.int(defval = 5, minval = 0, maxval = 200, title = 'Gap From Last Candle (bars)', group = 'Appearance', tooltip = 'Empty space between the newest candle and the left edge of the profile zone. The profile can never reach further left than this.')
+vp_row_gap       = input.float(defval = 10.0, minval = 0.0, maxval = 60.0, step = 5.0, title = 'Row Gap %', group = 'Appearance', tooltip = 'Box mode only. Vertical padding between rows. Set to 0 for a solid block.')
+vp_transp        = input.int(defval = 10, minval = 0, maxval = 90, title = 'Fill Transparency', group = 'Appearance')
+vp_bar_thickness = input.int(defval = 5, minval = 1, maxval = 30, title = 'Line Thickness [Lines mode]', group = 'Appearance')
+vp_backdrop      = input.bool(defval = true, title = 'Opaque Backdrop', group = 'Appearance', tooltip = 'Paints a solid chart-background panel behind the profile zone so channel fills, S/D zones and anything else drawn underneath cannot tint the bucket colors. Turn off if you want to see what is behind the profile.')
+vp_seg_edge      = input.bool(defval = true, title = 'Hairline Between Segments', group = 'Appearance', tooltip = 'Boxes mode only. Draws a 1px background-colored edge on each segment so bucket boundaries stay crisp. A segment clamped to the 1 bar minimum gets eaten by its own border, so turn this off if small buckets vanish.')
+vp_volume_type   = input.string(defval = 'Both', title = 'Volume Type', options = ['Both', 'Bullish', 'Bearish'], group = 'Appearance')
+vp_newest_inner  = input.bool(defval = false, title = 'Newest Block Against Right Anchor', group = 'Appearance', tooltip = 'Off: session open sits against the anchor and time grows leftward. On: flips the stack order.')
+
+vp_display_poc        = input.bool(defval = true, title = 'Display Point of Control (PoC)', group = 'Point of Control')
+vp_poc_full_width     = input.bool(defval = true, title = 'Extend PoC Across Session', group = 'Point of Control', tooltip = 'On draws the PoC back over the candles to the session open, which is the only way to read it against price. Off confines it to the profile zone, where it floats in empty space.')
+vp_poc_label          = input.bool(defval = true, title = 'Label The PoC', group = 'Point of Control')
+vp_poc_lbl_size       = input.string(defval = 'normal', title = 'PoC Label Size', options = ['small', 'normal', 'large', 'huge'], group = 'Point of Control')
+vp_poc_line_thickness = input.int(defval = 2, minval = 1, maxval = 30, title = 'PoC Line Thickness [1-30]', group = 'Point of Control')
+vp_poc_line_color     = input.color(defval = color.yellow, title = 'PoC Line Color', group = 'Point of Control')
+
+lg_mode  = input.string(defval = 'Compact', title = 'Legend Style', options = ['Compact', 'Full', 'Off'], group = 'Legend', tooltip = 'Compact is a small strip of color chips - hover any chip for its time range, timezone and share of session volume. Full lists every bucket as a labelled row.')
+lg_pos   = input.string(defval = 'Top Left', title = 'Legend Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], group = 'Legend')
+lg_used  = input.bool(defval = true, title = 'Hide Buckets With No Volume', group = 'Legend', tooltip = 'Only lists the 2-hour blocks that actually contributed volume to this session.')
+lg_pct   = input.bool(defval = true, title = 'Show % Of Session Volume', group = 'Legend')
+lg_size  = input.string(defval = 'small', title = 'Legend Text Size', options = ['tiny', 'small', 'normal', 'large'], group = 'Legend')
+lg_tint  = input.bool(defval = false, title = 'Tint Candles With Bucket Color', group = 'Legend', tooltip = 'Paints each candle the color its volume becomes in the profile. Fastest way to learn the palette.')
+
+// One resolved clock for the whole script: session boundary, color buckets and legend all read it.
+tz      = vp_tz == 'Exchange (auto)' ? syminfo.timezone : vp_tz
+lg_show = lg_mode != 'Off'
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// PALETTE
+//// Bucket 0 starts at vp_bucket_anchor, every bucket after is a 2 hour block walking forward.
+//// Hours below are the defaults: anchor 6, America/Los_Angeles. Move either and they all shift.
+//// Each step jumps 150 degrees around the hue wheel and flips light/deep, so the two segments that
+//// physically touch inside a row are always maximally separated. Buckets two apart are the deliberate
+//// sacrifice: they are never adjacent on screen, so a mixup costs 4 hours instead of 12.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var color[] palette = array.from(
+     #FF6666,  // 0  Light Red        06:00 - 08:00 PT   cash open 06:30
+     #00CC66,  // 1  Deep Green       08:00 - 10:00 PT   morning trend
+     #FF66FF,  // 2  Light Magenta    10:00 - 12:00 PT   lunch
+     #66CC00,  // 3  Deep Olive       12:00 - 14:00 PT   cash close 13:00
+     #6666FF,  // 4  Light Blue       14:00 - 16:00 PT   Globex open 15:00, anchor block
+     #CC6600,  // 5  Burnt Orange     16:00 - 18:00 PT
+     #66FFFF,  // 6  Light Cyan       18:00 - 20:00 PT
+     #CC0066,  // 7  Deep Rose        20:00 - 22:00 PT   Asia
+     #66FF66,  // 8  Light Green      22:00 - 00:00 PT
+     #6600CC,  // 9  Deep Violet      00:00 - 02:00 PT   London open
+     #FFFF66,  // 10 Light Yellow     02:00 - 04:00 PT
+     #0066CC)  // 11 Deep Azure       04:00 - 06:00 PT   US pre-market
+
+// Hour to bucket id, relative to the anchor. With anchor 8: 8 -> 0, 17 -> 4, 0 -> 8, 6 -> 11.
+bucket_of(int h) =>
+    int(math.floor(((h - vp_bucket_anchor + 24) % 24) / 2.0))
+
+hhmm(int h) =>
+    (h < 10 ? '0' : '') + str.tostring(h) + ':00'
+
+bucket_label(int b) =>
+    int s = (vp_bucket_anchor + b * 2) % 24
+    hhmm(s) + ' - ' + hhmm((s + 2) % 24)
+
+lg_textsize() =>
+    lg_size == 'tiny' ? size.tiny : lg_size == 'normal' ? size.normal : lg_size == 'large' ? size.large : size.small
+
+lg_position() =>
+    lg_pos == 'Top Left' ? position.top_left : lg_pos == 'Bottom Right' ? position.bottom_right : lg_pos == 'Bottom Left' ? position.bottom_left : lg_pos == 'Middle Right' ? position.middle_right : position.top_right
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// STATE
+//// One flat matrix of size rows x 12. Index = row * 12 + bucket.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var float[] rows_total    = array.new_float(vp_num_bars, 0.0)
+var float[] rows_seg      = array.new_float(vp_num_bars * 12, 0.0)
+var line[]  dynamic_lines  = array.new_line()
+var box[]   dynamic_boxes   = array.new_box()
+var label[] dynamic_labels = array.new_label()
+var table   lg_tbl         = na
+
+if barstate.islast
+    array.fill(rows_total, 0.0)
+    array.fill(rows_seg, 0.0)
+    for l in dynamic_lines
+        line.delete(l)
+    array.clear(dynamic_lines)
+    for bx in dynamic_boxes
+        box.delete(bx)
+    array.clear(dynamic_boxes)
+    for lb in dynamic_labels
+        label.delete(lb)
+    array.clear(dynamic_labels)
+    if not na(lg_tbl)
+        table.delete(lg_tbl)
+        lg_tbl := na
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //// 1. LOCATE THE SESSION OPEN
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    int scan      = math.min(vp_scan_depth, bar_index)
+    int sess_bars = scan - 1
+    for i = 0 to scan - 2
+        if hour(time[i], tz) == vp_sess_hour and hour(time[i + 1], tz) != vp_sess_hour
+            sess_bars := i
+            break
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //// 2. PRICE RANGE FROM THE SESSION BARS ONLY
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    float hi = high
+    float lo = low
+    for i = 0 to sess_bars
+        hi := math.max(hi, high[i])
+        lo := math.min(lo, low[i])
+
+    float interval = (hi - lo) / (vp_num_bars - 1)
+    if interval <= 0
+        interval := syminfo.mintick
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //// 3. DISTRIBUTE VOLUME
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    for i = 0 to sess_bars
+        bool is_bullish = close[i] >= open[i]
+        bool include_vol = vp_volume_type == 'Both' ? true : (vp_volume_type == 'Bullish' ? is_bullish : not is_bullish)
+
+        if include_vol and volume[i] > 0
+            int b    = bucket_of(hour(time[i], tz))
+            int j_lo = math.max(0, int(math.floor((low[i] - lo) / interval)))
+            int j_hi = math.min(vp_num_bars - 1, int(math.floor((high[i] - lo) / interval)))
+
+            if j_hi >= j_lo
+                float per_row = volume[i] / (j_hi - j_lo + 1)
+                for j = j_lo to j_hi
+                    array.set(rows_total, j, array.get(rows_total, j) + per_row)
+                    int k = j * 12 + b
+                    array.set(rows_seg, k, array.get(rows_seg, k) + per_row)
+
+    // Read off the actual open bar rather than vp_sess_hour, so the stack order stays right even when
+    // the scan found no session boundary and fell back to the far end of the window.
+    int anchor_bucket = bucket_of(hour(time[sess_bars], tz))
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //// 4. DRAW
+    //// The profile zone is [bar_index + gap, bar_index + gap + max_width]. Rows grow leftward from the
+    //// right anchor, and the widest possible row stops exactly at the left edge of the zone, so no
+    //// segment can ever reach the candles no matter how the volume distributes.
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    float max_vol = array.max(rows_total)
+
+    if max_vol > 0
+        int   poc_idx   = array.indexof(rows_total, max_vol)
+        bool  use_boxes = vp_style == 'Boxes'
+        float half_h    = interval * (1.0 - vp_row_gap / 100.0) / 2.0
+        int   objs_used = 0
+
+        // Two coordinate systems. Bar-index space rides with the chart; bar-time space lets us pin the
+        // profile to the visible window, the only screen-relative anchor Pine offers for boxes.
+        //
+        // chart.right_visible_bar_time is the last visible BAR, not the right edge of the pane. Scrolled
+        // to the present that is the newest candle, and anchoring there would drop the profile on top of
+        // live price. So screen anchoring only engages once you have panned back far enough that real
+        // bars reach the right edge; at the live edge the normal right-margin placement is already stable.
+        int  vis_span      = na(chart.right_visible_bar_time) or na(chart.left_visible_bar_time) ? 0 : chart.right_visible_bar_time - chart.left_visible_bar_time
+        bool screen_anchor = vp_anchor == 'Right Edge Of Screen' and vis_span > 0 and chart.right_visible_bar_time < time
+
+        int    x_anchor    = 0
+        int    x_zone_left = 0
+        int    zone_w      = 0
+        int    x_pad       = 0
+        int    min_w       = 1
+        string xl          = xloc.bar_index
+
+        if screen_anchor
+            x_anchor    := chart.right_visible_bar_time - int(math.round(vis_span * vp_edge_gap / 100.0))
+            zone_w      := int(math.round(vis_span * vp_edge_width / 100.0))
+            x_zone_left := x_anchor - zone_w
+            x_pad       := int(math.round(vis_span * 0.005))
+            min_w       := math.max(1, int(vis_span / 400))
+            xl          := xloc.bar_time
+        else
+            x_zone_left := bar_index + vp_gap
+            zone_w      := vp_max_width
+            x_anchor    := x_zone_left + zone_w
+            x_pad       := 5
+
+        // Created first so it sits underneath every segment. Same-type objects stack in creation order.
+        if vp_backdrop
+            box bg_bx = box.new(x_zone_left, hi + interval, x_anchor, lo - interval, xloc = xl, border_width = 0, bgcolor = chart.bg_color)
+            array.push(dynamic_boxes, bg_bx)
+            objs_used := objs_used + 1
+
+        for j = 0 to vp_num_bars - 1
+            if array.get(rows_total, j) > 0
+                float y      = lo + interval * j
+                int   cursor = x_anchor
+
+                for k = 0 to 11
+                    int b = vp_newest_inner ? (anchor_bucket + 11 - k) % 12 : (anchor_bucket + k) % 12
+                    float seg_vol = array.get(rows_seg, j * 12 + b)
+
+                    if seg_vol > 0
+                        int   w = math.max(min_w, int(math.round(seg_vol / max_vol * zone_w)))
+                        color c = color.new(array.get(palette, b), vp_transp)
+
+                        // Hard clamp. Rounding and the 1 bar minimum width can push a row a couple
+                        // of bars past the zone edge, so the last segment is trimmed instead.
+                        int x_left = math.max(x_zone_left, cursor - w)
+
+                        if x_left < cursor and objs_used < 498
+                            if use_boxes
+                                box seg_bx = box.new(x_left, y + half_h, cursor, y - half_h, xloc = xl, border_width = vp_seg_edge ? 1 : 0, border_color = chart.bg_color, bgcolor = c)
+                                array.push(dynamic_boxes, seg_bx)
+                            else
+                                line seg_ln = line.new(x_left, y, cursor, y, xloc = xl, color = c, width = vp_bar_thickness)
+                                array.push(dynamic_lines, seg_ln)
+                            objs_used := objs_used + 1
+
+                        cursor := math.max(x_zone_left, cursor - w)
+
+        if vp_display_poc
+            float poc_y    = lo + interval * poc_idx
+            int   sess_x1  = screen_anchor ? time[sess_bars] : bar_index - sess_bars
+            int   poc_x1   = vp_poc_full_width ? sess_x1 : x_zone_left
+            line poc_ln = line.new(poc_x1, poc_y, x_anchor + x_pad, poc_y, xloc = xl, color = vp_poc_line_color, width = vp_poc_line_thickness, style = line.style_dashed)
+            array.push(dynamic_lines, poc_ln)
+            if vp_poc_label
+                label poc_lb = label.new(x_anchor + x_pad, poc_y, 'PoC  ' + str.tostring(poc_y, format.mintick), xloc = xl, style = label.style_label_left, color = color.new(color.black, 100), textcolor = vp_poc_line_color, size = vp_poc_lbl_size == 'small' ? size.small : vp_poc_lbl_size == 'large' ? size.large : vp_poc_lbl_size == 'huge' ? size.huge : size.normal)
+                array.push(dynamic_labels, poc_lb)
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //// 5. LEGEND
+    //// Rows are listed in the same order the blocks stack, so top of legend == the block against the
+    //// right anchor. Flips automatically with vp_newest_inner. Tables do not count against the 500 limit.
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    if lg_show
+        float[] bucket_tot = array.new_float(12, 0.0)
+        float   sess_tot   = 0.0
+        for j = 0 to vp_num_bars - 1
+            for b = 0 to 11
+                float v = array.get(rows_seg, j * 12 + b)
+                if v > 0
+                    array.set(bucket_tot, b, array.get(bucket_tot, b) + v)
+                    sess_tot := sess_tot + v
+
+        int n_rows = 0
+        for k = 0 to 11
+            int b = vp_newest_inner ? (anchor_bucket + 11 - k) % 12 : (anchor_bucket + k) % 12
+            if not lg_used or array.get(bucket_tot, b) > 0
+                n_rows := n_rows + 1
+
+        if n_rows > 0 and lg_mode == 'Compact'
+            // Bare chips, every word behind a hover tooltip. Column order mirrors the chart: the anchor
+            // block sits at the right end and time walks left, so the strip is a miniature of the profile.
+            lg_tbl := table.new(position.top_right, n_rows, 1, frame_color = color.new(color.gray, 50), frame_width = 1, border_color = chart.bg_color, border_width = 1)
+            table.set_position(lg_tbl, lg_position())
+
+            int c = 0
+            for k = 0 to 11
+                int b = vp_newest_inner ? (anchor_bucket + 11 - k) % 12 : (anchor_bucket + k) % 12
+                if not lg_used or array.get(bucket_tot, b) > 0
+                    float pct = sess_tot > 0 ? array.get(bucket_tot, b) / sess_tot * 100.0 : 0.0
+                    string tip = bucket_label(b) + '  ' + tz + '\n' + str.tostring(pct, '#.0') + '% of session volume' + (c == 0 ? '\n\nSession open, anchor block' : '')
+                    table.cell(lg_tbl, n_rows - 1 - c, 0, '', width = 1.8, height = 2.0, bgcolor = color.new(array.get(palette, b), vp_transp), tooltip = tip)
+                    c := c + 1
+
+        if n_rows > 0 and lg_mode == 'Full'
+            lg_tbl := table.new(position.top_right, 3, n_rows + 1, frame_color = color.new(color.gray, 40), frame_width = 1, border_color = color.new(color.gray, 70), border_width = 1)
+            table.set_position(lg_tbl, lg_position())
+
+            table.cell(lg_tbl, 0, 0, '', bgcolor = color.new(color.gray, 80))
+            table.cell(lg_tbl, 1, 0, hhmm(hour(time[sess_bars], tz)) + ' open  ·  ' + tz, text_color = color.gray, text_size = lg_textsize(), text_halign = text.align_left, bgcolor = color.new(color.gray, 80))
+            table.cell(lg_tbl, 2, 0, vp_newest_inner ? '← older' : 'newer →', text_color = color.gray, text_size = lg_textsize(), text_halign = text.align_right, bgcolor = color.new(color.gray, 80))
+
+            int r = 1
+            for k = 0 to 11
+                int b = vp_newest_inner ? (anchor_bucket + 11 - k) % 12 : (anchor_bucket + k) % 12
+                if not lg_used or array.get(bucket_tot, b) > 0
+                    float pct = sess_tot > 0 ? array.get(bucket_tot, b) / sess_tot * 100.0 : 0.0
+                    table.cell(lg_tbl, 0, r, '   ', bgcolor = color.new(array.get(palette, b), vp_transp))
+                    table.cell(lg_tbl, 1, r, bucket_label(b), text_color = chart.fg_color, text_size = lg_textsize(), text_halign = text.align_left, tooltip = str.tostring(pct, '#.0') + '% of session volume')
+                    table.cell(lg_tbl, 2, r, lg_pct ? str.tostring(pct, '#.0') + '%' : '', text_color = color.new(chart.fg_color, 40), text_size = lg_textsize(), text_halign = text.align_right)
+                    r := r + 1
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// OPTIONAL CANDLE TINT
+//// Paints each candle the color its volume becomes in the profile. Global scope by necessity.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+barcolor(lg_tint ? color.new(array.get(palette, bucket_of(hour(time, tz))), 20) : na)

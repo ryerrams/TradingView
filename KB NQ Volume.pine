@@ -1,0 +1,131 @@
+// KB NQ Volume
+// Volume from a chosen symbol, in its own pane, measured against what is NORMAL for that time of day.
+//
+// A rolling 20-bar average is the usual way to judge volume and it is close to useless intraday: on a
+// 15m chart it spans five hours, so the cash open always reads "high" and the lunch lull always reads
+// "low" no matter what is actually happening. This keeps a separate average per clock slot - every
+// 09:30 bar is compared against previous 09:30 bars - so 1.8x means genuinely busy FOR THIS TIME,
+// and 0.4x means genuinely quiet.
+//
+// The quiet reading is the useful one for the tail-confluence setups: price grinding at the day extreme
+// on 0.4x volume is a different animal from price hitting it on 2x.
+
+//@version=6
+indicator(title = 'KB NQ Volume', shorttitle = 'KB_NQVOL', format = format.volume, precision = 0)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// INPUTS
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+src        = input.symbol(defval = 'CME_MINI:NQ1!', title = 'Volume Source', group = 'Source', tooltip = 'CME_MINI:NQ1! is the E-mini Nasdaq continuous front month - the contract where the size trades. Leave it here while charting MNQ to read institutional participation against micro prices. MNQ itself is CME_MINI:MNQ1!.')
+gate_on    = input.bool(defval = true, title = 'Only Run On Matching Symbols', group = 'Source', tooltip = 'TradingView can hide an indicator by timeframe but not by symbol, so the filter lives here. Off-symbol the pane draws nothing and says so.')
+gate_list  = input.string(defval = 'NQ, MNQ', title = 'Symbols', group = 'Source', tooltip = 'Comma separated. Matched against the futures root first (NQ1! has root NQ, MNQ1! has root MNQ), then against the full ticker as a fallback for non-futures.')
+
+tod_days   = input.int(defval = 20, minval = 2, maxval = 100, title = 'Time-Of-Day Lookback (sessions)', group = 'Relative Volume', tooltip = 'How many previous occurrences of this same clock slot feed the baseline. 20 is about a month of sessions on an intraday chart.')
+hi_thresh  = input.float(defval = 1.5, minval = 1.0, maxval = 10.0, step = 0.1, title = 'High Volume At', group = 'Relative Volume')
+lo_thresh  = input.float(defval = 0.6, minval = 0.05, maxval = 1.0, step = 0.05, title = 'Low Volume Below', group = 'Relative Volume')
+
+color_mode = input.string(defval = 'Relative Volume', title = 'Bar Coloring', options = ['Relative Volume', 'Up / Down'], group = 'Display', tooltip = 'Relative Volume colours each bar by how busy it is for its time of day. Up / Down colours by the source symbol own candle direction.')
+show_tod   = input.bool(defval = true, title = 'Time-Of-Day Baseline Line', group = 'Display')
+ma_len     = input.int(defval = 0, minval = 0, maxval = 500, title = 'Plain Average Length (0 = off)', group = 'Display', tooltip = 'The conventional rolling average, off by default because the time-of-day baseline above supersedes it. Turn on if you want both for comparison.')
+show_stat  = input.bool(defval = true, title = 'Readout', group = 'Display')
+
+c_hi       = input.color(defval = #FFB300, title = 'High',   inline = 'rv', group = 'Display')
+c_mid      = input.color(defval = #546E7A, title = 'Normal', inline = 'rv', group = 'Display')
+c_lo       = input.color(defval = #455A64, title = 'Low',    inline = 'rv', group = 'Display')
+c_up       = input.color(defval = #26A69A, title = 'Up',   inline = 'ud', group = 'Display')
+c_dn       = input.color(defval = #EF5350, title = 'Down', inline = 'ud', group = 'Display')
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// SYMBOL GATE
+//// Root first: NQ1! resolves to root NQ and MNQ1! to MNQ, so an exact list match separates them cleanly
+//// where a substring test would not - "NQ" is inside "MNQ".
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+sym_ok() =>
+    bool hit = not gate_on
+    if gate_on
+        string root = syminfo.root != '' ? str.upper(syminfo.root) : str.upper(syminfo.ticker)
+        string tick = str.upper(syminfo.ticker)
+        for t in str.split(str.replace_all(str.upper(gate_list), ' ', ''), ',')
+            if t != '' and (root == t or tick == t)
+                hit := true
+    hit
+
+bool on = sym_ok()
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// SOURCE
+//// One request for all three series. Chart timeframe, no lookahead, so nothing repaints.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+[v, o, c] = request.security(src, timeframe.period, [volume, open, close])
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// TIME-OF-DAY BASELINE
+//// One running mean per clock slot, keyed by minutes-since-midnight in exchange time. Read the baseline
+//// BEFORE folding this bar into it, so a bar is never compared against itself.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var map<int, float> todAvg = map.new<int, float>()
+var map<int, int>   todCnt = map.new<int, int>()
+
+int   slot = hour(time, syminfo.timezone) * 60 + minute(time, syminfo.timezone)
+float base = map.contains(todAvg, slot) ? map.get(todAvg, slot) : na
+float rvol = not na(base) and base > 0 and not na(v) ? v / base : na
+
+// Confirmed bars only. A developing bar carries partial volume, and folding that into the baseline
+// would drag every slot average down towards whatever fraction of the bar has elapsed.
+if barstate.isconfirmed and not na(v) and v > 0
+    int cnt = math.min((map.contains(todCnt, slot) ? map.get(todCnt, slot) : 0) + 1, tod_days)
+    map.put(todAvg, slot, na(base) ? v : base + (v - base) / cnt)
+    map.put(todCnt, slot, cnt)
+
+float vma = ma_len > 0 ? ta.sma(v, ma_len) : na
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// PLOT
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Three states, three colours. A warming-up bar takes the NORMAL colour rather than a fourth near-grey
+// nobody could tell apart from "quiet" - the readout says "building baseline" instead. na comparisons
+// are false in Pine, so an unknown rvol falls through both tests to normal on its own.
+color barCol = color_mode == 'Up / Down' ? color.new(c >= o ? c_up : c_dn, 30) : rvol >= hi_thresh ? color.new(c_hi, 10) : rvol < lo_thresh ? color.new(c_lo, 10) : color.new(c_mid, 25)
+
+plot(on ? v : na,              title = 'Volume',   style = plot.style_columns, color = barCol)
+plot(on and show_tod ? base : na, title = 'Typical For This Time', color = color.new(#B388FF, 10), linewidth = 2)
+plot(on ? vma : na,            title = 'Plain Average', color = color.new(color.orange, 20), linewidth = 1)
+
+hline(0, title = 'Zero', color = color.new(color.gray, 80))
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// READOUT
+//// Contract counts alone say nothing. The multiple against this slot own history is the number to read.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var table st = na
+if barstate.islast
+    if not na(st)
+        table.delete(st)
+        st := na
+    if not on
+        // An empty pane with no explanation reads as a broken indicator. Say why it is empty.
+        st := table.new(position.top_right, 1, 1, frame_color = color.new(color.gray, 75), frame_width = 1)
+        table.cell(st, 0, 0, 'KB NQ Volume - inactive on ' + syminfo.ticker, text_color = color.new(color.gray, 30), text_size = size.small)
+    else if show_stat
+        st := table.new(position.top_right, 3, 1, frame_color = color.new(color.gray, 60), frame_width = 1, border_color = color.new(color.gray, 75), border_width = 1)
+        string tag = na(rvol) ? 'building baseline' : rvol >= hi_thresh ? 'HIGH' : rvol < lo_thresh ? 'LOW' : 'normal'
+        color  tc  = na(rvol) ? color.gray : rvol >= hi_thresh ? c_hi : rvol < lo_thresh ? color.gray : chart.fg_color
+        table.cell(st, 0, 0, str.tostring(src), text_color = color.gray, text_size = size.normal)
+        table.cell(st, 1, 0, na(rvol) ? '-' : str.tostring(rvol, '#.00') + 'x', text_color = tc, text_size = size.normal)
+        table.cell(st, 2, 0, tag, text_color = tc, text_size = size.normal)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// GUARDS
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var table warn = na
+if barstate.islast
+    if not na(warn)
+        table.delete(warn)
+        warn := na
+    string msg = not on ? '' : na(v) ? 'KB NQ VOLUME  ·  no data for ' + str.tostring(src) + '  ·  check the symbol, e.g. CME_MINI:NQ1!' : timeframe.isdwm ? 'KB NQ VOLUME  ·  the time-of-day baseline needs an intraday chart  ·  on ' + timeframe.period + ' every bar is its own clock slot' : ''
+    if msg != ''
+        warn := table.new(position.bottom_center, 1, 1, bgcolor = color.new(#B71C1C, 5), frame_color = color.new(color.white, 50), frame_width = 1)
+        table.cell(warn, 0, 0, msg, text_color = color.white, text_size = size.normal)
+
+alertcondition(on and not na(rvol) and rvol >= hi_thresh and (na(rvol[1]) or rvol[1] < hi_thresh), title = 'Volume Surge',  message = 'Volume is running well above normal for this time of day')
+alertcondition(on and not na(rvol) and rvol <  lo_thresh and (na(rvol[1]) or rvol[1] >= lo_thresh), title = 'Volume Drying Up', message = 'Volume has dropped well below normal for this time of day')

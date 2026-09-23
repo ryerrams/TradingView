@@ -1,0 +1,154 @@
+//@version=6
+// =============================================================================
+//  Linear Regression Channel
+//  A least-squares fit through the last N bars, with parallel bands offset by
+//  a multiple of the residual standard deviation.
+//
+//  Deliberately kept separate from SD_Zones.pine: the zones are event-driven
+//  (a threshold crossing stamps a level that then persists), this refits every
+//  bar over a rolling window. Sharing a file would just couple two unrelated
+//  calculations and double the settings panel.
+// =============================================================================
+indicator("Linear Regression Channel", "LinReg Ch", overlay = true,
+     max_lines_count = 20, max_labels_count = 10, max_bars_back = 5000)
+
+string G_C = "Channel"
+string G_S = "Style"
+
+len    = input.int(80, "Length", minval = 10, group = G_C,
+     tooltip = "Bars in the regression window. 80 on a 5m chart is roughly one session.")
+src    = input.source(close, "Source", group = G_C)
+mult1  = input.float(1.0, "Deviation multiple", minval = 0.1, step = 0.5, group = G_C)
+band2  = input.bool(false, "Second band at", inline = "b2", group = G_C)
+mult2  = input.float(2.0, "×", minval = 0.1, step = 0.5, inline = "b2", group = G_C)
+extR   = input.bool(true, "Extend right", group = G_C)
+showR  = input.bool(true, "Show fit quality (Pearson R)", group = G_C,
+     tooltip = "|R| near 1 means price is tracking the trend line closely. Near 0 means the channel is fitting noise.")
+
+theme  = input.string("Standard", "Weight", options = ["Subtle", "Standard", "Bold"], group = G_S)
+fills  = input.bool(true, "Shade the halves", group = G_S)
+cUp    = input.color(color.rgb(38, 166, 154), "Upper half", inline = "c", group = G_S)
+cDn    = input.color(color.rgb(239, 83, 80),  "Lower half", inline = "c", group = G_S)
+cMid   = input.color(color.rgb(255, 255, 255), "Midline",   inline = "c", group = G_S)
+
+int fillT = theme == "Subtle" ? 93 : theme == "Bold" ? 82 : 88
+int lineW = theme == "Bold" ? 2 : 1
+
+// -----------------------------------------------------------------------------
+//  FIT
+// -----------------------------------------------------------------------------
+calc_slope(float source, int length) =>
+    float sumX  = 0.0
+    float sumY  = 0.0
+    float sumXY = 0.0
+    float sumX2 = 0.0
+    for i = 0 to length - 1
+        float val = source[i]
+        float per = i + 1.0
+        sumX  += per
+        sumY  += val
+        sumXY += val * per
+        sumX2 += per * per
+    float denom     = length * sumX2 - sumX * sumX
+    float slope     = denom == 0 ? 0.0 : (length * sumXY - sumX * sumY) / denom
+    float average   = sumY / length
+    float intercept = average - slope * sumX / length + slope
+    [slope, average, intercept]
+
+calc_dev(float source, int length, float slope, float average, float intercept) =>
+    float acc  = 0.0
+    float dsxx = 0.0
+    float dsyy = 0.0
+    float dsxy = 0.0
+    int   periods = length - 1
+    float daY  = intercept + slope * periods / 2
+    float val  = intercept
+    for j = 0 to periods
+        float price = source[j]
+        float dxt   = price - average
+        float dyt   = val - daY
+        price -= val
+        acc  += price * price
+        dsxx += dxt * dxt
+        dsyy += dyt * dyt
+        dsxy += dxt * dyt
+        val  += slope
+    float stdDev   = math.sqrt(acc / (periods == 0 ? 1 : periods))
+    float pearsonR = (dsxx == 0 or dsyy == 0) ? 0.0 : dsxy / math.sqrt(dsxx * dsyy)
+    [stdDev, pearsonR]
+
+[slope, average, intercept] = calc_slope(src, len)
+[stdDev, pearsonR] = calc_dev(src, len, slope, average, intercept)
+
+// i = 0 is the current bar, so the fit value here is the intercept and each
+// step back adds one slope.
+float endY   = intercept
+float startY = intercept + slope * (len - 1)
+
+// -----------------------------------------------------------------------------
+//  DRAW
+// -----------------------------------------------------------------------------
+var line lMid = na
+var line lU1  = na
+var line lD1  = na
+var line lU2  = na
+var line lD2  = na
+var linefill fU = na
+var linefill fD = na
+var label lblR  = na
+
+mkline(float y1, float y2, float off, color col, int width, bool solid) =>
+    line.new(math.max(0, bar_index - len + 1), y1 + off, bar_index, y2 + off, color = col,
+         width = width, style = solid ? line.style_solid : line.style_dashed,
+         extend = extR ? extend.right : extend.none)
+
+if barstate.islast
+    line.delete(lMid)
+    line.delete(lU1)
+    line.delete(lD1)
+    line.delete(lU2)
+    line.delete(lD2)
+    linefill.delete(fU)
+    linefill.delete(fD)
+    label.delete(lblR)
+
+    float off1 = stdDev * mult1
+
+    lMid := mkline(startY, endY, 0.0,   cMid, lineW, true)
+    lU1  := mkline(startY, endY,  off1, cUp,  lineW, true)
+    lD1  := mkline(startY, endY, -off1, cDn,  lineW, true)
+
+    if fills
+        fU := linefill.new(lU1, lMid, color.new(cUp, fillT))
+        fD := linefill.new(lMid, lD1, color.new(cDn, fillT))
+
+    if band2
+        float off2 = stdDev * mult2
+        lU2 := mkline(startY, endY,  off2, cUp, 1, false)
+        lD2 := mkline(startY, endY, -off2, cDn, 1, false)
+
+    if showR
+        lblR := label.new(bar_index + 3, endY,
+             "R " + str.tostring(pearsonR, "#.##"),
+             style = label.style_none, textcolor = cMid, size = size.small,
+             textalign = text.align_left)
+
+// -----------------------------------------------------------------------------
+//  VALUES  (data window only -- available for alerts and confluence checks)
+// -----------------------------------------------------------------------------
+plot(endY,                "Channel mid",   display = display.data_window)
+plot(endY + stdDev * mult1, "Upper band",  display = display.data_window)
+plot(endY - stdDev * mult1, "Lower band",  display = display.data_window)
+plot(pearsonR,            "Pearson R",     display = display.data_window)
+plot(slope,               "Slope",         display = display.data_window)
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+float upper = endY + stdDev * mult1
+float lower = endY - stdDev * mult1
+
+alertcondition(ta.crossunder(close, lower), "Close below lower band", "Price left the channel to the downside")
+alertcondition(ta.crossover(close, upper),  "Close above upper band", "Price left the channel to the upside")
+alertcondition(ta.crossover(close, endY),   "Cross above midline",    "Price crossed above the regression midline")
+alertcondition(ta.crossunder(close, endY),  "Cross below midline",    "Price crossed below the regression midline")

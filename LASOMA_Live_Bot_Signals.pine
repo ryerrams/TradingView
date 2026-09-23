@@ -1,0 +1,683 @@
+//@version=6
+// LASOMA Live Bot Signals -- full-parity Pine translation of the ACTUAL running bot
+// (bots/LaSoma/LASOMA_FUTURES_SCALPING_ONLY.py, Scalping preset, as configured 2026-09-10/11).
+//
+// This is not a generic "LASOMA indicator" -- it hardcodes the live deployment's real
+// config (signal sensitivity 12, fixed 20pt TP, 30s live-signal hold, VP entry gate,
+// leg-exhaustion guard, extension guard, closed-bar coherence gate with dual-trigger
+// override, 1-minute opposition veto, and all 4 currently-active exits: TP, Smart Trail
+// close, reversal, momentum-color profit exit). Intended to be run on a 5-minute NQ/MNQ
+// chart, matching the bot's --bar-size 5 default.
+//
+// IMPORTANT LIMITATIONS (read before trusting a specific historical marker):
+// 1. The bot's "live signal must hold continuously for 30s before firing" debounce is
+//    wall-clock based and only reproducible tick-by-tick on the CURRENT (realtime) bar.
+//    On historical bars, Pine has no intrabar wall-clock resolution, so a signal is
+//    treated as "held long enough" once that bar is confirmed (closed) -- historical
+//    entry markers are therefore a same-bar approximation, not a sub-minute replay.
+// 2. Session RTH/economic-calendar/maintenance-window trading-hour gates are NOT
+//    modeled here (this is a signal-quality study, not an order-scheduling one).
+// 3. Multi-contract pyramiding is not modeled; this assumes a single 1-lot in/out per
+//    signal, matching every trade actually observed in the live logs so far.
+// 4. The volume-profile gate rebuilds a session-anchored histogram from closed bars only,
+//    matching the bot's own _volume_profile()/_profile_value_area() bucketing -- but
+//    Pine's evenly-spaced bucket lookup is a floor-division approximation of the Python
+//    version's np.searchsorted, which can differ by one bucket exactly on a bucket edge.
+indicator("LASOMA Live Bot Signals", overlay = true, max_lines_count = 100, max_labels_count = 500, max_bars_back = 2000)
+
+// ============================================================================================
+// INPUTS -- defaults match the live bot's actual CLI/dataclass config, not generic presets
+// ============================================================================================
+grpEngine = "LASOMA Engine (Scalping preset)"
+i_signalSensitivity = input.int(12, "Signal Sensitivity", group = grpEngine)
+i_atrLength          = input.int(5, "ATR Length", group = grpEngine)
+i_catcherFast        = input.int(5, "Catcher Fast EMA", group = grpEngine)
+i_catcherSlow        = input.int(13, "Catcher Slow EMA", group = grpEngine)
+i_tracerLength       = input.int(14, "Tracer (Inertia) Length", group = grpEngine)
+i_cloudLength        = input.int(34, "Cloud Basis Length (ML feature only)", group = grpEngine)
+i_trailMultiplier    = input.float(2.0, "Trail ATR Multiplier", group = grpEngine)
+i_bandWidth          = input.float(0.35, "Trail Band ATR Width", group = grpEngine)
+i_trailSmoothing     = input.int(3, "Trail Smoothing", group = grpEngine)
+i_wmaLength          = input.int(30, "WMA Length", group = grpEngine)
+i_mlSensitivity      = input.float(1.8, "ML Sensitivity", group = grpEngine)
+i_bullThreshold      = input.float(60.0, "Bull Score Threshold", group = grpEngine)
+i_bearThreshold      = input.float(40.0, "Bear Score Threshold", group = grpEngine)
+i_minConfidence      = input.int(3, "Minimum Confidence (1-5)", group = grpEngine)
+i_moneyFlowLength    = input.int(20, "Money Flow Length", group = grpEngine)
+i_moneyFlowSmooth    = input.int(10, "Money Flow Smooth", group = grpEngine)
+i_hyperFast          = input.int(12, "HyperWave Fast", group = grpEngine)
+i_hyperSlow          = input.int(26, "HyperWave Slow", group = grpEngine)
+i_hyperSmooth        = input.int(5, "HyperWave Smooth", group = grpEngine)
+i_fastOscLength      = input.int(10, "Fast Oscillator Length", group = grpEngine)
+i_fastOscSmooth      = input.int(15, "Fast Oscillator Smooth", group = grpEngine)
+i_fastOscSignal      = input.int(3, "Fast Oscillator Signal", group = grpEngine)
+i_structureLookback  = input.int(10, "Regime Structure Lookback", group = grpEngine)
+i_impulseAtrThresh   = input.float(0.75, "Regime Impulse ATR Threshold", group = grpEngine)
+i_minTrendStrength   = input.float(18.0, "Regime Minimum ADX", group = grpEngine)
+i_confirmBars        = input.int(1, "Regime Confirmation Bars", group = grpEngine)
+
+grpEntry = "Entry Gating"
+i_holdSec            = input.float(30.0, "Live Signal Hold (sec, realtime bar only)", group = grpEntry)
+i_useVpGate          = input.bool(true, "Use VP Entry Gate", group = grpEntry)
+i_vpRows             = input.int(48, "VP Rows", group = grpEntry)
+i_vpLookbackBars     = input.int(6, "VP Lookback Bars", group = grpEntry)
+i_vpMinNodeFrac      = input.float(0.45, "VP Min Node Frac (accepted)", group = grpEntry)
+i_vpThinNodeFrac     = input.float(0.25, "VP Thin Node Frac", group = grpEntry)
+i_vpEdgeTolerance    = input.float(4.0, "VP Edge Tolerance (pts)", group = grpEntry)
+i_vpMigrationMin     = input.float(4.0, "VP Migration Min (pts)", group = grpEntry)
+i_useVpThinHodGuard  = input.bool(true, "Use VP Thin-HOD Guard", group = grpEntry)
+i_vpHodTolerance     = input.float(4.0, "VP HOD Tolerance (pts)", group = grpEntry)
+i_sessionHour        = input.int(17, "VP Session Start Hour (CT, 24h)", group = grpEntry)
+i_useExtGuard        = input.bool(true, "Use Extension Guard", group = grpEntry)
+i_extMaxTrailAtr     = input.float(1.40, "Extension Max Trail ATR", group = grpEntry)
+i_extMaxWmaAtr       = input.float(1.10, "Extension Max WMA ATR", group = grpEntry)
+i_extMaxBarRangeAtr  = input.float(1.40, "Extension Max Bar Range ATR", group = grpEntry)
+i_extMaxRecentMoveAtr = input.float(2.25, "Extension Max Recent Move ATR", group = grpEntry)
+i_extLookbackBars    = input.int(3, "Extension Lookback Bars", group = grpEntry)
+i_useLegGuard        = input.bool(true, "Use Leg Exhaustion Guard", group = grpEntry)
+i_legLookbackBars    = input.int(9, "Leg Exhaustion Lookback Bars", group = grpEntry)
+i_legMaxMoveAtr      = input.float(4.0, "Leg Exhaustion Max Move ATR", group = grpEntry)
+i_legMaxNodeFrac     = input.float(0.35, "Leg Exhaustion Max Node Frac", group = grpEntry)
+i_useOneMinVeto      = input.bool(true, "Use 1-Minute Opposition Veto", group = grpEntry)
+
+grpExit = "Exits"
+i_tpPts              = input.float(20.0, "Take Profit (points)", group = grpExit)
+i_useTpExit          = input.bool(true, "Use Take-Profit Exit", group = grpExit)
+i_useSmartTrailExit  = input.bool(true, "Use Smart Trail Close Exit", group = grpExit)
+i_useMomColorExit    = input.bool(true, "Use Momentum-Color Profit Exit", group = grpExit)
+i_momColorMinPts     = input.float(10.0, "Momentum-Color Exit Min Open Points", group = grpExit)
+
+grpDisplay = "Display"
+i_showTable          = input.bool(true, "Show Debug Table", group = grpDisplay)
+i_showVpLines        = input.bool(true, "Show VP POC/VAH/VAL Lines", group = grpDisplay)
+
+// ============================================================================================
+// HELPERS
+// ============================================================================================
+f_clamp(_v) => math.max(-1.0, math.min(1.0, _v))
+
+f_confLevel(_score) =>
+    _d = math.abs(_score - 50.0) * 2.0
+    _d >= 80.0 ? 5 : _d >= 60.0 ? 4 : _d >= 30.0 ? 3 : _d >= 10.0 ? 2 : 1
+
+f_inertia(_src, _length) =>
+    _stdev = ta.stdev(_src, 10)
+    _upDev = _src > _src[1] ? _stdev : 0.0
+    _downDev = _src < _src[1] ? _stdev : 0.0
+    _num = ta.sma(_upDev, 14)
+    _den = _num + ta.sma(_downDev, 14)
+    _rvi = _den != 0 ? _num / _den * 100.0 : 50.0
+    ta.linreg(_rvi, _length, 0)
+
+// Money-flow score (CMF+MFI)/2, matching Python's calculate_lasoma flow_score exactly,
+// including the two-step MFI override order (pos_sum==0 wins over neg_sum==0).
+f_flowScore(_moneyFlowLength, _moneyFlowSmooth) =>
+    _flowRange = math.max(high - low, syminfo.mintick)
+    _flowVolume = volume > 0 ? volume : 1.0
+    _mfv = ((2.0 * close - high - low) / _flowRange) * _flowVolume
+    _cmfRaw = math.sum(_mfv, _moneyFlowLength) / math.max(math.sum(_flowVolume, _moneyFlowLength), 1.0)
+    _cmfValue = ta.ema(_cmfRaw * 100.0, _moneyFlowSmooth)
+    _typical = hlc3
+    _posMF = _typical > _typical[1] ? _typical * _flowVolume : 0.0
+    _negMF = _typical < _typical[1] ? _typical * _flowVolume : 0.0
+    _posSum = math.sum(_posMF, _moneyFlowLength)
+    _negSum = math.sum(_negMF, _moneyFlowLength)
+    _ratioMfi = _negSum != 0 ? 100.0 - (100.0 / (1.0 + _posSum / _negSum)) : na
+    _mfiStep1 = _negSum != 0 ? _ratioMfi : 100.0
+    _mfiRaw = _posSum != 0 ? _mfiStep1 : 0.0
+    _mfiValue = ta.ema((_mfiRaw - 50.0) * 2.0, _moneyFlowSmooth)
+    (_cmfValue + _mfiValue) / 2.0
+
+f_momentumState(_moneyFlowLength, _moneyFlowSmooth, _fastOscLength, _fastOscSmooth, _fastOscSignal) =>
+    _flowScore = f_flowScore(_moneyFlowLength, _moneyFlowSmooth)
+    _flowMomentum = ta.ema(ta.change(_flowScore), 3)
+    _fastEsa = ta.ema(hlc3, _fastOscLength)
+    _fastD = ta.ema(math.abs(hlc3 - _fastEsa), _fastOscLength)
+    _fastCi = _fastD != 0 ? (hlc3 - _fastEsa) / (0.015 * _fastD) : 0.0
+    _fastOsc = ta.ema(_fastCi, _fastOscSmooth)
+    _fastOscSig = ta.ema(_fastOsc, _fastOscSignal)
+    _momBull = _flowMomentum > 0 and _fastOsc > _fastOscSig
+    _momBear = _flowMomentum < 0 and _fastOsc < _fastOscSig
+    _momBull ? 1 : _momBear ? -1 : 0
+
+// ============================================================================================
+// CORE ENGINE (5m chart, Scalping preset)
+// ============================================================================================
+trv = ta.tr(true)
+atrValue = ta.rma(trv, i_atrLength)
+atrSafe = math.max(atrValue, syminfo.mintick)
+
+emaFast = ta.ema(close, i_catcherFast)
+emaSlow = ta.ema(close, i_catcherSlow)
+
+tracerValue = f_inertia(close, i_tracerLength)
+cloudBasis = ta.sma(close, i_cloudLength)
+
+rsiValue = ta.rsi(close, 14)
+volAvg20 = ta.sma(volume, 20)
+volSafe = math.max(volAvg20, 1.0)
+atrAvg50 = ta.sma(atrValue, 50)
+volRatio = atrAvg50 == 0 ? 1.0 : atrValue / atrAvg50
+
+signalTrendFeature    = f_clamp((emaFast - emaSlow) / atrSafe)
+signalMomentumFeature = f_clamp((close - close[5]) / (atrSafe * 2.0))
+signalTracerFeature   = f_clamp((tracerValue - tracerValue[1]) / atrSafe)
+signalCloudFeature    = f_clamp((close - cloudBasis) / (atrSafe * 2.0))
+signalRsiFeature      = f_clamp((rsiValue - 50.0) / 30.0)
+signalVolumeFeature   = f_clamp(((close - open) / atrSafe) * (volume / volSafe))
+signalAdaptiveWeight  = f_clamp(2.0 - volRatio)
+signalEnsembleRaw = signalTrendFeature * 0.25 + signalMomentumFeature * 0.20 + signalTracerFeature * 0.15 +
+                     signalCloudFeature * 0.15 + signalRsiFeature * 0.15 + signalVolumeFeature * 0.10
+signalMlRaw = signalEnsembleRaw * i_mlSensitivity * (0.85 + signalAdaptiveWeight * 0.15)
+signalMlScore = 100.0 / (1.0 + math.exp(-signalMlRaw))
+signalMlConfidence = f_confLevel(signalMlScore)
+
+// Investor Trailing Stop (recursive ratchet) -- this IS "lasoma_visual_trail" for Scalping.
+investorOffset = atrValue * i_trailMultiplier * (1.0 + (i_signalSensitivity - 12.0) / 10.0)
+var float investorStop = na
+investorStop := na(investorStop[1]) ? close :
+     (close[1] >= investorStop[1] ?
+         (close < investorStop[1] ? close + investorOffset : math.max(investorStop[1], close - investorOffset)) :
+         (close > investorStop[1] ? close - investorOffset : math.min(investorStop[1], close + investorOffset)))
+investorTrend = close >= investorStop ? 1 : -1
+investorTrailRef = ta.ema(investorStop, i_trailSmoothing)
+investorLongCandidate  = investorTrend == 1  and investorTrend[1] == -1
+investorShortCandidate = investorTrend == -1 and investorTrend[1] == 1
+
+scalpingBullScoreChange = signalMlScore >= i_bullThreshold and (signalMlScore[1] < i_bullThreshold or signalMlConfidence != signalMlConfidence[1])
+scalpingBearScoreChange = signalMlScore <= i_bearThreshold and (signalMlScore[1] > i_bearThreshold or signalMlConfidence != signalMlConfidence[1])
+
+flowScore = f_flowScore(i_moneyFlowLength, i_moneyFlowSmooth)
+flowMomentum = ta.ema(ta.change(flowScore), 3)
+
+hyperMacd = ta.ema(close, i_hyperFast) - ta.ema(close, i_hyperSlow)
+hyperBase = ta.sma(close, 50)
+hyperNorm = hyperBase != 0 ? hyperMacd / hyperBase * 100.0 : 0.0
+hyperRaw = ta.ema(hyperNorm, i_hyperSmooth)
+hyperRange = ta.highest(math.abs(hyperRaw), 100)
+hyperWave = hyperRange > 0 ? hyperRaw / hyperRange * 100.0 : 0.0
+
+fastEsa2 = ta.ema(hlc3, i_fastOscLength)
+fastD2 = ta.ema(math.abs(hlc3 - fastEsa2), i_fastOscLength)
+fastCi2 = fastD2 != 0 ? (hlc3 - fastEsa2) / (0.015 * fastD2) : 0.0
+fastOsc = ta.ema(fastCi2, i_fastOscSmooth)
+fastOscSignal = ta.ema(fastOsc, i_fastOscSignal)
+
+trendSquareBullish = flowScore > 0 and hyperWave > 0
+trendSquareBearish = flowScore < 0 and hyperWave < 0
+momentumSquareBullish = flowMomentum > 0 and fastOsc > fastOscSignal
+momentumSquareBearish = flowMomentum < 0 and fastOsc < fastOscSignal
+momentumState = momentumSquareBullish ? 1 : momentumSquareBearish ? -1 : 0
+
+// Ratchet-based Smart Trail (separate from the investor trail) -- feeds ONLY the
+// MOMENTUM_EDGE trigger definition below, matching Python's "lasoma_original_visual_trail".
+trailOffset = atrValue * i_trailMultiplier
+var float trailCenter = na
+var int trailDirection = 1
+if na(trailCenter[1])
+    trailCenter := close
+    trailDirection := 1
+else if trailDirection[1] == 1
+    c1 = math.max(trailCenter[1], close - trailOffset)
+    if close < c1
+        trailDirection := -1
+        trailCenter := close + trailOffset
+    else
+        trailDirection := 1
+        trailCenter := c1
+else
+    c2 = math.min(trailCenter[1], close + trailOffset)
+    if close > c2
+        trailDirection := 1
+        trailCenter := close - trailOffset
+    else
+        trailDirection := -1
+        trailCenter := c2
+visualTrailRatchet = ta.ema(trailCenter, i_trailSmoothing)
+
+wmaValue = ta.wma(close, i_wmaLength)
+
+bandUpper = visualTrailRatchet + atrValue * i_bandWidth
+bandLower = visualTrailRatchet - atrValue * i_bandWidth
+rawPriceRegime = close > bandUpper ? 1 : close < bandLower ? -1 : 0
+
+upMove = high - high[1]
+downMove = low[1] - low
+plusDM = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM = (downMove > upMove and downMove > 0) ? downMove : 0.0
+dmiAtr = ta.rma(trv, 14)
+plusDMRma = ta.rma(plusDM, 14)
+minusDMRma = ta.rma(minusDM, 14)
+plusDI = dmiAtr != 0 ? 100.0 * plusDMRma / dmiAtr : 0.0
+minusDI = dmiAtr != 0 ? 100.0 * minusDMRma / dmiAtr : 0.0
+dx = (plusDI + minusDI) != 0 ? 100.0 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+adxValue = ta.rma(dx, 14)
+
+bullishTrendQuality = adxValue >= i_minTrendStrength and plusDI > minusDI
+bearishTrendQuality = adxValue >= i_minTrendStrength and minusDI > plusDI
+priorHigh = ta.highest(high[1], i_structureLookback)
+priorLow = ta.lowest(low[1], i_structureLookback)
+bullishStructBreak = close > priorHigh
+bearishStructBreak = close < priorLow
+bullishImpulse = close > close[1] and (close - close[1]) >= atrValue * i_impulseAtrThresh
+bearishImpulse = close < close[1] and (close[1] - close) >= atrValue * i_impulseAtrThresh
+bullishDynTrigger = bullishStructBreak or bullishImpulse
+bearishDynTrigger = bearishStructBreak or bearishImpulse
+
+var int regimeState = 0
+var int pendingRegime = 0
+var int pendingBars = 0
+prevRegime = regimeState[1]
+desired = prevRegime
+if prevRegime == 0
+    desired := (rawPriceRegime == 1 and bullishTrendQuality and bullishDynTrigger) ? 1 :
+               (rawPriceRegime == -1 and bearishTrendQuality and bearishDynTrigger) ? -1 : 0
+else if prevRegime == 1
+    desired := (rawPriceRegime == -1 and bearishTrendQuality and bearishDynTrigger) ? -1 : 1
+else
+    desired := (rawPriceRegime == 1 and bullishTrendQuality and bullishDynTrigger) ? 1 : -1
+
+if desired == prevRegime
+    pendingRegime := 0
+    pendingBars := 0
+    regimeState := prevRegime
+else
+    if desired != pendingRegime
+        pendingRegime := desired
+        pendingBars := 1
+    else
+        pendingBars := pendingBars + 1
+    if pendingBars >= i_confirmBars
+        regimeState := pendingRegime
+        pendingRegime := 0
+        pendingBars := 0
+    else
+        regimeState := prevRegime
+
+trendFeature = regimeState == 1 ? 1.0 : regimeState == -1 ? -1.0 : 0.0
+threeBarFeature = f_clamp((close - close[3]) / (atrSafe * 1.5))
+oneBarFeature = f_clamp((close - close[1]) / atrSafe)
+pressureFeature = f_clamp(((close - open) / atrSafe) * (volume / volSafe))
+futuresRawScore = trendFeature * 0.50 + threeBarFeature * 0.25 + oneBarFeature * 0.15 + pressureFeature * 0.10
+futuresScore = regimeState == 0 ? 50.0 : 50.0 + f_clamp(futuresRawScore) * 50.0
+bullishScoreState = futuresScore >= i_bullThreshold
+bearishScoreState = futuresScore <= i_bearThreshold
+
+bullishMomentumEntry = close > visualTrailRatchet and bullishScoreState and momentumSquareBullish
+bearishMomentumEntry = close < visualTrailRatchet and bearishScoreState and momentumSquareBearish
+scalpingBullMomentumEdge = bullishMomentumEntry and not bullishMomentumEntry[1]
+scalpingBearMomentumEdge = bearishMomentumEntry and not bearishMomentumEntry[1]
+
+scalpingLongSignal  = (investorLongCandidate  or scalpingBullScoreChange or scalpingBullMomentumEdge) and (signalMlConfidence >= i_minConfidence) and (investorTrend == 1)
+scalpingShortSignal = (investorShortCandidate or scalpingBearScoreChange or scalpingBearMomentumEdge) and (signalMlConfidence >= i_minConfidence) and (investorTrend == -1)
+
+liveSetupSide = scalpingLongSignal ? "LONG" : scalpingShortSignal ? "SHORT" : "NONE"
+triggerSource = investorLongCandidate or investorShortCandidate ? "INVESTOR_FLIP" :
+     (scalpingBullScoreChange or scalpingBearScoreChange) ? "SCORE_EDGE" :
+     (scalpingBullMomentumEdge or scalpingBearMomentumEdge) ? "MOMENTUM_EDGE" : "NONE"
+
+// "Closed bar" snapshot == last CONFIRMED bar's values, i.e. [1]-shifted relative to
+// whatever bar is currently forming -- mirrors Python's df_signal = df.iloc[:-1].
+closedSetupSide = scalpingLongSignal[1] ? "LONG" : scalpingShortSignal[1] ? "SHORT" : "NONE"
+closedRegime = investorTrend[1]
+closedConfidence = signalMlConfidence[1]
+closedClose = close[1]
+closedSmartTrail = investorTrailRef[1]
+closedInvestorLongCandidate = investorLongCandidate[1]
+closedInvestorShortCandidate = investorShortCandidate[1]
+closedScalpBullScoreChange = scalpingBullScoreChange[1]
+closedScalpBearScoreChange = scalpingBearScoreChange[1]
+
+// ============================================================================================
+// ENTRY/EXIT COHERENCE GATE (evaluate_entry_exit_coherence; allow_dual_trigger_override=True,
+// allow_one_minute_aligned_override=False at the bot's actual call site)
+// ============================================================================================
+expectedRegime = liveSetupSide == "LONG" ? 1 : liveSetupSide == "SHORT" ? -1 : 0
+regimeOk = expectedRegime != 0 and closedRegime == expectedRegime
+baseConfidenceOk = closedConfidence >= i_minConfidence
+investorFlipClosed = liveSetupSide == "LONG" ? closedInvestorLongCandidate : liveSetupSide == "SHORT" ? closedInvestorShortCandidate : false
+scoreEdgeClosed = liveSetupSide == "LONG" ? closedScalpBullScoreChange : liveSetupSide == "SHORT" ? closedScalpBearScoreChange : false
+dualTrigger = investorFlipClosed and scoreEdgeClosed
+dualTriggerOverride = i_minConfidence == 3 and closedConfidence == 2 and dualTrigger
+confidenceOk = baseConfidenceOk or dualTriggerOverride
+trailAvailable = not na(closedSmartTrail) and closedSmartTrail > 0
+trailOk = trailAvailable and ((liveSetupSide == "LONG" and closedClose >= closedSmartTrail) or (liveSetupSide == "SHORT" and closedClose <= closedSmartTrail))
+coherenceAllowed = (liveSetupSide == "LONG" or liveSetupSide == "SHORT") and regimeOk and confidenceOk and trailOk
+
+// ============================================================================================
+// 1-MINUTE OPPOSITION VETO (evaluate_one_minute_entry_context: momentum only, last CONFIRMED
+// 1m bar; neutral is allowed, only a direct opposite momentum vetoes)
+// ============================================================================================
+oneMinMomentum = request.security(syminfo.tickerid, "1", f_momentumState(i_moneyFlowLength, i_moneyFlowSmooth, i_fastOscLength, i_fastOscSmooth, i_fastOscSignal)[1], lookahead = barmerge.lookahead_off)
+expectedOneMin = liveSetupSide == "LONG" ? 1 : liveSetupSide == "SHORT" ? -1 : 0
+oneMinVeto = i_useOneMinVeto and expectedOneMin != 0 and oneMinMomentum == -expectedOneMin
+
+// ============================================================================================
+// VOLUME PROFILE ENTRY GATE (session-anchored, closed bars only, matches
+// evaluate_vp_entry_gate / _volume_profile / _profile_value_area)
+// ============================================================================================
+shiftedTime = time - i_sessionHour * 60 * 60 * 1000
+sessKey = year(shiftedTime, "America/Chicago") * 10000 + month(shiftedTime, "America/Chicago") * 100 + dayofmonth(shiftedTime, "America/Chicago")
+
+var array<float> sessHigh = array.new_float(0)
+var array<float> sessLow = array.new_float(0)
+var array<float> sessClose = array.new_float(0)
+var array<float> sessVol = array.new_float(0)
+var int lastPushedSessKey = na
+
+if barstate.isconfirmed
+    if na(lastPushedSessKey) or sessKey != lastPushedSessKey
+        array.clear(sessHigh)
+        array.clear(sessLow)
+        array.clear(sessClose)
+        array.clear(sessVol)
+    array.push(sessHigh, high)
+    array.push(sessLow, low)
+    array.push(sessClose, close)
+    array.push(sessVol, volume)
+    lastPushedSessKey := sessKey
+
+f_buildProfileRange(_highArr, _lowArr, _volArr, _fromIdx, _toIdx, _edgeLo, _step, _rows) =>
+    _totals = array.new_float(_rows, 0.0)
+    if _fromIdx <= _toIdx
+        for i = _fromIdx to _toIdx
+            _h = array.get(_highArr, i)
+            _l = array.get(_lowArr, i)
+            _v = array.get(_volArr, i)
+            if _v > 0
+                _loIdx = math.max(0, math.min(_rows - 1, int((math.min(_l, _h) - _edgeLo) / _step)))
+                _hiIdx = math.max(0, math.min(_rows - 1, int((math.max(_l, _h) - _edgeLo) / _step)))
+                if _hiIdx < _loIdx
+                    _hiIdx := _loIdx
+                _perRow = _v / (_hiIdx - _loIdx + 1)
+                for r = _loIdx to _hiIdx
+                    array.set(_totals, r, array.get(_totals, r) + _perRow)
+    _totals
+
+f_valueArea(_totals, _rows) =>
+    _pocIdx = 0
+    _best = array.get(_totals, 0)
+    for i = 1 to _rows - 1
+        _v = array.get(_totals, i)
+        if _v > _best
+            _best := _v
+            _pocIdx := i
+    _total = array.sum(_totals)
+    _loIdx = _pocIdx
+    _hiIdx = _pocIdx
+    _target = _total * 0.70
+    _acc = array.get(_totals, _pocIdx)
+    while _acc < _target and (_loIdx > 0 or _hiIdx < _rows - 1)
+        _leftVal = _loIdx > 0 ? array.get(_totals, _loIdx - 1) : -1.0
+        _rightVal = _hiIdx < _rows - 1 ? array.get(_totals, _hiIdx + 1) : -1.0
+        if _rightVal >= _leftVal
+            _hiIdx := _hiIdx + 1
+            _acc := _acc + math.max(0.0, _rightVal)
+        else
+            _loIdx := _loIdx - 1
+            _acc := _acc + math.max(0.0, _leftVal)
+    [_loIdx, _hiIdx, _pocIdx, _best]
+
+f_weightedCenter(_highArr, _lowArr, _closeArr, _volArr, _fromIdx, _toIdx) =>
+    _num = 0.0
+    _den = 0.0
+    if _fromIdx <= _toIdx
+        for i = _fromIdx to _toIdx
+            _h = array.get(_highArr, i)
+            _l = array.get(_lowArr, i)
+            _c = array.get(_closeArr, i)
+            _v = math.max(array.get(_volArr, i), 0.0)
+            _typical = (_h + _l + _c) / 3.0
+            _num := _num + _typical * _v
+            _den := _den + _v
+    _den > 0 ? _num / _den : na
+
+n = array.size(sessHigh)
+vpDataOk = i_useVpGate and n >= math.max(60, i_vpLookbackBars * 3)
+
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+var float activeDensity = na
+var float hodDensity = na
+var float recentDensity = na
+var float migrationPts = na
+var bool vpLongBlocked = false
+var bool vpShortBlocked = false
+
+if vpDataOk
+    sessMinLow = array.min(sessLow)
+    sessMaxHighVal = array.max(sessHigh)
+    edgeLo = sessMinLow
+    edgeHi = sessMaxHighVal <= sessMinLow ? sessMinLow + 0.25 : sessMaxHighVal
+    step = (edgeHi - edgeLo) / i_vpRows
+
+    fullTotals = f_buildProfileRange(sessHigh, sessLow, sessVol, 0, n - 1, edgeLo, step, i_vpRows)
+    [loIdx, hiIdx, pocIdx, pocVol] = f_valueArea(fullTotals, i_vpRows)
+    valPrice := edgeLo + step * (loIdx + 0.5)
+    vahPrice := edgeLo + step * (hiIdx + 0.5)
+    pocPrice := edgeLo + step * (pocIdx + 0.5)
+
+    recentFrom = math.max(0, n - i_vpLookbackBars)
+    recentTotals = f_buildProfileRange(sessHigh, sessLow, sessVol, recentFrom, n - 1, edgeLo, step, i_vpRows)
+    recentPocVol = array.max(recentTotals)
+
+    px = closedClose
+    rowIdx = math.max(0, math.min(i_vpRows - 1, int((px - edgeLo) / step)))
+    sessionHighVal = sessMaxHighVal
+    currentHigh = high[1]
+    hodIdx = math.max(0, math.min(i_vpRows - 1, int((sessionHighVal - edgeLo) / step)))
+
+    activeDensity := pocVol > 0 ? array.get(fullTotals, rowIdx) / pocVol : 0.0
+    hodDensity := pocVol > 0 ? array.get(fullTotals, hodIdx) / pocVol : 0.0
+    recentDensity := recentPocVol > 0 ? array.get(recentTotals, rowIdx) / recentPocVol : 0.0
+
+    prevFrom = math.max(0, n - 2 * i_vpLookbackBars)
+    prevTo = n - i_vpLookbackBars - 1
+    recentCenter = f_weightedCenter(sessHigh, sessLow, sessClose, sessVol, recentFrom, n - 1)
+    prevCenter = f_weightedCenter(sessHigh, sessLow, sessClose, sessVol, prevFrom, prevTo)
+    migrationPts := (not na(prevCenter) and prevCenter > 0) ? recentCenter - prevCenter : 0.0
+
+    acceptedHere = activeDensity >= i_vpMinNodeFrac or recentDensity >= i_vpMinNodeFrac
+    aboveValue = px >= vahPrice + i_vpEdgeTolerance
+    belowValue = px <= valPrice - i_vpEdgeTolerance
+    abovePoc = px >= pocPrice + i_vpEdgeTolerance
+    belowPoc = px <= pocPrice - i_vpEdgeTolerance
+    migratingUp = migrationPts >= i_vpMigrationMin
+    migratingDown = migrationPts <= -i_vpMigrationMin
+    nearSessionHigh = currentHigh >= sessionHighVal - i_vpHodTolerance
+    thinHod = hodDensity <= i_vpThinNodeFrac and recentDensity < i_vpMinNodeFrac
+
+    vpBlockLong1 = i_useVpThinHodGuard and aboveValue and nearSessionHigh and thinHod
+    vpBlockLong2 = aboveValue and (not acceptedHere or not migratingUp)
+    vpBlockLong3 = belowPoc and not acceptedHere and not migratingUp
+    vpLongBlocked := vpBlockLong1 or vpBlockLong2 or vpBlockLong3
+
+    vpBlockShort1 = belowValue and (not acceptedHere or not migratingDown)
+    vpBlockShort2 = abovePoc and not acceptedHere and not migratingDown
+    vpShortBlocked := vpBlockShort1 or vpBlockShort2
+
+vpGateOk = (not i_useVpGate) or (not vpDataOk) or (liveSetupSide == "LONG" ? not vpLongBlocked : liveSetupSide == "SHORT" ? not vpShortBlocked : true)
+
+// ============================================================================================
+// EXTENSION GUARD (evaluate_lasoma_extension_guard) -- native shifted series, rolling window
+// ============================================================================================
+extAtr = math.max(atrValue[1], 0.25)
+extTrail = closedSmartTrail
+extWma = wmaValue[1]
+extDirection = liveSetupSide == "LONG" ? 1.0 : liveSetupSide == "SHORT" ? -1.0 : 0.0
+trailExtAtr = extTrail > 0 ? extDirection * (closedClose - extTrail) / extAtr : 0.0
+wmaExtAtr = extWma > 0 ? extDirection * (closedClose - extWma) / extAtr : 0.0
+barRangeAtr = (high[1] - low[1]) / extAtr
+bodyAtr = math.abs(closedClose - open[1]) / extAtr
+priorCloseExt = close[1 + i_extLookbackBars]
+recentMoveAtr = extDirection * (closedClose - priorCloseExt) / extAtr
+extWin = math.max(i_extLookbackBars + 1, 6)
+recentWinHigh = ta.highest(high[1], extWin)
+recentWinLow = ta.lowest(low[1], extWin)
+nearExtremeExt = liveSetupSide == "LONG" ? closedClose >= recentWinHigh - 0.35 * extAtr : closedClose <= recentWinLow + 0.35 * extAtr
+tooFarFromTrend = trailExtAtr >= i_extMaxTrailAtr and wmaExtAtr >= i_extMaxWmaAtr
+outsizedBar = barRangeAtr >= i_extMaxBarRangeAtr or bodyAtr >= i_extMaxBarRangeAtr * 0.70
+fastRecentRun = recentMoveAtr >= i_extMaxRecentMoveAtr
+lateChase = tooFarFromTrend and nearExtremeExt and (outsizedBar or fastRecentRun)
+extGateOk = (not i_useExtGuard) or (liveSetupSide == "NONE") or (not lateChase)
+
+// ============================================================================================
+// LEG EXHAUSTION GUARD (evaluate_leg_exhaustion_guard) -- reuses VAH/VAL from the VP gate
+// ============================================================================================
+legPriorClose = close[1 + i_legLookbackBars]
+legMoveAtr = extDirection * (closedClose - legPriorClose) / extAtr
+legWin = i_legLookbackBars + 1
+legWinHigh = ta.highest(high[1], legWin)
+legWinLow = ta.lowest(low[1], legWin)
+legNearExtreme = liveSetupSide == "LONG" ? closedClose >= legWinHigh - 0.35 * extAtr : closedClose <= legWinLow + 0.35 * extAtr
+legOutsideValue = vpDataOk and (liveSetupSide == "LONG" ? closedClose >= vahPrice + i_vpEdgeTolerance : closedClose <= valPrice - i_vpEdgeTolerance)
+legLowDensityNode = vpDataOk and activeDensity <= i_legMaxNodeFrac
+legFarFromTrend = trailExtAtr >= i_extMaxTrailAtr or wmaExtAtr >= i_extMaxWmaAtr
+legExhausted = legOutsideValue and legLowDensityNode and legNearExtreme and legFarFromTrend and legMoveAtr >= i_legMaxMoveAtr
+legGateOk = (not i_useLegGuard) or (liveSetupSide == "NONE") or (not vpDataOk) or (not legExhausted)
+
+// ============================================================================================
+// LIVE SIGNAL HOLD TIMER (advance_live_signal_hold) -- wall-clock accurate on the realtime
+// bar only; historical bars approximate "held long enough" as "bar confirmed". See header.
+// ============================================================================================
+liveSignalId = liveSetupSide != "NONE" ? str.tostring(time) + "|" + liveSetupSide : ""
+var string pendingSignalId = na
+var float pendingSince = na
+var string consumedSignalId = na
+
+sameAsPending = liveSignalId != "" and pendingSignalId == liveSignalId
+sameAsConsumed = liveSignalId != "" and consumedSignalId == liveSignalId
+
+if liveSignalId == ""
+    pendingSignalId := na
+    pendingSince := na
+else if not sameAsConsumed and not sameAsPending
+    pendingSignalId := liveSignalId
+    pendingSince := timenow
+
+heldSec = (liveSignalId != "" and sameAsPending) ? (timenow - pendingSince) / 1000.0 : 0.0
+holdReady = liveSignalId != "" and not sameAsConsumed and (barstate.isrealtime ? heldSec >= i_holdSec : barstate.isconfirmed)
+
+// ============================================================================================
+// POSITION-STATE SIMULATION (single 1-lot in/out; drives exit checks + entry markers)
+// ============================================================================================
+var int posState = 0
+var float entryPx = na
+var int lastExitBarTime = na
+
+postExitOk = posState != 0 or liveSetupSide == "NONE" or na(lastExitBarTime) or time > lastExitBarTime
+
+exitFiredThisBar = false
+var string lastExitLabel = na
+var float lastExitPx = na
+
+if posState != 0
+    tpPrice = posState > 0 ? entryPx + i_tpPts : entryPx - i_tpPts
+    tpHit = i_useTpExit and ((posState > 0 and high >= tpPrice) or (posState < 0 and low <= tpPrice))
+    smartTrailExitCond = i_useSmartTrailExit and ((posState > 0 and closedClose < closedSmartTrail) or (posState < 0 and closedClose > closedSmartTrail))
+    reversalExitCond = (posState < 0 and closedSetupSide == "LONG") or (posState > 0 and closedSetupSide == "SHORT")
+    openPtsLive = posState > 0 ? (close - entryPx) : (entryPx - close)
+    momState1 = momentumState[1]
+    momState2 = momentumState[2]
+    momColorExitCond = i_useMomColorExit and openPtsLive >= i_momColorMinPts and
+         ((posState > 0 and momState2 == 1 and momState1 == -1) or (posState < 0 and momState2 == -1 and momState1 == 1))
+
+    if tpHit
+        lastExitPx := tpPrice
+        lastExitLabel := "TP +" + str.tostring(i_tpPts, "#.##")
+        posState := 0
+        lastExitBarTime := time
+        exitFiredThisBar := true
+    else if smartTrailExitCond
+        lastExitPx := close
+        lastExitLabel := "Smart Trail"
+        posState := 0
+        lastExitBarTime := time
+        exitFiredThisBar := true
+    else if reversalExitCond
+        lastExitPx := close
+        lastExitLabel := "Reversal"
+        posState := 0
+        lastExitBarTime := time
+        exitFiredThisBar := true
+    else if momColorExitCond
+        lastExitPx := close
+        lastExitLabel := "Mom Color +" + str.tostring(openPtsLive, "#.##")
+        posState := 0
+        lastExitBarTime := time
+        exitFiredThisBar := true
+
+gatesOk = extGateOk and legGateOk and vpGateOk and not oneMinVeto
+canEnter = posState == 0 and not exitFiredThisBar
+
+entryLongFired  = canEnter and liveSetupSide == "LONG"  and holdReady and coherenceAllowed and postExitOk and gatesOk
+entryShortFired = canEnter and liveSetupSide == "SHORT" and holdReady and coherenceAllowed and postExitOk and gatesOk
+
+if entryLongFired
+    posState := 1
+    entryPx := close
+    consumedSignalId := liveSignalId
+    pendingSignalId := na
+if entryShortFired
+    posState := -1
+    entryPx := close
+    consumedSignalId := liveSignalId
+    pendingSignalId := na
+
+// ============================================================================================
+// PLOTS
+// ============================================================================================
+plotshape(entryLongFired, title = "Long Entry", style = shape.triangleup, location = location.belowbar, color = color.new(color.rgb(34, 197, 94), 0), size = size.small)
+plotshape(entryShortFired, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.rgb(255, 32, 32), 0), size = size.small)
+
+plotchar(exitFiredThisBar and lastExitLabel == "TP +" + str.tostring(i_tpPts, "#.##"), title = "TP Exit", char = "T", location = location.abovebar, color = color.new(color.blue, 0), size = size.tiny)
+plotchar(exitFiredThisBar and lastExitLabel == "Smart Trail", title = "Smart Trail Exit", char = "S", location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotchar(exitFiredThisBar and lastExitLabel == "Reversal", title = "Reversal Exit", char = "R", location = location.abovebar, color = color.new(color.purple, 0), size = size.tiny)
+plotchar(exitFiredThisBar and str.startswith(str.tostring(lastExitLabel), "Mom Color"), title = "Mom Color Exit", char = "M", location = location.abovebar, color = color.new(color.teal, 0), size = size.tiny)
+
+plot(investorTrailRef, "Smart Trail (Investor)", color = investorTrend == 1 ? color.new(color.rgb(0, 188, 212), 40) : color.new(color.rgb(255, 152, 0), 40), linewidth = 2)
+plot(wmaValue, "WMA30", color = color.new(color.gray, 50))
+
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+if i_showVpLines and barstate.islast and vpDataOk
+    line.delete(pocLine)
+    line.delete(vahLine)
+    line.delete(valLine)
+    lineFrom = bar_index - 40
+    pocLine := line.new(lineFrom, pocPrice, bar_index + 5, pocPrice, color = color.new(color.yellow, 30), style = line.style_dashed)
+    vahLine := line.new(lineFrom, vahPrice, bar_index + 5, vahPrice, color = color.new(color.silver, 40), style = line.style_dotted)
+    valLine := line.new(lineFrom, valPrice, bar_index + 5, valPrice, color = color.new(color.silver, 40), style = line.style_dotted)
+
+var table infoTable = table.new(position.top_right, 2, 12, border_width = 1)
+if i_showTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Setup", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 0, liveSetupSide + " (" + triggerSource + ")", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 1, "Confidence", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 1, str.tostring(signalMlConfidence) + "/5 (score " + str.tostring(math.round(signalMlScore * 10) / 10) + ")", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 0, 2, "Investor Trend", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 2, investorTrend == 1 ? "BULL" : "BEAR", text_color = investorTrend == 1 ? color.lime : color.red, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 3, "Hold Timer", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 3, holdReady ? "READY" : str.tostring(math.round(heldSec)) + "/" + str.tostring(i_holdSec) + "s", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 0, 4, "Coherence", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 4, coherenceAllowed ? "PASS" : "BLOCK", text_color = coherenceAllowed ? color.lime : color.red, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 5, "1m Veto", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 5, oneMinVeto ? "VETOED" : "clear", text_color = oneMinVeto ? color.red : color.lime, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 0, 6, "VP Gate", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 6, not vpDataOk ? "n/a" : (vpGateOk ? "PASS" : "BLOCK"), text_color = vpGateOk ? color.lime : color.red, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 7, "VP POC/VAH/VAL", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 7, vpDataOk ? (str.tostring(math.round(pocPrice * 100) / 100) + " / " + str.tostring(math.round(vahPrice * 100) / 100) + " / " + str.tostring(math.round(valPrice * 100) / 100)) : "n/a", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 0, 8, "VP Node/Migration", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 8, vpDataOk ? (str.tostring(math.round(activeDensity * 100) / 100) + " / " + str.tostring(math.round(migrationPts * 10) / 10) + "pts") : "n/a", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 9, "Extension Gate", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 9, extGateOk ? "PASS" : "BLOCK", text_color = extGateOk ? color.lime : color.red, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 0, 10, "Leg Exhaustion", text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 10, legGateOk ? "PASS" : "BLOCK", text_color = legGateOk ? color.lime : color.red, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 0, 11, "Position", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 11, posState == 0 ? "FLAT" : (posState > 0 ? "LONG @ " + str.tostring(entryPx) : "SHORT @ " + str.tostring(entryPx)), text_color = color.white, bgcolor = color.new(color.gray, 40))
+
+alertcondition(entryLongFired, title = "LASOMA Long Entry", message = "LASOMA scalper: LONG entry fired")
+alertcondition(entryShortFired, title = "LASOMA Short Entry", message = "LASOMA scalper: SHORT entry fired")
+alertcondition(exitFiredThisBar, title = "LASOMA Exit", message = "LASOMA scalper: position exit fired")

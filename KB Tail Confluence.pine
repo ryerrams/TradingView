@@ -1,0 +1,189 @@
+// KB Tail Confluence
+// Port of the thinkScript "Daily/Hourly Tail Confluence" study.
+//
+// Fires at most one LONG and one SHORT per day, when the LOWS (or HIGHS) of the last few clock hours
+// cluster within a tolerance of the day's low (or high) - multi-timeframe agreement that price keeps
+// refusing to go further. These are the thin, low-volume tails of the day's volume profile, which is
+// why the original was built on profile objects.
+//
+// It does not need them. thinkScript's profile.GetLowest() returns the lowest price ROW of a profile,
+// which is simply the period's low; GetHighest() is its high. So the whole test reduces to comparing
+// hourly extremes against the day's extreme, and the profile machinery in the original is inert.
+//
+// Targets are deliberately absent. The original's T1 is today's developing POC and T2/T3 are prior-day
+// POCs beyond it - already drawn by "KB Vol Profile" (yellow PoC line) and "KB POC Levels" (DAILY POC
+// plus the naked POCs). This indicator supplies only the entry signal those levels are the targets for.
+
+//@version=6
+indicator(title = 'KB Tail Confluence', shorttitle = 'KB_TAIL', overlay = true, max_labels_count = 500)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// INPUTS
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+tol_mode     = input.string(defval = 'ATR Multiple', title = 'Tolerance Mode', options = ['ATR Multiple', 'Fixed Points'], group = 'Confluence', tooltip = 'ATR Multiple self-scales to current volatility, so the same setting keeps working when the range expands. Fixed Points is the original default.')
+tol_atr      = input.float(defval = 0.5, minval = 0.05, maxval = 5.0, step = 0.05, title = 'ATR Multiple', group = 'Confluence')
+tol_pts      = input.float(defval = 5.0, minval = 0.0, step = 0.25, title = 'Fixed Points', group = 'Confluence')
+atr_len      = input.int(defval = 14, minval = 2, maxval = 200, title = 'ATR Length', group = 'Confluence')
+
+day_mode     = input.string(defval = 'Calendar Day', title = 'Day Boundary', options = ['Calendar Day', 'Exchange Session'], group = 'Confluence', tooltip = 'What "the day" means for the day high/low and for the once-per-day latch. Calendar Day rolls at midnight exchange time and matches the thinkScript original, so at 10:00 the day low excludes the prior evening Globex. Exchange Session rolls at the 17:00 CT futures open and matches KB Vol Profile and KB POC Levels, so the overnight range counts.')
+hr_lookback  = input.int(defval = 3, minval = 1, maxval = 4, title = 'Hourly Lookback (incl. live hour)', group = 'Confluence', tooltip = '1 = the live hour only, 2 = live plus last completed hour, and so on.')
+min_hours    = input.int(defval = 2, minval = 1, maxval = 4, title = 'Hours Required Near', group = 'Confluence')
+inc_live     = input.bool(defval = true, title = 'Count The Live Hour', group = 'Confluence', tooltip = 'A still-forming hourly extreme can drift in and out of tolerance. Safe to leave on because the once-per-day latch already stops that from re-firing.')
+need_confirm = input.bool(defval = true, title = 'Require Reversal Confirmation', group = 'Confluence', tooltip = 'Only signal while price is back above the day low (longs) or below the day high (shorts). State, not a one-shot cross: confluence often locks in a bar after the actual turn, so this fires whenever the second of the two arrives.')
+one_per_day  = input.bool(defval = true, title = 'One Signal Per Side Per Day', group = 'Confluence')
+
+show_long    = input.bool(defval = true, title = 'Long Signals', group = 'Display')
+show_short   = input.bool(defval = true, title = 'Short Signals', group = 'Display')
+c_long       = input.color(defval = #26A69A, title = 'Long Color', group = 'Display')
+c_short      = input.color(defval = #EF5350, title = 'Short Color', group = 'Display')
+show_zones   = input.bool(defval = true, title = 'Tolerance Bands', group = 'Display', tooltip = 'Shades the band from each day extreme out to the tolerance, so you can see the window the hourly tails have to land inside.')
+show_extreme = input.bool(defval = false, title = 'Day High / Low Lines', group = 'Display')
+show_count   = input.bool(defval = true, title = 'Count On Signal', group = 'Display', tooltip = 'Small tag on the arrow showing how many hours agreed.')
+show_status  = input.bool(defval = true, title = 'Status Readout', group = 'Display')
+status_size  = input.string(defval = 'normal', title = 'Status Text Size', options = ['small', 'normal', 'large'], group = 'Display')
+status_pos   = input.string(defval = 'Bottom Right', title = 'Status Position', options = ['Bottom Right', 'Bottom Left', 'Top Right', 'Middle Right'], group = 'Display')
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// PERIOD EXTREMES
+//// Clock hours and the exchange trading day. Both come from timeframe.change, so the day rolls at the
+//// session open (17:00 CT on CME) and stays in step with the other two indicators.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+bool newHour = timeframe.change('60')
+// Calendar rollover is a date change in exchange time, which is how GetYYYYMMDD/countTradingDays behaves
+// in the original. timeframe.change('D') is the session roll instead - 17:00 CT on CME, not midnight.
+bool newCal  = na(time[1]) or dayofmonth(time, syminfo.timezone) != dayofmonth(time[1], syminfo.timezone)
+bool newDay  = day_mode == 'Calendar Day' ? newCal : timeframe.change('D')
+
+var float hrLo = na
+var float hrHi = na
+var float dyLo = na
+var float dyHi = na
+
+// Completed-hour registers. h1 is the hour that just closed, h3 is three hours back.
+var float h1Lo = na
+var float h2Lo = na
+var float h3Lo = na
+var float h1Hi = na
+var float h2Hi = na
+var float h3Hi = na
+
+if newHour
+    // Shift before resetting, so the hour being retired is the one that lands in h1.
+    h3Lo := h2Lo
+    h2Lo := h1Lo
+    h1Lo := hrLo
+    h3Hi := h2Hi
+    h2Hi := h1Hi
+    h1Hi := hrHi
+    hrLo := low
+    hrHi := high
+else
+    hrLo := na(hrLo) ? low  : math.min(hrLo, low)
+    hrHi := na(hrHi) ? high : math.max(hrHi, high)
+
+if newDay
+    dyLo := low
+    dyHi := high
+else
+    dyLo := na(dyLo) ? low  : math.min(dyLo, low)
+    dyHi := na(dyHi) ? high : math.max(dyHi, high)
+
+float atrv = ta.atr(atr_len)
+float tol  = tol_mode == 'ATR Multiple' ? tol_atr * atrv : tol_pts
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// CONFLUENCE
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+near(float v, float ref) =>
+    not na(v) and not na(ref) and not na(tol) and math.abs(v - ref) <= tol
+
+bool n0L = inc_live and near(hrLo, dyLo)
+bool n1L = hr_lookback >= 2 and near(h1Lo, dyLo)
+bool n2L = hr_lookback >= 3 and near(h2Lo, dyLo)
+bool n3L = hr_lookback >= 4 and near(h3Lo, dyLo)
+int  cntL = (n0L ? 1 : 0) + (n1L ? 1 : 0) + (n2L ? 1 : 0) + (n3L ? 1 : 0)
+
+bool n0H = inc_live and near(hrHi, dyHi)
+bool n1H = hr_lookback >= 2 and near(h1Hi, dyHi)
+bool n2H = hr_lookback >= 3 and near(h2Hi, dyHi)
+bool n3H = hr_lookback >= 4 and near(h3Hi, dyHi)
+int  cntH = (n0H ? 1 : 0) + (n1H ? 1 : 0) + (n2H ? 1 : 0) + (n3H ? 1 : 0)
+
+bool longRaw  = cntL >= min_hours and (not need_confirm or close > dyLo)
+bool shortRaw = cntH >= min_hours and (not need_confirm or close < dyHi)
+
+// Edge-detected so it fires once, not on every bar the condition happens to hold.
+bool longEdge  = longRaw  and not longRaw[1]
+bool shortEdge = shortRaw and not shortRaw[1]
+
+var bool dayLongFired  = false
+var bool dayShortFired = false
+if newDay
+    dayLongFired  := false
+    dayShortFired := false
+
+bool longSig  = show_long  and longEdge  and (not one_per_day or not dayLongFired)
+bool shortSig = show_short and shortEdge and (not one_per_day or not dayShortFired)
+
+if longSig
+    dayLongFired := true
+if shortSig
+    dayShortFired := true
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// DRAW
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+plotshape(longSig,  title = 'Long Confluence',  style = shape.triangleup,   location = location.belowbar, color = c_long,  size = size.small)
+plotshape(shortSig, title = 'Short Confluence', style = shape.triangledown, location = location.abovebar, color = c_short, size = size.small)
+
+if show_count and longSig
+    label.new(bar_index, low, str.tostring(cntL) + 'h', yloc = yloc.belowbar, style = label.style_none, textcolor = c_long, size = size.small)
+if show_count and shortSig
+    label.new(bar_index, high, str.tostring(cntH) + 'h', yloc = yloc.abovebar, style = label.style_none, textcolor = c_short, size = size.small)
+
+pDayLo  = plot(show_zones or show_extreme ? dyLo : na, title = 'Day Low',  color = show_extreme ? color.new(c_long, 30) : color.new(c_long, 100), linewidth = 1, style = plot.style_linebr)
+pLongTop = plot(show_zones ? dyLo + tol : na, title = 'Long Band Top', color = color.new(c_long, 100), style = plot.style_linebr)
+fill(pDayLo, pLongTop, color = show_zones ? color.new(c_long, 88) : na, title = 'Long Tolerance Band')
+
+pDayHi   = plot(show_zones or show_extreme ? dyHi : na, title = 'Day High', color = show_extreme ? color.new(c_short, 30) : color.new(c_short, 100), linewidth = 1, style = plot.style_linebr)
+pShortBot = plot(show_zones ? dyHi - tol : na, title = 'Short Band Bottom', color = color.new(c_short, 100), style = plot.style_linebr)
+fill(pDayHi, pShortBot, color = show_zones ? color.new(c_short, 88) : na, title = 'Short Tolerance Band')
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// STATUS
+//// One compact row. A blank chart should say why it is blank rather than leaving you to guess between
+//// "no confluence", "already fired today" and "the tolerance is wrong for this instrument".
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var table st = na
+if barstate.islast
+    if not na(st)
+        table.delete(st)
+        st := na
+    // Suppressed above 60m: the counts are meaningless there, and the warning banner needs the room.
+    if show_status and timeframe.in_seconds() < 3600
+        stp = status_pos == 'Bottom Left' ? position.bottom_left : status_pos == 'Top Right' ? position.top_right : status_pos == 'Middle Right' ? position.middle_right : position.bottom_right
+        sts = status_size == 'small' ? size.small : status_size == 'large' ? size.large : size.normal
+        st := table.new(position.bottom_right, 3, 1, frame_color = color.new(color.gray, 50), frame_width = 1, border_color = color.new(color.gray, 70), border_width = 1)
+        table.set_position(st, stp)
+        table.cell(st, 0, 0, 'tol ' + str.tostring(tol, format.mintick), text_color = color.gray, text_size = sts)
+        table.cell(st, 1, 0, 'lo ' + str.tostring(cntL) + '/' + str.tostring(min_hours) + (dayLongFired ? ' done' : ''), text_color = cntL >= min_hours ? c_long : color.gray, text_size = sts)
+        table.cell(st, 2, 0, 'hi ' + str.tostring(cntH) + '/' + str.tostring(min_hours) + (dayShortFired ? ' done' : ''), text_color = cntH >= min_hours ? c_short : color.gray, text_size = sts)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//// TIMEFRAME GUARD
+//// At 60m and above the hourly registers hold one bar each, and on a daily chart the day extreme IS the
+//// bar extreme, so every test passes trivially. Fail loudly rather than drawing meaningless arrows.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// A table, not a label: tables anchor to the pane rather than a candle. Bottom, not top - the top strip
+// belongs to TradingView's own OHLC legend and a banner there buries it.
+var table tf_warn = na
+if barstate.islast
+    if not na(tf_warn)
+        table.delete(tf_warn)
+        tf_warn := na
+    if timeframe.in_seconds() >= 3600
+        tf_warn := table.new(position.bottom_center, 1, 1, bgcolor = color.new(#B71C1C, 5), frame_color = color.new(color.white, 50), frame_width = 1, border_width = 0)
+        table.cell(tf_warn, 0, 0, 'KB TAIL CONFLUENCE INACTIVE  ·  needs a chart finer than 60m  ·  at ' + timeframe.period + ' the hourly and daily extremes collapse into the bar itself  ·  use 5m or 15m', text_color = color.white, text_size = size.normal)
+
+alertcondition(longSig,  title = 'Tail Confluence LONG',  message = 'Hourly tails clustering at the day low')
+alertcondition(shortSig, title = 'Tail Confluence SHORT', message = 'Hourly tails clustering at the day high')
