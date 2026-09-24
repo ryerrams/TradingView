@@ -1,0 +1,88 @@
+//@version=6
+// =====================================================================
+//  ATR Stretch from 28 EMA  (label)  — port of the ThinkOrSwim study
+//  ---------------------------------------------------------------------
+//  Prints how far price is from the 28 EMA measured in ATR units:
+//       factor = (close - EMA28) / ATR
+//  +ve = price stretched ABOVE the EMA, -ve = BELOW. Bigger magnitude =
+//  more extended (mean-reversion risk). Label highlights past a threshold.
+// =====================================================================
+indicator("ATR Stretch from EMA", overlay=true, max_labels_count=500)
+
+// ── Inputs ──────────────────────────────────────────────
+emaLength         = input.int(28, "EMA Length", minval=1)
+atrLength         = input.int(14, "ATR Length", minval=1)
+atrAverageType    = input.string("Wilders", "ATR Average Type", options=["Wilders", "Simple", "Exponential", "Weighted", "Hull"])
+extendedThreshold = input.float(2.0, "Extended Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extended (red)")
+greenThreshold    = input.float(3.0, "Green Threshold", step=0.1, tooltip="factor above this colors the label green")
+showEma           = input.bool(false, "Show EMA on Price")
+buyThreshold      = input.float(4.0, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
+showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
+labelPos          = input.string("Top Right", "Label Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"])
+
+// ── Calculation ─────────────────────────────────────────
+tr  = ta.tr(true)
+atr = switch atrAverageType
+    "Simple"      => ta.sma(tr, atrLength)
+    "Exponential" => ta.ema(tr, atrLength)
+    "Weighted"    => ta.wma(tr, atrLength)
+    "Hull"        => ta.hma(tr, atrLength)
+    => ta.rma(tr, atrLength)
+
+ema    = ta.ema(close, emaLength)
+factor = atr == 0 ? 0.0 : (close - ema) / atr
+
+// ── BUY setup: deeply oversold AND the live candle reclaims the prior candle's open ──
+oversold = factor <= -buyThreshold      // at least buyThreshold ATR BELOW the EMA
+reclaim  = close > open[1]              // current (live) price back above the previous candle's open
+rawBuy   = oversold and reclaim
+buyNow   = rawBuy and not rawBuy[1]     // fire once, when the setup first triggers
+
+// ── EMA ─────────────────────────────────────────────────
+plot(showEma ? ema : na, "EMA", color=color.yellow)
+
+// ── BUY arrow + bubble ──────────────────────────────────
+showBuy = showBuyBubble and buyNow
+plotshape(showBuy ? low - atr * 0.25 : na, "BUY Arrow", style=shape.arrowup, location=location.absolute, color=color.green, size=size.normal)
+
+// Keep a single bubble per bar: on the live bar the setup can flicker, so the
+// label is created once and updated / removed as the bar evolves.
+var label buyLbl = na
+if barstate.isnew
+    buyLbl := na
+if showBuy
+    txt = "BUY\n" + str.tostring(math.abs(factor), "0.0") + "x ATR"
+    if na(buyLbl)
+        buyLbl := label.new(bar_index, low - atr * 0.5, txt, style=label.style_label_up, color=color.green, textcolor=color.white)
+    else
+        label.set_xy(buyLbl, bar_index, low - atr * 0.5)
+        label.set_text(buyLbl, txt)
+else if not na(buyLbl)
+    label.delete(buyLbl)
+    buyLbl := na
+
+alertcondition(buyNow, "ATR reversion BUY", "ATR reversion BUY on {{ticker}} ({{interval}})")
+if buyNow
+    alert("ATR reversion BUY: " + syminfo.ticker + " " + str.tostring(math.abs(factor), "0.0") + "x ATR below " + str.tostring(emaLength) + " EMA", alert.freq_once_per_bar)
+
+// ── Stretch label (TOS AddLabel equivalent) ─────────────
+absF     = math.abs(factor)
+lblColor = factor > greenThreshold ? color.green : absF >= extendedThreshold ? color.red : absF >= extendedThreshold * 0.66 ? color.yellow : color.gray
+txtColor = lblColor == color.gray ? color.white : color.black
+
+pos = switch labelPos
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.top_right
+
+var table tbl = table.new(pos, 1, 1)
+if barstate.islast
+    dist = close - ema
+    lblText = "Px vs " + str.tostring(emaLength) + "EMA: " + (factor >= 0 ? "+" : "") + str.tostring(factor, "0.00") + "x ATR" + "  (" + (dist >= 0 ? "+" : "") + str.tostring(dist, "0.00") + " pt)"
+    table.cell(tbl, 0, 0, lblText, bgcolor=lblColor, text_color=txtColor, text_size=size.normal)
+
+// Data-window value so the factor can be read on any bar
+plot(factor, "Stretch Factor (x ATR)", display=display.data_window)
