@@ -19,6 +19,8 @@ showEma           = input.bool(false, "Show EMA on Price")
 buyThreshold      = input.float(4.0, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
 showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
 labelPos          = input.string("Top Right", "Label Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"])
+labelOffset       = input.float(6.0, "Label Edge Offset (% of pane)", minval=0, maxval=50, step=1, tooltip="Pushes the label away from the pane edge so it clears TradingView's own buttons and legend")
+labelSizeInput    = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"])
 
 // ── Calculation ─────────────────────────────────────────
 tr  = ta.tr(true)
@@ -78,11 +80,19 @@ pos = switch labelPos
     "Bottom Right"  => position.bottom_right
     => position.top_right
 
-var table tbl = table.new(pos, 1, 1)
+isTop     = str.startswith(labelPos, "Top")
+labelSize = labelSizeInput == "Small" ? size.small : labelSizeInput == "Large" ? size.large : size.normal
+
+// Two rows: an empty spacer row on the pane-edge side, then the label itself.
+var table tbl = table.new(pos, 1, 2)
 if barstate.islast
     dist = close - ema
     lblText = "Px vs " + str.tostring(emaLength) + "EMA: " + (factor >= 0 ? "+" : "") + str.tostring(factor, "0.00") + "x ATR" + "  (" + (dist >= 0 ? "+" : "") + str.tostring(dist, "0.00") + " pt)"
-    table.cell(tbl, 0, 0, lblText, bgcolor=lblColor, text_color=txtColor, text_size=size.normal)
+    spacerRow = isTop ? 0 : 1
+    labelRow  = isTop ? 1 : 0
+    if labelOffset > 0
+        table.cell(tbl, 0, spacerRow, "", height=labelOffset)
+    table.cell(tbl, 0, labelRow, lblText, bgcolor=lblColor, text_color=txtColor, text_size=labelSize)
 
 // Data-window value so the factor can be read on any bar
 plot(factor, "Stretch Factor (x ATR)", display=display.data_window)
