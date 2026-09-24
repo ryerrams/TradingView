@@ -70,7 +70,7 @@ if buyNow
 // ── Stretch label (TOS AddLabel equivalent) ─────────────
 absF     = math.abs(factor)
 lblColor = factor > greenThreshold ? color.green : absF >= extendedThreshold ? color.red : absF >= extendedThreshold * 0.66 ? color.yellow : color.gray
-txtColor = lblColor == color.gray ? color.white : color.black
+txtColor = lblColor == color.gray or lblColor == color.red ? color.white : color.black
 
 pos = switch labelPos
     "Top Left"      => position.top_left
