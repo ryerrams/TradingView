@@ -1,0 +1,904 @@
+//@version=6
+// =============================================================================
+//  SOMA_PRECISION_SYSTEM  (TradingView port of the thinkorswim study)
+//
+//  Design goals:
+//  - No future-bar references in actionable signals.
+//  - PEZ/"Shotgun" entries use a lower-high/higher-low body break.
+//  - Stops use the setup wick by default.
+//  - Targets are the nearest unique structural levels in the trade direction.
+//  - Fixed-distance Turn targets and structural Shotgun targets are independent.
+//
+//  Port notes:
+//  - Session times are Eastern (America/New_York), matching thinkorswim.
+//  - "HighestAll" logic (latest plan only, latest zone only, prior-today marks)
+//    is rebuilt with line/box/label objects that track the newest signal.
+//  - The historical Structure arrows back-paint in the original (future refs
+//    [-1..-3]); here they are confirmed 3 bars later and drawn with offset=-3.
+//  - TTM_Squeeze histogram uses the standard thinkorswim-equivalent formula.
+// =============================================================================
+indicator("SOMA Precision System", "SOMA", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+// -----------------------------------------------------------------------------
+// Display
+// -----------------------------------------------------------------------------
+GD = "Display"
+trendBandsLayer            = input.bool(true,  "TREND Bands Layer",            group=GD, tooltip="EMA bands, cloud, and TREND candle colors.")
+trendyMode                 = input.bool(true,  "Trendy Mode",                  group=GD, tooltip="Original TREND Bands teal/red/white momentum mode.")
+structureLayer             = input.bool(true,  "Structure Layer",              group=GD, tooltip="Historical yellow/purple structure markers and latest zones.")
+edgesLayer                 = input.bool(false, "Edges Layer",                  group=GD, tooltip="Daily, weekly, monthly, yearly edges and four-hour targets.")
+sessionLevelsLayer         = input.bool(false, "Session Levels Layer",         group=GD, tooltip="LIS, premarket zone, and opening range levels.")
+turnSignalsLayer           = input.bool(true,  "Turn Signals Layer",           group=GD, tooltip="Historical Turn arrows and the latest Turn plan.")
+precisionTradesLayer       = input.bool(true,  "Precision Trades Layer",       group=GD, tooltip="Historical Shotgun arrows and the latest precision trade plan.")
+continuationSignalsLayer   = input.bool(true,  "Continuation Signals Layer",   group=GD, tooltip="Confirmed-trend pullback/resumption signals; separate from Turn and Shotgun entries.")
+showTodaysSignals          = input.bool(true,  "Show Today's Signals",         group=GD, tooltip="Mark earlier actionable entries from the current intraday session.")
+showHistoricalSignalLabels = input.bool(false, "Show Historical Signal Labels", group=GD, tooltip="Add a compact BUY/SELL price bubble to earlier signals.")
+showSignalGateDiagnostics  = input.bool(false, "Show Signal Gate Diagnostics", group=GD, tooltip="Show the current Turn and Shotgun gate states for troubleshooting.")
+showTradePlanBubbles       = input.bool(false, "Show Trade Plan Bubbles",      group=GD, tooltip="Show entry, stop, target, and exit bubbles for the newest plan.")
+enableAlerts               = input.bool(false, "Enable Alerts",                group=GD, tooltip="Fire alert() calls for Turn, Shotgun, and Continuation signals (create the alert with 'Any alert() function call').")
+tradeMode                  = input.string("TrendRun", "Trade Mode", options=["Scalp", "TrendRun"], group=GD, tooltip="Scalp uses compact ATR objectives; TrendRun uses wider ATR targets and stop.")
+labelPosIn                 = input.string("Bottom Left", "Info Panel Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=GD, tooltip="Top positions add a spacer so the panel clears TradingView's toolbar and legend.")
+labelSizeIn                = input.string("Normal", "Info Panel Text Size", options=["Tiny", "Small", "Normal", "Large"], group=GD)
+showLineTags               = input.bool(true, "Show Plan Line Tags", group=GD, tooltip="Name and price at the right end of the entry, stop, and target lines.")
+cooldownFromIn             = input.string("Last Fired Signal", "Cooldown Counts From", options=["Last Fired Signal", "Last Setup (TOS original)"], group=GD, tooltip="Last Fired Signal: a blocked setup does not restart the cooldown, so a run of setups every 1-2 bars cannot suppress every entry. Last Setup: original thinkorswim behavior.")
+cooldownFromSignal         = cooldownFromIn == "Last Fired Signal"
+
+showBands            = trendBandsLayer
+colorTrendBars       = trendBandsLayer
+showStructureArrows  = structureLayer
+showStructureZones   = structureLayer
+showPMZ              = sessionLevelsLayer
+showLIS              = sessionLevelsLayer
+showORB              = sessionLevelsLayer
+showEdges            = edgesLayer
+showTurnSignals      = turnSignalsLayer
+showTurnTradeLevels  = turnSignalsLayer
+showShotgunLevels    = precisionTradesLayer
+showBubbles          = showTradePlanBubbles
+showLabels           = true
+showOnlyCurrentChartDay = true
+signalLookbackBars   = 120
+isScalp              = tradeMode == "Scalp"
+
+// -----------------------------------------------------------------------------
+// Core settings
+// -----------------------------------------------------------------------------
+SUPER_FAST_LEN = 9
+FAST_LEN       = 13
+SLOW_LEN       = 22
+TREND_LEN      = 44
+ATR_LEN        = 14
+
+REQ_EMA_STRUCTURE        = false
+REQ_EMA_TURNS            = true
+TURN_SETUP_VALIDITY_BARS = 8
+TURN_COOLDOWN_BARS       = 4
+REQ_EMA_SHOTGUN          = false
+REQ_TURN_CONF_SHOTGUN    = false
+TURN_CONF_LOOKBACK       = 3
+REQ_ZONE_TOUCH_SHOTGUN   = true
+ZONE_TOUCH_LOOKBACK      = 20
+SHOTGUN_COOLDOWN_BARS    = 3
+CONT_PULLBACK_LOOKBACK   = 3
+CONT_COOLDOWN_BARS       = 6
+CONT_MAX_EXTENSION_ATR   = 1.75
+AGGRESSIVE_BODY_BREAK    = false
+USE_ZONE_BOUNDARY_STOP   = false
+USE_CLASSIC_ZONES        = false
+INVALIDATE_ZONE_ON_CLOSE = true
+
+// Turn / Shotgun objective settings
+turnStopATR   = isScalp ? 0.75 : 1.25
+turnT1ATR     = isScalp ? 0.50 : 1.00
+turnT2ATR     = isScalp ? 1.00 : 2.00
+turnT3ATR     = isScalp ? 1.50 : 4.00
+shotgunStopATR = isScalp ? 0.50 : 1.00
+shotgunT1R    = isScalp ? 0.50 : 1.00
+shotgunT2R    = isScalp ? 1.00 : 2.00
+shotgunT3R    = isScalp ? 1.50 : 4.00
+
+// Session settings (Eastern Time), minutes from midnight
+TZ               = "America/New_York"
+PREMARKET_START  = 7 * 60 + 30
+REGULAR_OPEN     = 9 * 60 + 30
+REGULAR_CLOSE    = 16 * 60
+PMZ_RESET_TIME   = 15 * 60 + 55
+ORB_END          = 9 * 60 + 45
+
+// Structural-target settings
+TARGET_MIN_SPACING_TICKS = 2
+RECENT_SWING_LOOKBACK    = 20
+
+// Colors
+cBull          = color.green
+cBear          = color.red
+cNeutral       = color.gray
+cTrendyBull    = color.rgb(52, 179, 167)
+cTrendyBear    = color.red
+cTrendyNeutral = color.white
+cDemand        = color.rgb(35, 75, 55)
+cSupply        = color.rgb(85, 45, 45)
+cPMZBull       = color.rgb(70, 170, 110)
+cPMZBear       = color.rgb(190, 80, 80)
+cLIS           = color.rgb(215, 215, 215)
+cORBHigh       = color.rgb(70, 170, 110)
+cORBLow        = color.rgb(190, 80, 80)
+cDailyEdge     = color.rgb(255, 140, 0)
+cWeeklyEdge    = color.yellow
+cMonthlyEdge   = color.rgb(221, 160, 221)
+cYearlyEdge    = color.blue
+cStop          = color.rgb(190, 80, 80)
+cTarget        = color.rgb(215, 215, 215)
+cPlum          = color.rgb(221, 160, 221)
+cLightRed      = color.rgb(255, 120, 120)
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_tick(float x, float t) => math.round(x / t) * t
+f_p(float x) => str.tostring(x, format.mintick)
+f_txt(color c) => (color.r(c) * 0.299 + color.g(c) * 0.587 + color.b(c) * 0.114) > 150 ? color.black : color.white
+f_dateKey(int t) => year(t, TZ) * 10000 + month(t, TZ) * 100 + dayofmonth(t, TZ)
+
+f_minAbove(float best, float v, float thr) => (not na(v) and v > thr) ? math.min(best, v) : best
+f_maxBelow(float best, float v, float thr) => (not na(v) and v < thr) ? math.max(best, v) : best
+
+f_nearestAbove(float thr, array<float> base, float x1, float x2, float x3, float x4, float x5) =>
+    float best = 1000000000.0
+    for v in base
+        best := f_minAbove(best, v, thr)
+    best := f_minAbove(best, x1, thr)
+    best := f_minAbove(best, x2, thr)
+    best := f_minAbove(best, x3, thr)
+    best := f_minAbove(best, x4, thr)
+    best := f_minAbove(best, x5, thr)
+    best
+
+f_nearestBelow(float thr, array<float> base, float x1, float x2, float x3, float x4, float x5) =>
+    float best = -1000000000.0
+    for v in base
+        best := f_maxBelow(best, v, thr)
+    best := f_maxBelow(best, x1, thr)
+    best := f_maxBelow(best, x2, thr)
+    best := f_maxBelow(best, x3, thr)
+    best := f_maxBelow(best, x4, thr)
+    best := f_maxBelow(best, x5, thr)
+    best
+
+// -----------------------------------------------------------------------------
+// Core series
+// -----------------------------------------------------------------------------
+// Round to the symbol's own tick; the TOS floor of 0.01 collapses sub-penny prices (e.g. PUMPUSDT) to 0.
+safeTick   = syminfo.mintick > 0 ? syminfo.mintick : 0.01
+atr        = ta.atr(ATR_LEN)
+bodyHigh   = math.max(open, close)
+bodyLow    = math.min(open, close)
+isIntraday = timeframe.isintraday
+tfSec      = timeframe.in_seconds()
+barMin     = hour(time, TZ) * 60 + minute(time, TZ)
+newChartDay = nz(ta.change(time_tradingday)) != 0
+
+lastDateKey      = f_dateKey(last_bar_time)
+currentChartDay  = f_dateKey(time) == lastDateKey
+sessionVisualOK  = not isIntraday or not showOnlyCurrentChartDay or currentChartDay
+signalWindow     = bar_index >= last_bar_index - signalLookbackBars
+currentYearVisual  = year(time, TZ) == year(last_bar_time, TZ)
+currentMonthVisual = year(time, TZ) * 100 + month(time, TZ) == year(last_bar_time, TZ) * 100 + month(last_bar_time, TZ)
+currentWeekVisual  = year(time, TZ) * 100 + weekofyear(time, TZ) == year(last_bar_time, TZ) * 100 + weekofyear(last_bar_time, TZ)
+
+var int dayStartBar = 0
+if bar_index == 0 or f_dateKey(time) != f_dateKey(time[1])
+    dayStartBar := bar_index
+
+// -----------------------------------------------------------------------------
+// TREND bands and directional regime
+// -----------------------------------------------------------------------------
+ema9  = ta.ema(close, SUPER_FAST_LEN)
+ema13 = ta.ema(close, FAST_LEN)
+ema22 = ta.ema(close, SLOW_LEN)
+ema44 = ta.ema(close, TREND_LEN)
+emaBull = ema9 > ema13 and ema13 > ema22
+emaBear = ema9 < ema13 and ema13 < ema22
+
+stateCol = emaBull ? cTrendyBull : emaBear ? cTrendyBear : cTrendyNeutral
+p9  = plot(showBands ? ema9  : na, "EMA 9",  trendyMode ? stateCol : color.green)
+p22 = plot(showBands ? ema22 : na, "EMA 22", trendyMode ? stateCol : color.yellow)
+p44 = plot(showBands ? ema44 : na, "EMA 44", trendyMode ? stateCol : cPlum)
+// 22/44 cloud is always available; TrendyMode adds the faster 9/22 ribbon.
+fill(p22, p44, color=ema22 > ema44 ? color.new(trendyMode ? cTrendyBull : color.green, 80) : color.new(cLightRed, 80), title="22/44 Cloud")
+fill(p9, p22, color=trendyMode ? (ema9 > ema22 ? color.new(cTrendyBull, 80) : color.new(cLightRed, 80)) : na, title="9/22 Ribbon")
+
+// -----------------------------------------------------------------------------
+// Non-back-painted Structure Identifier
+// -----------------------------------------------------------------------------
+hh1 = high[1]
+ll1 = low[1]
+hh2 = ta.highest(high[1], 2)
+hh3 = ta.highest(high[1], 3)
+ll2 = ta.lowest(low[1], 2)
+ll3 = ta.lowest(low[1], 3)
+
+R   = high[1] < high and close > open
+D   = low[1] > low and close < open
+RB  = R[1] and open[1] <= close and close <= close[1]
+RBB = RB[1] and open[2] <= close and close <= close[2]
+DB  = D[1] and open[1] >= close and close >= close[1]
+// Corrected bearish double-inside containment.
+DBB = DB[1] and open[2] >= close and close >= close[2]
+
+RBR  = RB[1]  and close > open and high >= hh2
+RBBR = RBB[1] and close > open and high >= hh3
+DBD  = DB[1]  and close < open and low <= ll2
+DBBD = DBB[1] and close < open and low <= ll3
+DBR  = DB[1]  and close > open and high >= hh2
+DBBR = DBB[1] and close > open and high >= hh3
+RBD  = RB[1]  and close < open and low <= ll2
+RBBD = RBB[1] and close < open and low <= ll3
+
+rawBullStructure = RBR or RBBR or DBR or DBBR
+rawBearStructure = DBD or DBBD or RBD or RBBD
+bullStructure = rawBullStructure and (not REQ_EMA_STRUCTURE or emaBull)
+bearStructure = rawBearStructure and (not REQ_EMA_STRUCTURE or emaBear)
+
+bullFormationLow  = (RBBR or DBBR) ? ll3 : ll2
+bullFormationHigh = (RBBR or DBBR) ? hh3 : hh2
+bearFormationLow  = (DBBD or RBBD) ? ll3 : ll2
+bearFormationHigh = (DBBD or RBBD) ? hh3 : hh2
+
+newDemandLow  = bullFormationLow
+newDemandHigh = USE_CLASSIC_ZONES ? bullFormationHigh : math.max(bullFormationLow, low)
+newSupplyLow  = USE_CLASSIC_ZONES ? bearFormationLow : math.min(bearFormationHigh, high)
+newSupplyHigh = bearFormationHigh
+
+var float demandLow  = na
+var float demandHigh = na
+var float supplyLow  = na
+var float supplyHigh = na
+demandInvalid = INVALIDATE_ZONE_ON_CLOSE and close < demandLow
+supplyInvalid = INVALIDATE_ZONE_ON_CLOSE and close > supplyHigh
+if bullStructure
+    demandLow  := newDemandLow
+    demandHigh := newDemandHigh
+else if demandInvalid
+    demandLow  := na
+    demandHigh := na
+if bearStructure
+    supplyHigh := newSupplyHigh
+    supplyLow  := newSupplyLow
+else if supplyInvalid
+    supplyHigh := na
+    supplyLow  := na
+
+// Latest-zone tracking (replaces HighestAll(structure bar)).
+var int   dzStart = na
+var int   dzEnd   = na
+var float dzTop   = na
+var float dzBot   = na
+var int   szStart = na
+var int   szEnd   = na
+var float szTop   = na
+var float szBot   = na
+if bullStructure
+    dzStart := bar_index
+if not na(demandLow)
+    dzEnd := bar_index
+    dzTop := demandHigh
+    dzBot := demandLow
+if bearStructure
+    szStart := bar_index
+if not na(supplyLow)
+    szEnd := bar_index
+    szTop := supplyHigh
+    szBot := supplyLow
+
+var box demandBox = na
+var box supplyBox = na
+if barstate.islast
+    restrictDay = isIntraday and showOnlyCurrentChartDay
+    box.delete(demandBox)
+    box.delete(supplyBox)
+    if showStructureZones and not na(dzStart) and not na(dzEnd)
+        left = restrictDay ? math.max(dzStart, dayStartBar) : dzStart
+        if dzEnd >= left
+            demandBox := box.new(left, dzTop, dzEnd, dzBot, border_color=cDemand, bgcolor=color.new(cDemand, 40))
+    if showStructureZones and not na(szStart) and not na(szEnd)
+        left = restrictDay ? math.max(szStart, dayStartBar) : szStart
+        if szEnd >= left
+            supplyBox := box.new(left, szTop, szEnd, szBot, border_color=cSupply, bgcolor=color.new(cSupply, 40))
+
+// Historical structure display reproduces the original Structure Identifier,
+// including its DBB/DBR/RBD definitions. The original looks up to 3 bars into
+// the future, so here it is evaluated 3 bars late and drawn with offset=-3.
+vDBB  = DB[1] and open[2] <= close and close >= close[2]
+vRBR  = RB[1] and close > open and high >= hh2
+vRBBR = RBB[1] and close > open and high >= hh3
+vDBD  = DB[1] and close < open and low <= ll2
+vDBBD = vDBB[1] and close < open and low <= ll3
+vDBR  = DB[1] and close > open and high >= hh1
+vDBBR = vDBB[1] and close > open and high >= hh3
+vRBD  = RB[1] and close < open and low <= ll1
+vRBBD = RBB[1] and close < open and low <= ll3
+vBullRaw = vRBR or vDBR or vRBBR or vDBBR
+vBearRaw = vDBD or vRBD or vDBBD or vRBBD
+histBull3 = vBullRaw[3] or vBullRaw[2] or vBullRaw[1] or vRBBR or vDBBR
+histBear3 = vBearRaw[3] or vBearRaw[2] or vBearRaw[1] or vDBBD or vRBBD
+qStructBull3 = histBull3 and not histBear3 and emaBull[3] and close[3] > ema44[3] and ema9[3] > ema9[4]
+qStructBear3 = histBear3 and not histBull3 and emaBear[3] and close[3] < ema44[3] and ema9[3] < ema9[4]
+var int structState = 0
+prevStructState = structState
+if qStructBull3
+    structState := 1
+else if qStructBear3
+    structState := -1
+structBullOnce = qStructBull3 and prevStructState != 1
+structBearOnce = qStructBear3 and prevStructState != -1
+plotshape(showStructureArrows and structBullOnce, "Structure Bull", shape.arrowup,   location.belowbar, color.yellow, offset=-3, size=size.small)
+plotshape(showStructureArrows and structBearOnce, "Structure Bear", shape.arrowdown, location.abovebar, cPlum,        offset=-3, size=size.small)
+
+// -----------------------------------------------------------------------------
+// LIS: captured 4:00 PM five-minute close
+// -----------------------------------------------------------------------------
+var float lisValue = na
+lisCapture = isIntraday and (tfSec < 300 ? (barMin >= REGULAR_CLOSE and barMin < REGULAR_CLOSE + 5) : barMin == REGULAR_CLOSE)
+if lisCapture
+    lisValue := close
+plot(showLIS and isIntraday and sessionVisualOK and not na(lisValue) ? lisValue : na, "LIS", cLIS, 2, plot.style_linebr)
+
+// -----------------------------------------------------------------------------
+// Premarket Zone
+// -----------------------------------------------------------------------------
+blk5 = math.floor(time / 300000)
+var float blk5Open = na
+if blk5 != blk5[1]
+    blk5Open := open
+inPremarket = isIntraday and barMin >= PREMARKET_START and barMin < REGULAR_OPEN
+
+var float premarketHigh = 0.0
+var float premarketLow  = 1000000.0
+var bool  premarketAboveLIS = false
+if barMin == PMZ_RESET_TIME
+    premarketHigh := 0.0
+    premarketLow  := 1000000.0
+else if inPremarket
+    premarketHigh := math.max(premarketHigh, high)
+    premarketLow  := math.min(premarketLow, low)
+if inPremarket
+    premarketAboveLIS := blk5Open >= lisValue
+
+premarketRange = premarketHigh - premarketLow
+pmzValid = isIntraday and premarketHigh > premarketLow and premarketHigh > 0 and premarketLow < 1000000
+pmzHighValue = premarketAboveLIS ? premarketHigh - premarketRange * 0.20 : premarketLow + premarketRange * 0.40
+pmzLowValue  = premarketAboveLIS ? premarketHigh - premarketRange * 0.40 : premarketLow + premarketRange * 0.20
+pmzDisplayTime = isIntraday and barMin >= REGULAR_OPEN and barMin < REGULAR_CLOSE
+
+validPMZHigh       = pmzValid ? pmzHighValue : na
+validPMZLow        = pmzValid ? pmzLowValue : na
+validPremarketHigh = pmzValid ? premarketHigh : na
+validPremarketLow  = pmzValid ? premarketLow : na
+
+pmzShow = showPMZ and sessionVisualOK and pmzDisplayTime and pmzValid
+pPMZH = plot(pmzShow ? pmzHighValue : na, "PMZ High", cPMZBull, 2, plot.style_linebr)
+pPMZL = plot(pmzShow ? pmzLowValue : na,  "PMZ Low",  cPMZBear, 2, plot.style_linebr)
+fill(pPMZH, pPMZL, color.new(cPMZBull, 80), "PMZ Cloud")
+
+// -----------------------------------------------------------------------------
+// 15-minute opening range
+// -----------------------------------------------------------------------------
+inORB = isIntraday and barMin >= REGULAR_OPEN and barMin < ORB_END
+var float orbHighValue = na
+var float orbLowValue  = na
+if barMin == REGULAR_OPEN
+    orbHighValue := high
+    orbLowValue  := low
+else if newChartDay
+    orbHighValue := na
+    orbLowValue  := na
+else if inORB
+    orbHighValue := math.max(orbHighValue, high)
+    orbLowValue  := math.min(orbLowValue, low)
+afterORB = isIntraday and barMin >= ORB_END and barMin < REGULAR_CLOSE
+plot(showORB and sessionVisualOK and afterORB ? orbHighValue : na, "ORB High", cORBHigh, 2, plot.style_linebr)
+plot(showORB and sessionVisualOK and afterORB ? orbLowValue  : na, "ORB Low",  cORBLow,  2, plot.style_linebr)
+
+// -----------------------------------------------------------------------------
+// Edges: prior completed ranges
+// -----------------------------------------------------------------------------
+hasDaily    = tfSec <= timeframe.in_seconds("D")
+hasWeekly   = tfSec <= timeframe.in_seconds("W")
+hasMonthly  = tfSec <= timeframe.in_seconds("M")
+hasYearly   = tfSec <= timeframe.in_seconds("12M")
+hasFourHour = tfSec <= timeframe.in_seconds("240")
+
+[pdhRaw, pdlRaw] = request.security(syminfo.tickerid, hasDaily    ? "D"   : timeframe.period, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pwhRaw, pwlRaw] = request.security(syminfo.tickerid, hasWeekly   ? "W"   : timeframe.period, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pmhRaw, pmlRaw] = request.security(syminfo.tickerid, hasMonthly  ? "M"   : timeframe.period, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pyhRaw, pylRaw] = request.security(syminfo.tickerid, hasYearly   ? "12M" : timeframe.period, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[p4hRaw, p4lRaw] = request.security(syminfo.tickerid, hasFourHour ? "240" : timeframe.period, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+prevDayHigh = hasDaily ? pdhRaw : na
+prevDayLow  = hasDaily ? pdlRaw : na
+dayRange    = prevDayHigh - prevDayLow
+dailyLowerEdgeValue = prevDayLow + dayRange * 0.113
+dailyBearValue      = prevDayLow + dayRange * 0.382
+dailyMidValue       = prevDayLow + dayRange * 0.500
+dailyBullValue      = prevDayLow + dayRange * 0.618
+dailyUpperEdgeValue = prevDayLow + dayRange * 0.887
+
+prevWeekHigh = hasWeekly ? pwhRaw : na
+prevWeekLow  = hasWeekly ? pwlRaw : na
+weekRange    = prevWeekHigh - prevWeekLow
+weeklyLowerEdgeValue = prevWeekLow + weekRange * 0.113
+weeklyMidValue       = prevWeekLow + weekRange * 0.500
+weeklyUpperEdgeValue = prevWeekLow + weekRange * 0.887
+
+prevMonthHigh = hasMonthly ? pmhRaw : na
+prevMonthLow  = hasMonthly ? pmlRaw : na
+monthRange    = prevMonthHigh - prevMonthLow
+monthlyLowerEdgeValue = prevMonthLow + monthRange * 0.113
+monthlyMidValue       = prevMonthLow + monthRange * 0.500
+monthlyUpperEdgeValue = prevMonthLow + monthRange * 0.887
+
+prevYearHigh = hasYearly ? pyhRaw : na
+prevYearLow  = hasYearly ? pylRaw : na
+yearRange    = prevYearHigh - prevYearLow
+yearlyLowerEdgeValue = prevYearLow + yearRange * 0.113
+yearlyMidValue       = prevYearLow + yearRange * 0.500
+yearlyUpperEdgeValue = prevYearLow + yearRange * 0.887
+
+prevFourHourHigh = hasFourHour ? p4hRaw : na
+prevFourHourLow  = hasFourHour ? p4lRaw : na
+fourHourRange    = prevFourHourHigh - prevFourHourLow
+fourHourLowerTarget = prevFourHourLow + fourHourRange * 0.113
+fourHourUpperTarget = prevFourHourLow + fourHourRange * 0.887
+
+showD  = showEdges and hasDaily and currentChartDay
+showW  = showEdges and hasWeekly and currentWeekVisual
+showM  = showEdges and hasMonthly and currentMonthVisual
+showY  = showEdges and hasYearly and currentYearVisual
+show4h = showEdges and hasFourHour and sessionVisualOK
+plot(showD ? dailyLowerEdgeValue : na,   "Daily Lower Edge",   cDailyEdge,   1, plot.style_linebr)
+plot(showD ? dailyUpperEdgeValue : na,   "Daily Upper Edge",   cDailyEdge,   1, plot.style_linebr)
+plot(showD ? dailyMidValue : na,         "Daily Mid Edge",     cDailyEdge,   1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+plot(showW ? weeklyLowerEdgeValue : na,  "Weekly Lower Edge",  cWeeklyEdge,  1, plot.style_linebr)
+plot(showW ? weeklyUpperEdgeValue : na,  "Weekly Upper Edge",  cWeeklyEdge,  1, plot.style_linebr)
+plot(showW ? weeklyMidValue : na,        "Weekly Mid Edge",    cWeeklyEdge,  1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+plot(showM ? monthlyLowerEdgeValue : na, "Monthly Lower Edge", cMonthlyEdge, 1, plot.style_linebr)
+plot(showM ? monthlyUpperEdgeValue : na, "Monthly Upper Edge", cMonthlyEdge, 1, plot.style_linebr)
+plot(showM ? monthlyMidValue : na,       "Monthly Mid Edge",   cMonthlyEdge, 1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+plot(showY ? yearlyLowerEdgeValue : na,  "Yearly Lower Edge",  cYearlyEdge,  1, plot.style_linebr)
+plot(showY ? yearlyUpperEdgeValue : na,  "Yearly Upper Edge",  cYearlyEdge,  1, plot.style_linebr)
+plot(showY ? yearlyMidValue : na,        "Yearly Mid Edge",    cYearlyEdge,  1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+plot(show4h ? fourHourLowerTarget : na,  "4H Lower Target",    color.white,  1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+plot(show4h ? fourHourUpperTarget : na,  "4H Upper Target",    color.white,  1, plot.style_linebr, linestyle=plot.linestyle_dashed)
+
+// -----------------------------------------------------------------------------
+// TTM Squeeze turns: setup window, delayed confirmation, and ATR trade plan
+// -----------------------------------------------------------------------------
+SQZ_LEN = 20
+sqzMid = (ta.highest(high, SQZ_LEN) + ta.lowest(low, SQZ_LEN)) / 2 + ta.ema(close, SQZ_LEN)
+squeezeHistogram = ta.linreg(close - sqzMid / 2, SQZ_LEN, 0)
+
+rawTurnDown = squeezeHistogram > 0 and squeezeHistogram < squeezeHistogram[1] and squeezeHistogram[2] < squeezeHistogram[1]
+rawTurnUp   = squeezeHistogram < 0 and squeezeHistogram > squeezeHistogram[1] and squeezeHistogram[2] > squeezeHistogram[1]
+var int rawTurnUpAge   = 10000
+var int rawTurnDownAge = 10000
+rawTurnUpAge   := rawTurnUp   ? 0 : math.min(rawTurnUpAge + 1, 10000)
+rawTurnDownAge := rawTurnDown ? 0 : math.min(rawTurnDownAge + 1, 10000)
+recentTurnUpSetup   = rawTurnUpAge <= TURN_SETUP_VALIDITY_BARS and rawTurnUpAge < rawTurnDownAge
+recentTurnDownSetup = rawTurnDownAge <= TURN_SETUP_VALIDITY_BARS and rawTurnDownAge < rawTurnUpAge
+trendRunBullFilter = isScalp or (close > ema44 and ema22 > ema22[1])
+trendRunBearFilter = isScalp or (close < ema44 and ema22 < ema22[1])
+qualifiedTurnUp   = recentTurnUpSetup and (not REQ_EMA_TURNS or emaBull) and close > high[1] and ema9 > ema9[1] and trendRunBullFilter
+qualifiedTurnDown = recentTurnDownSetup and (not REQ_EMA_TURNS or emaBear) and close < low[1] and ema9 < ema9[1] and trendRunBearFilter
+qualifiedTurnUpOnly   = qualifiedTurnUp and not qualifiedTurnDown
+qualifiedTurnDownOnly = qualifiedTurnDown and not qualifiedTurnUp
+turnUpEdge   = qualifiedTurnUpOnly and not qualifiedTurnUpOnly[1]
+turnDownEdge = qualifiedTurnDownOnly and not qualifiedTurnDownOnly[1]
+var int barsSinceTurnEdge = 100000
+barsSinceTurnEdge := (turnUpEdge or turnDownEdge) ? 0 : math.min(barsSinceTurnEdge + 1, 100000)
+var int barsSinceTurnSignal = 100000
+turnCooldownReady = cooldownFromSignal ? barsSinceTurnSignal >= TURN_COOLDOWN_BARS : nz(barsSinceTurnEdge[1], 100000) >= TURN_COOLDOWN_BARS
+turnUpSignal   = turnUpEdge and turnCooldownReady
+turnDownSignal = turnDownEdge and turnCooldownReady
+barsSinceTurnSignal := (turnUpSignal or turnDownSignal) ? 0 : math.min(barsSinceTurnSignal + 1, 100000)
+anyTurnSignal  = turnUpSignal or turnDownSignal
+
+var int   turnDirection = 0
+var float turnEntry     = na
+var float turnSignalATR = na
+var int   turnSignalBar = 0
+if anyTurnSignal
+    turnDirection := turnUpSignal ? 1 : -1
+    turnEntry     := close
+    turnSignalATR := atr
+    turnSignalBar := bar_index
+turnStopValue = f_tick(turnDirection == 1 ? turnEntry - turnSignalATR * turnStopATR : turnDirection == -1 ? turnEntry + turnSignalATR * turnStopATR : na, safeTick)
+turnT1Value   = f_tick(turnDirection == 1 ? turnEntry + turnSignalATR * turnT1ATR : turnDirection == -1 ? turnEntry - turnSignalATR * turnT1ATR : na, safeTick)
+turnT2Value   = f_tick(turnDirection == 1 ? turnEntry + turnSignalATR * turnT2ATR : turnDirection == -1 ? turnEntry - turnSignalATR * turnT2ATR : na, safeTick)
+turnT3Value   = f_tick(turnDirection == 1 ? turnEntry + turnSignalATR * turnT3ATR : turnDirection == -1 ? turnEntry - turnSignalATR * turnT3ATR : na, safeTick)
+
+turnPlanMaxBars     = isScalp ? 30 : 120
+turnPlanExpired     = bar_index - turnSignalBar > turnPlanMaxBars
+turnPlanCompleted   = (turnDirection == 1 and high >= turnT3Value) or (turnDirection == -1 and low <= turnT3Value)
+turnPlanInvalidated = (turnDirection == 1 and close <= turnStopValue) or (turnDirection == -1 and close >= turnStopValue)
+var bool turnPlanActive = false
+prevTurnPlanActive = turnPlanActive
+turnPlanActive := anyTurnSignal ? true : (isIntraday and newChartDay) ? false : (turnPlanExpired or turnPlanCompleted or turnPlanInvalidated) ? false : turnPlanActive
+turnTPExitEvent      = prevTurnPlanActive and turnPlanCompleted and not anyTurnSignal
+turnInvalidExitEvent = prevTurnPlanActive and turnPlanInvalidated and not anyTurnSignal
+
+plotshape(showTurnSignals and turnUpSignal,   "Turn Up",   shape.triangleup,   location.belowbar, cTrendyBull, size=size.small)
+plotshape(showTurnSignals and turnDownSignal, "Turn Down", shape.triangledown, location.abovebar, cTrendyBear, size=size.small)
+
+// -----------------------------------------------------------------------------
+// Confirmed-trend continuation entries
+// -----------------------------------------------------------------------------
+bullPB = (low[1] <= ema13[1] and close[1] > ema44[1]) ? 1 : 0
+bearPB = (high[1] >= ema13[1] and close[1] < ema44[1]) ? 1 : 0
+recentBullContPullback = ta.highest(bullPB, CONT_PULLBACK_LOOKBACK) > 0
+recentBearContPullback = ta.highest(bearPB, CONT_PULLBACK_LOOKBACK) > 0
+bullContExtATR = (close - ema22) / math.max(atr, safeTick)
+bearContExtATR = (ema22 - close) / math.max(atr, safeTick)
+ll2c = ta.lowest(low[1], 2)
+rawContLong  = emaBull and emaBull[1] and close > ema44 and ema22 > ema22[1] and recentBullContPullback and close > hh2 and close > open and bullContExtATR <= CONT_MAX_EXTENSION_ATR
+rawContShort = emaBear and emaBear[1] and close < ema44 and ema22 < ema22[1] and recentBearContPullback and close < ll2c and close < open and bearContExtATR <= CONT_MAX_EXTENSION_ATR
+contLongEdge  = rawContLong and not rawContLong[1]
+contShortEdge = rawContShort and not rawContShort[1]
+var int barsSinceContEdge = 100000
+barsSinceContEdge := (contLongEdge or contShortEdge) ? 0 : math.min(barsSinceContEdge + 1, 100000)
+var int barsSinceContSignal = 100000
+contCooldownReady = cooldownFromSignal ? barsSinceContSignal >= CONT_COOLDOWN_BARS : nz(barsSinceContEdge[1], 100000) >= CONT_COOLDOWN_BARS
+contLongSignal  = contLongEdge and contCooldownReady
+contShortSignal = contShortEdge and contCooldownReady
+barsSinceContSignal := (contLongSignal or contShortSignal) ? 0 : math.min(barsSinceContSignal + 1, 100000)
+
+plotshape(continuationSignalsLayer and signalWindow and contLongSignal,  "Continuation Long",  shape.triangleup,   location.belowbar, color.aqua,   size=size.tiny)
+plotshape(continuationSignalsLayer and signalWindow and contShortSignal, "Continuation Short", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+if showHistoricalSignalLabels and continuationSignalsLayer and contLongSignal
+    label.new(bar_index, low, "CONT BUY " + f_p(close), style=label.style_label_up, color=color.aqua, textcolor=color.black, size=size.small)
+if showHistoricalSignalLabels and continuationSignalsLayer and contShortSignal
+    label.new(bar_index, high, "CONT SELL " + f_p(close), style=label.style_label_down, color=color.orange, textcolor=color.black, size=size.small)
+
+// -----------------------------------------------------------------------------
+// PEZ / Shotgun entry state
+// -----------------------------------------------------------------------------
+demandTouch = not na(demandLow) and low <= demandHigh and high >= demandLow
+supplyTouch = not na(supplyLow) and high >= supplyLow and low <= supplyHigh
+var int demandTouchAge = 10000
+var int supplyTouchAge = 10000
+demandTouchAge := demandTouch ? 0 : math.min(demandTouchAge + 1, 10000)
+supplyTouchAge := supplyTouch ? 0 : math.min(supplyTouchAge + 1, 10000)
+
+longZoneContext  = not REQ_ZONE_TOUCH_SHOTGUN or nz(demandTouchAge[1], 10000) <= ZONE_TOUCH_LOOKBACK
+shortZoneContext = not REQ_ZONE_TOUCH_SHOTGUN or nz(supplyTouchAge[1], 10000) <= ZONE_TOUCH_LOOKBACK
+higherLowSetup = low[1] > low[2]
+lowerHighSetup = high[1] < high[2]
+longBodyBreak  = AGGRESSIVE_BODY_BREAK ? high > bodyHigh[1] : close > bodyHigh[1]
+shortBodyBreak = AGGRESSIVE_BODY_BREAK ? low < bodyLow[1] : close < bodyLow[1]
+
+longTurnConfirmed  = ta.highest(turnUpSignal ? 1 : 0, TURN_CONF_LOOKBACK) > 0
+shortTurnConfirmed = ta.highest(turnDownSignal ? 1 : 0, TURN_CONF_LOOKBACK) > 0
+longShotgunFilters  = (not REQ_EMA_SHOTGUN or emaBull) and (not REQ_TURN_CONF_SHOTGUN or longTurnConfirmed)
+shortShotgunFilters = (not REQ_EMA_SHOTGUN or emaBear) and (not REQ_TURN_CONF_SHOTGUN or shortTurnConfirmed)
+rawShotgunLong  = longZoneContext and higherLowSetup and longBodyBreak and longShotgunFilters
+rawShotgunShort = shortZoneContext and lowerHighSetup and shortBodyBreak and shortShotgunFilters
+rawShotgunLongOnly  = rawShotgunLong and not rawShotgunShort
+rawShotgunShortOnly = rawShotgunShort and not rawShotgunLong
+shotgunLongEdge  = rawShotgunLongOnly and not rawShotgunLongOnly[1]
+shotgunShortEdge = rawShotgunShortOnly and not rawShotgunShortOnly[1]
+
+var int barsSinceShotgunEdge = 100000
+barsSinceShotgunEdge := (shotgunLongEdge or shotgunShortEdge) ? 0 : math.min(barsSinceShotgunEdge + 1, 100000)
+var int barsSinceShotgunSignal = 100000
+shotgunCooldownReady = cooldownFromSignal ? barsSinceShotgunSignal >= SHOTGUN_COOLDOWN_BARS : nz(barsSinceShotgunEdge[1], 100000) >= SHOTGUN_COOLDOWN_BARS
+shotgunLongSignal  = shotgunLongEdge and shotgunCooldownReady
+shotgunShortSignal = shotgunShortEdge and shotgunCooldownReady
+barsSinceShotgunSignal := (shotgunLongSignal or shotgunShortSignal) ? 0 : math.min(barsSinceShotgunSignal + 1, 100000)
+anyShotgunSignal   = shotgunLongSignal or shotgunShortSignal
+
+newShotgunDirection = shotgunLongSignal ? 1 : shotgunShortSignal ? -1 : 0
+newShotgunEntry = shotgunLongSignal ? bodyHigh[1] : shotgunShortSignal ? bodyLow[1] : na
+setupWickStop   = shotgunLongSignal ? low[1] : shotgunShortSignal ? high[1] : na
+zoneStop        = shotgunLongSignal ? demandLow : shotgunShortSignal ? supplyHigh : na
+validZoneStop   = not na(zoneStop) and ((shotgunLongSignal and zoneStop < newShotgunEntry) or (shotgunShortSignal and zoneStop > newShotgunEntry))
+baseShotgunStop = USE_ZONE_BOUNDARY_STOP and validZoneStop ? zoneStop : setupWickStop
+minShotgunStopDist = atr * shotgunStopATR
+rawNewShotgunStop = shotgunLongSignal ? math.min(baseShotgunStop, newShotgunEntry - minShotgunStopDist) : shotgunShortSignal ? math.max(baseShotgunStop, newShotgunEntry + minShotgunStopDist) : na
+newShotgunStop = f_tick(rawNewShotgunStop, safeTick)
+newShotgunRisk = math.abs(newShotgunEntry - newShotgunStop)
+
+recentSwingHigh = ta.highest(high, RECENT_SWING_LOOKBACK)[1]
+recentSwingLow  = ta.lowest(low, RECENT_SWING_LOOKBACK)[1]
+targetSpacing = safeTick * TARGET_MIN_SPACING_TICKS
+
+float finalLongT1  = na
+float finalLongT2  = na
+float finalLongT3  = na
+float finalShortT1 = na
+float finalShortT2 = na
+float finalShortT3 = na
+if anyShotgunSignal
+    base = array.from(validPMZLow, validPMZHigh, validPremarketLow, validPremarketHigh, orbLowValue, orbHighValue, lisValue, fourHourLowerTarget, fourHourUpperTarget, dailyLowerEdgeValue, dailyUpperEdgeValue)
+    e = newShotgunEntry
+    r = newShotgunRisk
+    if shotgunLongSignal
+        rawT1 = f_nearestAbove(e, base, weeklyLowerEdgeValue, weeklyUpperEdgeValue, prevDayHigh, supplyLow, recentSwingHigh)
+        rawT2 = f_nearestAbove(rawT1 + targetSpacing, base, weeklyLowerEdgeValue, weeklyUpperEdgeValue, prevDayHigh, supplyHigh, recentSwingHigh)
+        rawT3 = f_nearestAbove(rawT2 + targetSpacing, base, monthlyLowerEdgeValue, monthlyUpperEdgeValue, yearlyLowerEdgeValue, yearlyUpperEdgeValue, supplyHigh)
+        fb1 = e + r * shotgunT1R
+        fb2 = e + r * shotgunT2R
+        fb3 = e + r * shotgunT3R
+        c1 = rawT1 < 500000000 ? rawT1 : fb1
+        c2 = rawT2 < 500000000 ? rawT2 : fb2
+        c3 = rawT3 < 500000000 ? rawT3 : fb3
+        t1 = na(c1) ? fb1 : math.max(c1, fb1)
+        t2 = na(c2) ? math.max(t1 + targetSpacing, fb2) : math.max(math.max(c2, t1 + targetSpacing), fb2)
+        t3 = na(c3) ? math.max(t2 + targetSpacing, fb3) : math.max(math.max(c3, t2 + targetSpacing), fb3)
+        finalLongT1 := f_tick(t1, safeTick)
+        finalLongT2 := f_tick(t2, safeTick)
+        finalLongT3 := f_tick(t3, safeTick)
+    else
+        rawT1 = f_nearestBelow(e, base, weeklyLowerEdgeValue, weeklyUpperEdgeValue, prevDayLow, demandHigh, recentSwingLow)
+        rawT2 = f_nearestBelow(rawT1 - targetSpacing, base, weeklyLowerEdgeValue, weeklyUpperEdgeValue, prevDayLow, demandLow, recentSwingLow)
+        rawT3 = f_nearestBelow(rawT2 - targetSpacing, base, monthlyLowerEdgeValue, monthlyUpperEdgeValue, yearlyLowerEdgeValue, yearlyUpperEdgeValue, demandLow)
+        fb1 = e - r * shotgunT1R
+        fb2 = e - r * shotgunT2R
+        fb3 = e - r * shotgunT3R
+        c1 = rawT1 > -500000000 ? rawT1 : fb1
+        c2 = rawT2 > -500000000 ? rawT2 : fb2
+        c3 = rawT3 > -500000000 ? rawT3 : fb3
+        t1 = na(c1) ? fb1 : math.min(c1, fb1)
+        t2 = na(c2) ? math.min(t1 - targetSpacing, fb2) : math.min(math.min(c2, t1 - targetSpacing), fb2)
+        t3 = na(c3) ? math.min(t2 - targetSpacing, fb3) : math.min(math.min(c3, t2 - targetSpacing), fb3)
+        finalShortT1 := f_tick(t1, safeTick)
+        finalShortT2 := f_tick(t2, safeTick)
+        finalShortT3 := f_tick(t3, safeTick)
+
+var int   shotgunDirection = 0
+var float shotgunEntry = na
+var float shotgunStop  = na
+var float shotgunRisk  = na
+var float shotgunT1    = na
+var float shotgunT2    = na
+var float shotgunT3    = na
+var int   shotgunSignalBar = 0
+if anyShotgunSignal
+    shotgunDirection := newShotgunDirection
+    shotgunEntry     := newShotgunEntry
+    shotgunStop      := newShotgunStop
+    shotgunRisk      := newShotgunRisk
+    shotgunT1        := shotgunLongSignal ? finalLongT1 : finalShortT1
+    shotgunT2        := shotgunLongSignal ? finalLongT2 : finalShortT2
+    shotgunT3        := shotgunLongSignal ? finalLongT3 : finalShortT3
+    shotgunSignalBar := bar_index
+
+shotgunPlanMaxBars  = isScalp ? 60 : 180
+shotgunPlanExpired  = bar_index - shotgunSignalBar > shotgunPlanMaxBars
+shotgunPlanCompleted = (shotgunDirection == 1 and high >= shotgunT3) or (shotgunDirection == -1 and low <= shotgunT3)
+shotgunPlanStopped   = (shotgunDirection == 1 and close <= shotgunStop) or (shotgunDirection == -1 and close >= shotgunStop)
+var bool shotgunPlanActive = false
+prevShotgunPlanActive = shotgunPlanActive
+shotgunPlanActive := anyShotgunSignal ? true : (isIntraday and newChartDay) ? false : (shotgunPlanExpired or shotgunPlanCompleted or shotgunPlanStopped) ? false : shotgunPlanActive
+shotgunTPExitEvent   = prevShotgunPlanActive and shotgunPlanCompleted and not anyShotgunSignal
+shotgunStopExitEvent = prevShotgunPlanActive and shotgunPlanStopped and not anyShotgunSignal
+
+plotshape(showShotgunLevels and shotgunLongSignal,  "Shotgun Long",  shape.triangleup,   location.belowbar, cTrendyBull, size=size.normal)
+plotshape(showShotgunLevels and shotgunShortSignal, "Shotgun Short", shape.triangledown, location.abovebar, cTrendyBear, size=size.normal)
+
+// -----------------------------------------------------------------------------
+// Newest plan ownership (replaces HighestAll signal/exit bars)
+// A single newest signal owns every displayed trade-plan element.
+// -----------------------------------------------------------------------------
+var line[]  planLines     = array.new<line>()
+var label[] planTags      = array.new<label>()
+var label[] planLabels    = array.new<label>()
+var color[] planLabelCols = array.new<color>()
+var bool[]  planLabelDyn  = array.new<bool>()
+var int planKind = 0          // 1 = Turn, 2 = Shotgun
+var int lastTurnSignalBar = 0
+var int lastShotgunSignalBar = 0
+
+f_addLine(float y, color c, bool dashed, string name) =>
+    array.push(planLines, line.new(bar_index, y, bar_index, y, color=c, width=1, style=dashed ? line.style_dashed : line.style_solid))
+    if showLineTags
+        array.push(planTags, label.new(bar_index + 2, y, name + " " + f_p(y), style=label.style_label_left, color=color.new(c, 15), textcolor=f_txt(c), size=size.small))
+
+f_addLabel(float y, string txt, color c, bool above, bool dyn) =>
+    array.push(planLabels, label.new(bar_index, y, txt, style=above ? label.style_label_down : label.style_label_up, color=c, textcolor=f_txt(c), size=size.small))
+    array.push(planLabelCols, c)
+    array.push(planLabelDyn, dyn)
+
+newEnabledTurnPlan    = turnSignalsLayer and anyTurnSignal
+newEnabledShotgunPlan = precisionTradesLayer and anyShotgunSignal
+newCombinedPlan       = newEnabledTurnPlan or newEnabledShotgunPlan
+newCombinedDirection  = newEnabledShotgunPlan ? newShotgunDirection : turnUpSignal ? 1 : turnDownSignal ? -1 : 0
+newCombinedEntry      = newEnabledShotgunPlan ? newShotgunEntry : turnEntry
+
+var int   prevCombBar   = na
+var int   prevCombTime  = na
+var float prevCombEntry = na
+var int   prevCombDir   = 0
+
+if newEnabledTurnPlan
+    lastTurnSignalBar := bar_index
+if newEnabledShotgunPlan
+    lastShotgunSignalBar := bar_index
+
+if newCombinedPlan
+    // Earlier actionable entries from the current chart day get a point marker.
+    if showTodaysSignals and isIntraday and not na(prevCombBar) and f_dateKey(prevCombTime) == lastDateKey
+        pc = prevCombDir == 1 ? cTrendyBull : cTrendyBear
+        label.new(prevCombBar, prevCombEntry, "", style=label.style_circle, color=pc, size=size.tiny)
+        if showHistoricalSignalLabels
+            label.new(prevCombBar, prevCombEntry, (prevCombDir == 1 ? "BUY " : "SELL ") + f_p(prevCombEntry), style=prevCombDir == -1 ? label.style_label_down : label.style_label_up, color=pc, textcolor=f_txt(pc), size=size.small)
+    prevCombBar   := bar_index
+    prevCombTime  := time
+    prevCombEntry := newCombinedEntry
+    prevCombDir   := newCombinedDirection
+
+    for l in planLines
+        line.delete(l)
+    array.clear(planLines)
+    for t in planTags
+        label.delete(t)
+    array.clear(planTags)
+    for lb in planLabels
+        label.delete(lb)
+    array.clear(planLabels)
+    array.clear(planLabelCols)
+    array.clear(planLabelDyn)
+
+    planKind := newEnabledShotgunPlan ? 2 : 1
+    if planKind == 1
+        dirCol = turnDirection == 1 ? cTrendyBull : cTrendyBear
+        if showTurnTradeLevels
+            f_addLine(turnEntry, dirCol, false, "ENTRY")
+            f_addLine(turnStopValue, cStop, false, "SL")
+            f_addLine(turnT1Value, cTarget, true, "T1")
+            f_addLine(turnT2Value, cTarget, true, "T2")
+            f_addLine(turnT3Value, cTarget, true, "T3")
+        if showBubbles
+            f_addLabel(turnEntry, "LAST " + (turnUpSignal ? "BUY " : "SELL ") + f_p(turnEntry), dirCol, turnDownSignal, true)
+            f_addLabel(turnStopValue, "SL " + f_p(turnStopValue), cStop, turnDownSignal, true)
+            f_addLabel(turnT1Value, "T1 " + f_p(turnT1Value), cTarget, turnUpSignal, true)
+            f_addLabel(turnT2Value, "T2 " + f_p(turnT2Value), cTarget, turnUpSignal, true)
+            f_addLabel(turnT3Value, "T3 " + f_p(turnT3Value), cTarget, turnUpSignal, true)
+    else
+        dirCol = shotgunDirection == 1 ? cTrendyBull : cTrendyBear
+        if showShotgunLevels
+            f_addLine(shotgunEntry, dirCol, false, "ENTRY")
+            f_addLine(shotgunStop, cStop, false, "STOP")
+            f_addLine(shotgunT1, cTarget, true, "T1")
+            f_addLine(shotgunT2, cTarget, true, "T2")
+            f_addLine(shotgunT3, cTarget, true, "T3")
+        if showBubbles
+            f_addLabel(shotgunEntry, "ENTRY " + f_p(newShotgunEntry), dirCol, shotgunShortSignal, true)
+            f_addLabel(shotgunStop, "STOP " + f_p(newShotgunStop), cStop, shotgunLongSignal, true)
+            if showShotgunLevels
+                f_addLabel(shotgunT1, "T1 " + f_p(shotgunT1) + "  Reward: " + f_p(f_tick(math.abs(shotgunT1 - newShotgunEntry), safeTick)) + " pts", cTarget, shotgunLongSignal, true)
+                f_addLabel(shotgunT2, "T2 " + f_p(shotgunT2) + "  Reward: " + f_p(f_tick(math.abs(shotgunT2 - newShotgunEntry), safeTick)) + " pts", cTarget, shotgunLongSignal, true)
+                f_addLabel(shotgunT3, "T3 " + f_p(shotgunT3) + "  Reward: " + f_p(f_tick(math.abs(shotgunT3 - newShotgunEntry), safeTick)) + " pts", cTarget, shotgunLongSignal, true)
+
+// Extend the newest plan while it is active; completed or invalidated plans stop.
+planActiveNow = planKind == 1 ? turnPlanActive : planKind == 2 ? shotgunPlanActive : false
+if planActiveNow
+    for l in planLines
+        line.set_x2(l, bar_index)
+    for t in planTags
+        label.set_x(t, bar_index + 2)
+
+// Exit bubbles for the newest plan.
+if showBubbles and planKind == 1 and turnSignalsLayer
+    if turnTPExitEvent
+        f_addLabel(turnT3Value, "TP EXIT " + f_p(turnT3Value), cTrendyBull, turnDirection == 1, false)
+    if turnInvalidExitEvent
+        f_addLabel(turnStopValue, "SL EXIT " + f_p(turnStopValue), cTrendyBear, turnDirection == -1, false)
+if showBubbles and planKind == 2 and precisionTradesLayer
+    if shotgunTPExitEvent
+        f_addLabel(shotgunT3, "TP EXIT " + f_p(shotgunT3), cTrendyBull, shotgunDirection == 1, false)
+    if shotgunStopExitEvent
+        f_addLabel(shotgunStop, "STOPPED " + f_p(shotgunStop), cTrendyBear, shotgunDirection == -1, false)
+
+// Plan bubbles turn gray once the newest plan is no longer active.
+if barstate.islast
+    for [i, lb] in planLabels
+        if array.get(planLabelDyn, i)
+            c = planActiveNow ? array.get(planLabelCols, i) : cNeutral
+            label.set_color(lb, c)
+            label.set_textcolor(lb, f_txt(c))
+
+// -----------------------------------------------------------------------------
+// Labels, candle colors, and alerts
+// -----------------------------------------------------------------------------
+dailyTrendState = close >= dailyUpperEdgeValue ? 3 : close >= prevDayLow + dayRange * 0.764 ? 2 : close >= dailyBullValue ? 1 : close > dailyBearValue ? 0 : close > prevDayLow + dayRange * 0.236 ? -1 : close > dailyLowerEdgeValue ? -2 : -3
+weeklyTrendState = close >= weeklyUpperEdgeValue ? 3 : close >= prevWeekLow + weekRange * 0.764 ? 2 : close >= prevWeekLow + weekRange * 0.618 ? 1 : close > prevWeekLow + weekRange * 0.382 ? 0 : close > prevWeekLow + weekRange * 0.236 ? -1 : close > weeklyLowerEdgeValue ? -2 : -3
+f_state(int s) => s > 0 ? "BULL" : s < 0 ? "BEAR" : "NEUTRAL"
+
+latestSignalIsShotgun = lastShotgunSignalBar > 0 and lastShotgunSignalBar >= lastTurnSignalBar
+latestSignalIsTurn    = lastTurnSignalBar > lastShotgunSignalBar
+
+labelPos = switch labelPosIn
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.bottom_left
+labelSize = switch labelSizeIn
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    => size.normal
+panelIsTop = str.startswith(labelPosIn, "Top")
+var table infoTbl = table.new(labelPos, 1, 12)
+
+if barstate.islast
+    table.clear(infoTbl, 0, 0, 0, 11)
+    texts = array.new<string>()
+    cols  = array.new<color>()
+    if showSignalGateDiagnostics
+        txt = "TURN=" + (qualifiedTurnUpOnly ? "UP_READY" : qualifiedTurnDownOnly ? "DOWN_READY" : recentTurnUpSetup ? "UP_WAIT" : recentTurnDownSetup ? "DOWN_WAIT" : "NONE") +
+             " turnCD=" + (turnCooldownReady ? "READY" : "WAIT") +
+             "\nSHOT=" + (rawShotgunLongOnly ? "LONG" : rawShotgunShortOnly ? "SHORT" : "NONE") +
+             " zone[L=" + (longZoneContext ? "1" : "0") + " S=" + (shortZoneContext ? "1" : "0") + "]" +
+             " cooldown=" + (shotgunCooldownReady ? "READY" : "WAIT") +
+             "\nCONT=" + (rawContLong ? "LONG" : rawContShort ? "SHORT" : "NONE") +
+             " contCD=" + (contCooldownReady ? "READY" : "WAIT")
+        array.push(texts, txt)
+        array.push(cols, turnUpSignal or shotgunLongSignal or contLongSignal ? cTrendyBull : turnDownSignal or shotgunShortSignal or contShortSignal ? cTrendyBear : color.gray)
+    if showLabels and edgesLayer and hasDaily
+        array.push(texts, "W: " + f_state(weeklyTrendState) + " | D: " + f_state(dailyTrendState))
+        array.push(cols, cTrendyNeutral)
+    else if showLabels and edgesLayer and hasWeekly
+        array.push(texts, "W: " + f_state(weeklyTrendState))
+        array.push(cols, cTrendyNeutral)
+    if showLabels and sessionLevelsLayer and isIntraday and (pmzValid or not na(lisValue))
+        array.push(texts, (pmzValid ? "PMZ " + f_p(f_tick(pmzLowValue, safeTick)) + " - " + f_p(f_tick(pmzHighValue, safeTick)) : "") + (not na(lisValue) ? " | LIS " + f_p(f_tick(lisValue, safeTick)) : ""))
+        array.push(cols, color.gray)
+    if showLabels and showEdges and hasFourHour
+        array.push(texts, "EDGES " + f_p(f_tick(fourHourUpperTarget, safeTick)) + " / " + f_p(f_tick(fourHourLowerTarget, safeTick)))
+        array.push(cols, cTrendyNeutral)
+    if showLabels and turnSignalsLayer and latestSignalIsTurn and turnPlanActive and not na(turnEntry)
+        array.push(texts, (isScalp ? "SCALP " : "TREND RUN ") + (turnDirection == 1 ? "BUY " : "SELL ") + f_p(turnEntry) + "   SL " + f_p(turnStopValue) + "\nTP " + f_p(turnT1Value) + " / " + f_p(turnT2Value) + " / " + f_p(turnT3Value))
+        array.push(cols, turnDirection == 1 ? cTrendyBull : cTrendyBear)
+    if showLabels and precisionTradesLayer and latestSignalIsShotgun and shotgunPlanActive and not na(shotgunEntry)
+        array.push(texts, "SHOTGUN " + (shotgunDirection == 1 ? "LONG " : "SHORT ") + f_p(shotgunEntry) + "\nSTOP " + f_p(shotgunStop) + "   RISK " + f_p(shotgunRisk))
+        array.push(cols, shotgunDirection == 1 ? cTrendyBull : cTrendyBear)
+    if showLabels and precisionTradesLayer and latestSignalIsShotgun and shotgunPlanActive and not na(shotgunT1)
+        array.push(texts, "T1 " + f_p(shotgunT1) + "\nT2 " + f_p(shotgunT2) + "\nT3 " + f_p(shotgunT3))
+        array.push(cols, cTrendyNeutral)
+    if showLabels and turnSignalsLayer and latestSignalIsTurn and not turnPlanActive and lastTurnSignalBar > 0
+        array.push(texts, "LAST " + (turnDirection == 1 ? "BUY " : "SELL ") + f_p(turnEntry) + " (CLOSED)\nSL " + f_p(turnStopValue) + "\nT1 " + f_p(turnT1Value) + "  T2 " + f_p(turnT2Value) + "  T3 " + f_p(turnT3Value))
+        array.push(cols, cNeutral)
+    if showLabels and precisionTradesLayer and latestSignalIsShotgun and not shotgunPlanActive and lastShotgunSignalBar > 0
+        array.push(texts, "LAST SHOTGUN " + (shotgunDirection == 1 ? "LONG " : "SHORT ") + f_p(shotgunEntry) + " (CLOSED)\nSTOP " + f_p(shotgunStop) + "\nT1 " + f_p(shotgunT1) + "  T2 " + f_p(shotgunT2) + "  T3 " + f_p(shotgunT3))
+        array.push(cols, cNeutral)
+    rowOffset = panelIsTop ? 1 : 0
+    if panelIsTop
+        table.cell(infoTbl, 0, 0, "\n\n", text_size=labelSize)
+    for [i, txt] in texts
+        bg = array.get(cols, i)
+        table.cell(infoTbl, 0, i + rowOffset, txt, bgcolor=bg, text_color=f_txt(bg), text_size=labelSize, text_halign=text.align_left)
+
+barcolor(colorTrendBars and trendyMode ? (emaBull ? cTrendyBull : emaBear ? cTrendyBear : cTrendyNeutral) : na, title="TREND Candles")
+
+alertcondition(turnUpSignal,       "SOMA Turn Up",            "SOMA Turn Up on {{ticker}} @ {{close}}")
+alertcondition(turnDownSignal,     "SOMA Turn Down",          "SOMA Turn Down on {{ticker}} @ {{close}}")
+alertcondition(shotgunLongSignal,  "SOMA Shotgun Long",       "SOMA Shotgun Long on {{ticker}} @ {{close}}")
+alertcondition(shotgunShortSignal, "SOMA Shotgun Short",      "SOMA Shotgun Short on {{ticker}} @ {{close}}")
+alertcondition(contLongSignal,     "SOMA Continuation Long",  "SOMA Continuation Long on {{ticker}} @ {{close}}")
+alertcondition(contShortSignal,    "SOMA Continuation Short", "SOMA Continuation Short on {{ticker}} @ {{close}}")
+
+if enableAlerts
+    if turnUpSignal
+        alert("SOMA Turn Up " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
+    if turnDownSignal
+        alert("SOMA Turn Down " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
+    if shotgunLongSignal
+        alert("SOMA Shotgun Long " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
+    if shotgunShortSignal
+        alert("SOMA Shotgun Short " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
+    if continuationSignalsLayer and contLongSignal
+        alert("SOMA Continuation Long " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
+    if continuationSignalsLayer and contShortSignal
+        alert("SOMA Continuation Short " + syminfo.ticker + " @ " + f_p(close), alert.freq_once_per_bar_close)
