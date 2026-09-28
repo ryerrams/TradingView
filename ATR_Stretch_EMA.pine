@@ -5,7 +5,17 @@
 //  Prints how far price is from the 28 EMA measured in ATR units:
 //       factor = (close - EMA28) / ATR
 //  +ve = price stretched ABOVE the EMA, -ve = BELOW. Bigger magnitude =
-//  more extended (mean-reversion risk). Label highlights past a threshold.
+//  more extended (mean-reversion risk). Label colors scale with |factor|
+//  the same way on both sides:
+//       gray < 0.66 x Extended <= yellow < Extended <= red < Extreme <= fuchsia
+//
+//  Also stamps the factor on each bar as a small label: above the bar when
+//  price is at/above the EMA, below it when price is under. By default only
+//  the live bar gets one; turn on historical labels to see it on every bar.
+//
+//  BUY: price was deeply oversold (factor <= -BUY Threshold on this bar or
+//  within the lookback) AND price reclaims the prior candle's open. Fires
+//  intrabar (can repaint) unless "Confirm on Bar Close" is on.
 // =====================================================================
 indicator("ATR Stretch from EMA", overlay=true, max_labels_count=500)
 
@@ -14,10 +24,15 @@ emaLength         = input.int(28, "EMA Length", minval=1)
 atrLength         = input.int(14, "ATR Length", minval=1)
 atrAverageType    = input.string("Wilders", "ATR Average Type", options=["Wilders", "Simple", "Exponential", "Weighted", "Hull"])
 extendedThreshold = input.float(2.0, "Extended Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extended (red)")
-greenThreshold    = input.float(3.0, "Green Threshold", step=0.1, tooltip="factor above this colors the label green")
+extremeThreshold  = input.float(3.0, "Extreme Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extreme (fuchsia), above or below the EMA")
 showEma           = input.bool(false, "Show EMA on Price")
 buyThreshold      = input.float(4.0, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
+oversoldLookback  = input.int(2, "BUY Oversold Lookback (bars)", minval=1, maxval=20, tooltip="1 = oversold must be on the reclaim bar itself (original ToS behavior). 2 = this bar or the prior bar.")
+confirmOnClose    = input.bool(false, "BUY: Confirm on Bar Close", tooltip="Off = BUY can fire intrabar and disappear if price falls back (like ToS). On = only once the bar has closed.")
 showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
+showFactorLabels  = input.bool(true, "Show Per-Bar Factor Labels")
+showHistFactor    = input.bool(false, "Factor Labels on Historical Bars", tooltip="Off = only the live bar gets a factor label.")
+factorSizeInput   = input.string("Small", "Factor Label Size", options=["Tiny", "Small", "Normal"])
 labelPos          = input.string("Top Right", "Label Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"])
 labelOffset       = input.float(6.0, "Label Edge Offset (% of pane)", minval=0, maxval=50, step=1, tooltip="Pushes the label away from the pane edge so it clears TradingView's own buttons and legend")
 labelSizeInput    = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"])
@@ -34,11 +49,20 @@ atr = switch atrAverageType
 ema    = ta.ema(close, emaLength)
 factor = atr == 0 ? 0.0 : (close - ema) / atr
 
-// ── BUY setup: deeply oversold AND the live candle reclaims the prior candle's open ──
-oversold = factor <= -buyThreshold      // at least buyThreshold ATR BELOW the EMA
-reclaim  = close > open[1]              // current (live) price back above the previous candle's open
-rawBuy   = oversold and reclaim
-buyNow   = rawBuy and not rawBuy[1]     // fire once, when the setup first triggers
+stretchColor(float f) =>
+    a = math.abs(f)
+    a >= extremeThreshold ? color.fuchsia : a >= extendedThreshold ? color.red : a >= extendedThreshold * 0.66 ? color.yellow : color.gray
+
+// Black text only on yellow; white reads better on gray / red / fuchsia
+textColorFor(color bg) =>
+    bg == color.yellow ? color.black : color.white
+
+// ── BUY setup: deeply oversold (now or within the lookback) AND price reclaims the prior candle's open ──
+minFactor = ta.lowest(factor, oversoldLookback)   // deepest stretch within the lookback
+oversold  = minFactor <= -buyThreshold            // at least buyThreshold ATR BELOW the EMA
+reclaim   = close > open[1]                       // current (live) price back above the previous candle's open
+rawBuy    = oversold and reclaim
+buyNow    = rawBuy and not rawBuy[1] and (not confirmOnClose or barstate.isconfirmed)   // fire once, when the setup first triggers
 
 // ── EMA ─────────────────────────────────────────────────
 plot(showEma ? ema : na, "EMA", color=color.yellow)
@@ -53,7 +77,7 @@ var label buyLbl = na
 if barstate.isnew
     buyLbl := na
 if showBuy
-    txt = "BUY\n" + str.tostring(math.abs(factor), "0.0") + "x ATR"
+    txt = "BUY\n" + str.tostring(math.abs(minFactor), "0.0") + "x ATR"
     if na(buyLbl)
         buyLbl := label.new(bar_index, low - atr * 0.5, txt, style=label.style_label_up, color=color.green, textcolor=color.white)
     else
@@ -65,12 +89,26 @@ else if not na(buyLbl)
 
 alertcondition(buyNow, "ATR reversion BUY", "ATR reversion BUY on {{ticker}} ({{interval}})")
 if buyNow
-    alert("ATR reversion BUY: " + syminfo.ticker + " " + str.tostring(math.abs(factor), "0.0") + "x ATR below " + str.tostring(emaLength) + " EMA", alert.freq_once_per_bar)
+    alert("ATR reversion BUY: " + syminfo.ticker + " " + str.tostring(math.abs(minFactor), "0.0") + "x ATR below " + str.tostring(emaLength) + " EMA", alert.freq_once_per_bar)
+
+// ── Per-bar factor label: above the bar when price >= EMA, below when under ──
+// Skipped on BUY bars so it doesn't overlap the BUY bubble.
+factorSize = factorSizeInput == "Tiny" ? size.tiny : factorSizeInput == "Normal" ? size.normal : size.small
+var label prevFactorLbl = na
+if showFactorLabels and not showBuy
+    aboveEma = close >= ema
+    fColor   = stretchColor(factor)
+    fLbl = label.new(bar_index, aboveEma ? high + atr * 0.25 : low - atr * 0.25,
+         (factor >= 0 ? "+" : "") + str.tostring(factor, "0.0") + "x",
+         style=aboveEma ? label.style_label_down : label.style_label_up,
+         color=fColor, textcolor=textColorFor(fColor), size=factorSize)
+    if not showHistFactor
+        label.delete(prevFactorLbl)
+    prevFactorLbl := fLbl
 
 // ── Stretch label (TOS AddLabel equivalent) ─────────────
-absF     = math.abs(factor)
-lblColor = factor > greenThreshold ? color.green : absF >= extendedThreshold ? color.red : absF >= extendedThreshold * 0.66 ? color.yellow : color.gray
-txtColor = lblColor == color.gray or lblColor == color.red ? color.white : color.black
+lblColor = stretchColor(factor)
+txtColor = textColorFor(lblColor)
 
 pos = switch labelPos
     "Top Left"      => position.top_left
