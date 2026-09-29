@@ -14,8 +14,9 @@
 //  the live bar gets one; turn on historical labels to see it on every bar.
 //
 //  BUY: price was deeply oversold (factor <= -BUY Threshold on this bar or
-//  within the lookback) AND price reclaims the prior candle's open. Fires
-//  intrabar (can repaint) unless "Confirm on Bar Close" is on.
+//  within the lookback) AND price closes above the prior candle's open.
+//  Defaults (3.5x, lookback 1, confirm on close) match Keyur's backtest;
+//  turn "Confirm on Bar Close" off to fire intrabar (can repaint).
 // =====================================================================
 indicator("ATR Stretch from EMA", overlay=true, max_labels_count=500)
 
@@ -26,9 +27,9 @@ atrAverageType    = input.string("Wilders", "ATR Average Type", options=["Wilder
 extendedThreshold = input.float(2.0, "Extended Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extended (red)")
 extremeThreshold  = input.float(3.0, "Extreme Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extreme (fuchsia), above or below the EMA")
 showEma           = input.bool(false, "Show EMA on Price")
-buyThreshold      = input.float(4.0, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
-oversoldLookback  = input.int(2, "BUY Oversold Lookback (bars)", minval=1, maxval=20, tooltip="1 = oversold must be on the reclaim bar itself (original ToS behavior). 2 = this bar or the prior bar.")
-confirmOnClose    = input.bool(false, "BUY: Confirm on Bar Close", tooltip="Off = BUY can fire intrabar and disappear if price falls back (like ToS). On = only once the bar has closed.")
+buyThreshold      = input.float(3.5, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
+oversoldLookback  = input.int(1, "BUY Oversold Lookback (bars)", minval=1, maxval=20, tooltip="1 = oversold must be on the reclaim bar itself (original ToS behavior). 2 = this bar or the prior bar.")
+confirmOnClose    = input.bool(true, "BUY: Confirm on Bar Close", tooltip="Off = BUY can fire intrabar and disappear if price falls back (like ToS). On = only once the bar has closed.")
 showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
 showFactorLabels  = input.bool(true, "Show Per-Bar Factor Labels")
 showHistFactor    = input.bool(false, "Factor Labels on Historical Bars", tooltip="Off = only the live bar gets a factor label.")
