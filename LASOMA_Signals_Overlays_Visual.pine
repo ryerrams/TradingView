@@ -797,6 +797,7 @@ f_distFg(_d) =>
 ReadoutPos    = input.string("Top Right", "Readout Position", options = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = "Readout")
 ReadoutOffset = input.float(12.0, "Readout Edge Offset (% of pane)", minval = 0, maxval = 50, step = 1, tooltip = "Pushes the strip away from the pane edge so it stacks under the Px vs EMA (6) and Daily Bias (9) readouts", group = "Readout")
 ReadoutSizeIn = input.string("Normal", "Readout Text Size", options = ["Small", "Normal", "Large"], group = "Readout")
+ReadoutHelp   = input.bool(true, "Readout Help Tooltips", tooltip = "Hover any readout chip for an explanation of what it means", group = "Readout")
 
 readoutPosition = switch ReadoutPos
     "Top Left"      => position.top_left
@@ -811,8 +812,21 @@ readoutTop  = str.startswith(ReadoutPos, "Top")
 // rows: spacer + zone + signal + info (the spacer sits on the pane-edge side)
 var table readout = table.new(readoutPosition, 5, 4, border_width = 1, border_color = color.new(color.black, 100))
 
-f_chip(_col, _row, _text, _bg, _fg) =>
-    table.cell(readout, _col, _row, _text, bgcolor = _bg, text_color = _fg, text_size = readoutSize)
+f_chip(_col, _row, _text, _bg, _fg, _tip = "") =>
+    table.cell(readout, _col, _row, _text, bgcolor = _bg, text_color = _fg, text_size = readoutSize, tooltip = ReadoutHelp ? _tip : "")
+
+// hover help for the readout chips (thresholds pulled from the live inputs)
+tipZone   = "ZONE ROW — is it OK to be in a trade right now? (last closed bar)\nLONG/SHORT ZONE: trend is up/down, price is 0–" + str.tostring(ChaseAtr) + " ATR from the trail, confidence is high enough, and no climax bar.\nNO TRADE: one of those failed — the grey chip at the end says which."
+tipConf   = "Confidence 1–5: the scoring model's rating of the current trend, bucketed into 5 levels.\nBlue (4–5) or purple (≥ " + str.tostring(MinMlConfidence) + ") = tradeable. Dark = 2 (only OK within " + str.tostring(Conf2NearTrailAtr) + " ATR of the trail). Grey = too low."
+tipDist   = "Distance from the trailing stop, in ATRs.\nGreen = 0–" + str.tostring(ChaseAtr) + " ATR (good entry area). Red = more than " + str.tostring(ChaseAtr) + " ATR away (chasing). Grey = wrong side of trail / no trend."
+tipVolZ   = "Volume z-score vs the 20-bar average (0 = normal, +2 = unusually heavy).\nTurns red above " + str.tostring(ClimaxVolumeZ) + " = climax bar, which blocks new entries."
+tipReason = "Why the zone is NO TRADE (or what it is waiting for)."
+tipSig    = "SIGNAL ROW — did a signal fire on the last closed bar, and what did the bot do with it?\nShows 'No signal' on every other bar, so it only duplicates the zone row on the bar right after a signal."
+tipSigDst = "How far price was from the trail (in ATRs) when the signal fired."
+tipEnter  = "BOT ENTERS: the signal passed every check and the bot takes the trade."
+tipSkip   = "SKIPPED: the signal bar was a climax (volume) bar, so the bot ignores it."
+tipChase  = "NOT CHASED: price was too far from the trail. The bot waits for a pullback to this level for up to " + str.tostring(RetestBars) + " bars."
+tipFill   = "ENTRY: an earlier NOT CHASED signal got its pullback and the bot entered at this level."
 
 if barstate.islast
     table.clear(readout, 0, 0, 4, 3)
@@ -825,30 +839,30 @@ if barstate.islast
 
     if ShowDynamicLabel
         f_chip(0, zoneRow, labelLong ? "LONG ZONE" : labelShort ? "SHORT ZONE" : "NO TRADE",
-             labelLong ? colBull : labelShort ? colBear : color.gray, labelLong ? color.black : color.white)
-        f_chip(1, zoneRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white)
-        f_chip(2, zoneRow, f_signed(curTrailDistAtr, 1) + " ATR", f_distBg(curTrailDistAtr), f_distFg(curTrailDistAtr))
-        f_chip(3, zoneRow, "volZ " + f_signed(lblVolZ, 1), lblClimax ? colTrailBear : colChipDark, lblClimax ? color.black : color.white)
+             labelLong ? colBull : labelShort ? colBear : color.gray, labelLong ? color.black : color.white, tipZone)
+        f_chip(1, zoneRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white, tipConf)
+        f_chip(2, zoneRow, f_signed(curTrailDistAtr, 1) + " ATR", f_distBg(curTrailDistAtr), f_distFg(curTrailDistAtr), tipDist)
+        f_chip(3, zoneRow, "volZ " + f_signed(lblVolZ, 1), lblClimax ? colTrailBear : colChipDark, lblClimax ? color.black : color.white, tipVolZ)
         if labelReason != 0
-            f_chip(4, zoneRow, reasonText, labelReason == 1 ? colNeutral : colChipDark, color.white)
+            f_chip(4, zoneRow, reasonText, labelReason == 1 ? colNeutral : colChipDark, color.white, tipReason)
 
     if ShowSignalLabel
         if not hasSig1
-            f_chip(0, sigRow, "No signal", colChipDark, color.white)
+            f_chip(0, sigRow, "No signal", colChipDark, color.white, tipSig)
         else if fill1
-            f_chip(0, sigRow, sigLong1 ? "LONG ENTRY" : "SHORT ENTRY", sigLong1 ? colBull : colBear, sigLong1 ? color.black : color.white)
-            f_chip(1, sigRow, "Pullback fill " + f_fmt(sigRetest1, 2), colNeutral, color.white)
+            f_chip(0, sigRow, sigLong1 ? "LONG ENTRY" : "SHORT ENTRY", sigLong1 ? colBull : colBear, sigLong1 ? color.black : color.white, tipFill)
+            f_chip(1, sigRow, "Pullback fill " + f_fmt(sigRetest1, 2), colNeutral, color.white, tipFill)
         else
             takeBg = sigLong1 ? colBull : colBear
-            f_chip(0, sigRow, sigLong1 ? "LONG signal" : "SHORT signal", take1 ? takeBg : color.gray, take1 and sigLong1 ? color.black : color.white)
-            f_chip(1, sigRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white)
-            f_chip(2, sigRow, f_signed(sigDist1, 1) + " ATR", f_distBg(sigDist1), f_distFg(sigDist1))
+            f_chip(0, sigRow, sigLong1 ? "LONG signal" : "SHORT signal", take1 ? takeBg : color.gray, take1 and sigLong1 ? color.black : color.white, tipSig)
+            f_chip(1, sigRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white, tipConf)
+            f_chip(2, sigRow, f_signed(sigDist1, 1) + " ATR", f_distBg(sigDist1), f_distFg(sigDist1), tipSigDst)
             if veto1
-                f_chip(3, sigRow, "SKIPPED: climax bar", colTrailBear, color.black)
+                f_chip(3, sigRow, "SKIPPED: climax bar", colTrailBear, color.black, tipSkip)
             else if far1
-                f_chip(3, sigRow, "NOT CHASED: pullback " + f_fmt(sigRetest1, 2), colNeutral, color.white)
+                f_chip(3, sigRow, "NOT CHASED: pullback " + f_fmt(sigRetest1, 2), colNeutral, color.white, tipChase)
             else
-                f_chip(3, sigRow, "BOT ENTERS", takeBg, sigLong1 ? color.black : color.white)
+                f_chip(3, sigRow, "BOT ENTERS", takeBg, sigLong1 ? color.black : color.white, tipEnter)
 
     col = 0
     if ShowRegime and visualEnabled
