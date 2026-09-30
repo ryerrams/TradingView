@@ -21,12 +21,14 @@
 // dim color = continuation of the same bias.
 //
 // Also draws the prior session's VAH/POC/VAL as flat reference lines, today's
-// developing VAH/POC/VAL as live plots, optional entry/exit bubbles, and a
-// one-line readout strip (current bias + prior VAH/POC/VAL).
+// developing VAH/POC/VAL (default: short stubs at the live bar only, so the
+// stair-stepping history doesn't clutter the chart), right-edge price tags,
+// optional entry/exit bubbles, and a one-line readout strip (current bias +
+// prior VAH/POC/VAL).
 //
 // Differences vs. the NT8 original:
 //   - Today's live VA is always computed (the letter/bubble qualifiers need it);
-//     "Show Today's Live VAH/POC/VAL Bands" only controls whether it's plotted.
+//     "Today's VAH/POC/VAL" only controls how (or whether) it's drawn.
 //   - Session boundaries follow the chart's session setting (RTH vs ETH),
 //     the equivalent of NT's trading-hours template.
 //   - On the live bar, values update intrabar and settle at bar close (Pine
@@ -45,7 +47,9 @@ flipBars       = input.int(2, "Flip Confirmation Bars", minval=1, maxval=20, gro
 useQual        = input.bool(true, "Use Intraday Structure Qualifier (L/l, S/s vs today's POC)", group=grpP)
 
 showRef        = input.bool(true, "Show Prior VAH/POC/VAL Lines", group=grpV)
-showLive       = input.bool(true, "Show Today's Live VAH/POC/VAL Bands", group=grpV)
+liveMode       = input.string("Stubs", "Today's VAH/POC/VAL", options=["Stubs", "Full History", "Off"], group=grpV, tooltip="Stubs = short line + price tag at the live bar only. Full History = the developing levels plotted across the whole session (stair-steps as the profile builds).")
+stubBars       = input.int(8, "Today Stub Length (bars)", minval=1, maxval=100, group=grpV)
+showTags       = input.bool(true, "Show Price Tags on Level Lines", group=grpV)
 letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxval=50, group=grpV)
 letterSizeIn   = input.string("Normal", "Letter Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpV)
 showBubbles    = input.bool(true, "Show Long/Short Entry-Exit Bubbles", group=grpV)
@@ -262,10 +266,47 @@ if bar_index >= 2
         lastPrinted := confirmed
     lastCheckpointElapsed := elapsed
 
-// ── Live plots ──────────────────────────────────────────
-plot(showLive ? liveVah : na, "Today VAH", color=liveVahCol, linewidth=2)
-plot(showLive ? livePoc : na, "Today POC", color=livePocCol, linewidth=2)
-plot(showLive ? liveVal : na, "Today VAL", color=liveValCol, linewidth=2)
+// ── Today's developing levels ───────────────────────────
+showFull = liveMode == "Full History"
+plot(showFull ? liveVah : na, "Today VAH", color=liveVahCol, linewidth=2)
+plot(showFull ? livePoc : na, "Today POC", color=livePocCol, linewidth=2)
+plot(showFull ? liveVal : na, "Today VAL", color=liveValCol, linewidth=2)
+
+// Stubs + tags live only on the last bar, so they're created once and moved.
+var line  stVah = line.new(0, float(na), 0, float(na), color=liveVahCol, width=2)
+var line  stPoc = line.new(0, float(na), 0, float(na), color=livePocCol, width=2)
+var line  stVal = line.new(0, float(na), 0, float(na), color=liveValCol, width=2)
+var label tgVah = label.new(0, float(na), "", style=label.style_label_left, color=liveVahCol, textcolor=color.black, size=size.small)
+var label tgPoc = label.new(0, float(na), "", style=label.style_label_left, color=livePocCol, textcolor=color.black, size=size.small)
+var label tgVal = label.new(0, float(na), "", style=label.style_label_left, color=liveValCol, textcolor=color.white, size=size.small)
+var label tgPVah = label.new(0, float(na), "", style=label.style_label_left, color=priorVaCol,  textcolor=color.white, size=size.small)
+var label tgPPoc = label.new(0, float(na), "", style=label.style_label_left, color=priorPocCol, textcolor=color.black, size=size.small)
+var label tgPVal = label.new(0, float(na), "", style=label.style_label_left, color=priorVaCol,  textcolor=color.white, size=size.small)
+
+// Show a stub/tag at (x1..x2, y) with text, or hide it when y is na / disabled.
+setStub(line ln, float y, bool on, int x1, int x2) =>
+    ln.set_xy1(x1, on ? y : na)
+    ln.set_xy2(x2, on ? y : na)
+// Today's tags sit next to the stubs; prior tags go one column further right so
+// close levels (e.g. VAH vs Prior VAH) don't overlap.
+setTag(label lb, float y, string txt, bool on, int xOff) =>
+    lb.set_xy(bar_index + xOff, on and not na(y) ? y : na)
+    lb.set_text(txt + " " + str.tostring(y, format.mintick))
+
+if barstate.islast
+    liveOn = liveMode != "Off"
+    stubOn = liveMode == "Stubs"
+    x1 = bar_index - stubBars + 1
+    setStub(stVah, liveVah, stubOn, x1, bar_index + 2)
+    setStub(stPoc, livePoc, stubOn, x1, bar_index + 2)
+    setStub(stVal, liveVal, stubOn, x1, bar_index + 2)
+    setTag(tgVah, liveVah, "VAH", showTags and liveOn, 3)
+    setTag(tgPoc, livePoc, "POC", showTags and liveOn, 3)
+    setTag(tgVal, liveVal, "VAL", showTags and liveOn, 3)
+    priorOn = showTags and showRef and havePrior
+    setTag(tgPVah, priorVah, "Prior VAH", priorOn, 16)
+    setTag(tgPPoc, priorPoc, "Prior POC", priorOn, 16)
+    setTag(tgPVal, priorVal, "Prior VAL", priorOn, 16)
 
 // ── Readout strip: [Bias] [Prior VAH] [Prior POC] [Prior VAL] in one row ──
 fmt(float v) => na(v) ? "—" : str.tostring(v, format.mintick)
@@ -295,5 +336,5 @@ if showReadout and barstate.islast
         readout.cell(0, spacerRow, "", height=readoutOffset)
     readout.cell(0, stripRow, havePrior ? biasTxt : "Bias —", bgcolor=havePrior ? biasBg : color.gray, text_color=havePrior ? biasFg : color.white, text_size=readoutSize)
     readout.cell(1, stripRow, "Prior VAH " + fmt(priorVah), bgcolor=priorVaCol, text_color=color.white, text_size=readoutSize)
-    readout.cell(2, stripRow, "POC " + fmt(priorPoc), bgcolor=priorPocCol, text_color=color.black, text_size=readoutSize)
-    readout.cell(3, stripRow, "VAL " + fmt(priorVal), bgcolor=priorVaCol, text_color=color.white, text_size=readoutSize)
+    readout.cell(2, stripRow, "Prior POC " + fmt(priorPoc), bgcolor=priorPocCol, text_color=color.black, text_size=readoutSize)
+    readout.cell(3, stripRow, "Prior VAL " + fmt(priorVal), bgcolor=priorVaCol, text_color=color.white, text_size=readoutSize)
