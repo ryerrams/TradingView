@@ -81,7 +81,7 @@ ShowConfidenceBubbles = input.bool(true, "Show Confidence Bubbles", tooltip = "G
 ShowDecisionBubbles   = input.bool(false, "Show Decision Bubbles", tooltip = "Verbose \"conf | ATR wait/CLX\" bubbles instead of the plain confidence number", group = "Dynamic (paper-v4)")
 ShowEntryArrows       = input.bool(false, "Show Entry Arrows", tooltip = "Arrows on the bars the bot enters (retest fills included)", group = "Dynamic (paper-v4)")
 BubbleCooldownBars    = input.int(0, "Bubble Cooldown Bars", tooltip = "Same verdict on consecutive bars prints once every N bars (score-change signals repeat)", group = "Dynamic (paper-v4)")
-ShowSignalLabel       = input.bool(true, "Show Signal Label", tooltip = "What the last CLOSED bar's signal was and what the bot did with it", group = "Dynamic (paper-v4)")
+ShowSignalLabel       = input.bool(true, "Show Signal Label", tooltip = "The most recent signal (held until the next one) and what the bot did with it", group = "Dynamic (paper-v4)")
 
 AtrLength                    = input.int(14, "ATR Length", group = "Core Engine")
 TrailMultiplier               = input.float(3.0, "Trail ATR Multiplier", group = "Core Engine")
@@ -743,7 +743,7 @@ if visualEnabled and ShowLevels and barstate.islast
 // READOUT STRIP  (AddLabel equivalents, laid out like the Daily Bias / Px vs EMA readouts:
 // one row of coloured chips per label, with an edge-offset spacer so it stacks under them)
 //   row 1: ZONE verdict | conf | ATR from trail | volZ | reason        (last closed bar)
-//   row 2: last signal  | conf | ATR from trail | bot decision          (last closed bar)
+//   row 2: last signal  | bars ago @ price | bot decision / pullback status  (persists until the next signal)
 //   row 3: RVOL / Strength / Squeeze / Volume / KNN chips (when enabled)
 // ============================================================================================
 // DYNAMIC labels are evaluated on the last CLOSED bar (the bot's view). On the forming bar the trend/confidence
@@ -765,25 +765,38 @@ confOk = lblConf >= MinMlConfidence or (lblConf == 2 and curTrailDistAtr <= Conf
 zoneOk = not na(curTrailDistAtr) and curTrailDistAtr >= 0 and curTrailDistAtr <= ChaseAtr and not lblClimax and confOk
 labelLong = zoneOk and lblTrend == 1
 labelShort = zoneOk and lblTrend == -1
-labelReason = retestOpen ? 1 : na(curTrailDistAtr) ? 2 : lblClimax ? 3 : curTrailDistAtr > ChaseAtr ? 4 : not confOk ? 5 : 0
-reasonText = labelReason == 1 ? "Waiting " + (retestSide == 1 ? "long" : "short") + " pullback " + f_fmt(retestLvl, 2) + " (" + str.tostring(RetestBars - retestAge) + " bars)" :
-     labelReason == 2 ? "No trend" :
+labelReason = na(curTrailDistAtr) ? 2 : lblClimax ? 3 : curTrailDistAtr > ChaseAtr ? 4 : not confOk ? 5 : 0
+reasonText = labelReason == 2 ? "No trend" :
      labelReason == 3 ? "Climax bar" :
      labelReason == 4 ? "Too far from trail" :
      labelReason == 5 ? "Conf 2 needs ≤ " + str.tostring(Conf2NearTrailAtr) + " ATR" : ""
 
-// the last CLOSED bar's signal event and the bot's decision on it
-sigL1 = activeLongSignal[1]
-sigS1 = activeShortSignal[1]
-fill1 = retestFirstFill[1]
-fillSide1 = retestSide[1]
-sigLong1 = fill1 ? fillSide1 == 1 : sigL1
-hasSig1 = fill1 or sigL1 or sigS1
-take1 = signalTake[1]
-far1 = signalFar[1]
-veto1 = signalVetoed[1]
-sigDist1 = signalDistAtr[1]
-sigRetest1 = nz(retestLvl[1])
+// the most recent signal and what became of it, held until the next signal fires
+//   status: 1 = bot entered, 2 = skipped (climax), 3 = waiting for pullback, 4 = pullback filled, 5 = pullback missed
+var int   lastSigBar    = na
+var int   lastSigDir    = 0
+var float lastSigPrice  = na
+var int   lastSigStatus = 0
+var float lastSigLevel  = na
+if anySignal
+    lastSigBar    := bar_index
+    lastSigDir    := activeLongSignal ? 1 : -1
+    lastSigPrice  := close
+    lastSigStatus := signalVetoed ? 2 : signalFar ? 3 : 1
+    lastSigLevel  := signalFar ? retestLvl : na
+else if lastSigStatus == 3
+    if retestFirstFill
+        lastSigStatus := 4
+    else if not retestOpen
+        lastSigStatus := 5
+
+// read it as of the last CLOSED bar, like the zone row
+sigBar1    = lastSigBar[1]
+sigDir1    = nz(lastSigDir[1])
+sigPrice1  = lastSigPrice[1]
+sigStatus1 = nz(lastSigStatus[1])
+sigLevel1  = lastSigLevel[1]
+sigLeft1   = RetestBars - nz(retestAge[1])
 
 // chip colours (bright fills with contrasting text, same palette as the chart markers)
 colChipDark = color.rgb(67, 70, 81)
@@ -820,13 +833,14 @@ tipZone   = "ZONE ROW — is it OK to be in a trade right now? (last closed bar)
 tipConf   = "Confidence 1–5: the scoring model's rating of the current trend, bucketed into 5 levels.\nBlue (4–5) or purple (≥ " + str.tostring(MinMlConfidence) + ") = tradeable. Dark = 2 (only OK within " + str.tostring(Conf2NearTrailAtr) + " ATR of the trail). Grey = too low."
 tipDist   = "Distance from the trailing stop, in ATRs.\nGreen = 0–" + str.tostring(ChaseAtr) + " ATR (good entry area). Red = more than " + str.tostring(ChaseAtr) + " ATR away (chasing). Grey = wrong side of trail / no trend."
 tipVolZ   = "Volume z-score vs the 20-bar average (0 = normal, +2 = unusually heavy).\nTurns red above " + str.tostring(ClimaxVolumeZ) + " = climax bar, which blocks new entries."
-tipReason = "Why the zone is NO TRADE (or what it is waiting for)."
-tipSig    = "SIGNAL ROW — did a signal fire on the last closed bar, and what did the bot do with it?\nShows 'No signal' on every other bar, so it only duplicates the zone row on the bar right after a signal."
-tipSigDst = "How far price was from the trail (in ATRs) when the signal fired."
-tipEnter  = "BOT ENTERS: the signal passed every check and the bot takes the trade."
-tipSkip   = "SKIPPED: the signal bar was a climax (volume) bar, so the bot ignores it."
-tipChase  = "NOT CHASED: price was too far from the trail. The bot waits for a pullback to this level for up to " + str.tostring(RetestBars) + " bars."
-tipFill   = "ENTRY: an earlier NOT CHASED signal got its pullback and the bot entered at this level."
+tipReason = "Why the zone is NO TRADE."
+tipSig    = "SIGNAL ROW — the most recent LONG/SHORT signal and what the bot did with it.\nIt stays up until the next signal fires. Grey = the bot did not trade it."
+tipSigAgo = "How many bars ago the signal fired, and the close of the signal bar."
+tipEnter  = "BOT ENTERED: the signal passed every check and the bot took the trade."
+tipSkip   = "SKIPPED: the signal bar was a climax (volume) bar, so the bot ignored it."
+tipWait   = "NOT CHASED: price was more than " + str.tostring(ChaseAtr) + " ATR from the trail. The bot has a pullback order at this level for up to " + str.tostring(RetestBars) + " bars."
+tipFill   = "PULLBACK FILLED: price came back to the pullback level and the bot entered there."
+tipMissed = "PULLBACK MISSED: price never came back to the pullback level (or the trend flipped), so the bot never entered."
 
 if barstate.islast
     table.clear(readout, 0, 0, 4, 3)
@@ -844,25 +858,25 @@ if barstate.islast
         f_chip(2, zoneRow, f_signed(curTrailDistAtr, 1) + " ATR", f_distBg(curTrailDistAtr), f_distFg(curTrailDistAtr), tipDist)
         f_chip(3, zoneRow, "volZ " + f_signed(lblVolZ, 1), lblClimax ? colTrailBear : colChipDark, lblClimax ? color.black : color.white, tipVolZ)
         if labelReason != 0
-            f_chip(4, zoneRow, reasonText, labelReason == 1 ? colNeutral : colChipDark, color.white, tipReason)
+            f_chip(4, zoneRow, reasonText, colChipDark, color.white, tipReason)
 
     if ShowSignalLabel
-        if not hasSig1
-            f_chip(0, sigRow, "No signal", colChipDark, color.white, tipSig)
-        else if fill1
-            f_chip(0, sigRow, sigLong1 ? "LONG ENTRY" : "SHORT ENTRY", sigLong1 ? colBull : colBear, sigLong1 ? color.black : color.white, tipFill)
-            f_chip(1, sigRow, "Pullback fill " + f_fmt(sigRetest1, 2), colNeutral, color.white, tipFill)
+        if sigDir1 == 0
+            f_chip(0, sigRow, "No signal yet", colChipDark, color.white, tipSig)
         else
-            takeBg = sigLong1 ? colBull : colBear
-            f_chip(0, sigRow, sigLong1 ? "LONG signal" : "SHORT signal", take1 ? takeBg : color.gray, take1 and sigLong1 ? color.black : color.white, tipSig)
-            f_chip(1, sigRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white, tipConf)
-            f_chip(2, sigRow, f_signed(sigDist1, 1) + " ATR", f_distBg(sigDist1), f_distFg(sigDist1), tipSigDst)
-            if veto1
-                f_chip(3, sigRow, "SKIPPED: climax bar", colTrailBear, color.black, tipSkip)
-            else if far1
-                f_chip(3, sigRow, "NOT CHASED: pullback " + f_fmt(sigRetest1, 2), colNeutral, color.white, tipChase)
-            else
-                f_chip(3, sigRow, "BOT ENTERS", takeBg, sigLong1 ? color.black : color.white, tipEnter)
+            sigLong  = sigDir1 == 1
+            traded   = sigStatus1 == 1 or sigStatus1 == 4
+            sideBg   = sigLong ? colBull : colBear
+            sideFg   = sigLong ? color.black : color.white
+            barsAgo  = bar_index - sigBar1
+            f_chip(0, sigRow, sigLong ? "LONG signal" : "SHORT signal", traded or sigStatus1 == 3 ? sideBg : color.gray, traded or sigStatus1 == 3 ? sideFg : color.white, tipSig)
+            f_chip(1, sigRow, str.tostring(barsAgo) + (barsAgo == 1 ? " bar ago @ " : " bars ago @ ") + f_fmt(sigPrice1, 2), colChipDark, color.white, tipSigAgo)
+            switch sigStatus1
+                1 => f_chip(2, sigRow, "BOT ENTERED", sideBg, sideFg, tipEnter)
+                2 => f_chip(2, sigRow, "SKIPPED: climax bar", colTrailBear, color.black, tipSkip)
+                3 => f_chip(2, sigRow, "NOT CHASED: pullback " + f_fmt(sigLevel1, 2) + " (" + str.tostring(sigLeft1) + " bars left)", colNeutral, color.white, tipWait)
+                4 => f_chip(2, sigRow, "PULLBACK FILLED @ " + f_fmt(sigLevel1, 2), sideBg, sideFg, tipFill)
+                5 => f_chip(2, sigRow, "PULLBACK MISSED " + f_fmt(sigLevel1, 2), color.gray, color.white, tipMissed)
 
     col = 0
     if ShowRegime and visualEnabled
