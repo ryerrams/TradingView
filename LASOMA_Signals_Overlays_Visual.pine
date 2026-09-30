@@ -10,6 +10,15 @@
 // - The KNN filter from the original Pine source is intentionally NOT reproduced (ml.knn / matrix based
 //   loops are out of scope for a faithful, maintainable port); UseKnnFilter is kept as a pass-through
 //   toggle that only shows a warning label, exactly like the ThinkScript version.
+// - DYNAMIC build (synced to the ThinkScript "Scalping Dynamic build" of 2026-09-29, mirrors the
+//   paper-v4 bot on the same signal engine):
+//     * a 2/5 signal is accepted when the close is within Conf2NearTrailAtr of the Smart Trail
+//     * a signal further than ChaseAtr from the trail is not chased: a retest level (trail +/- RetestAtr)
+//       is drawn for RetestBars bars, cancelled on a trend flip, "RETEST" on the first touch
+//     * a climax-volume signal bar (volume z > ClimaxVolumeZ) is shown grey (bot vetoes it)
+//     * two status rows (last closed bar's signal + bot decision, and the LONG/SHORT ZONE verdict)
+//     * the TOS scan drop-down is a hidden "Scan" plot (Pine Screener column) + alert condition
+//   Engine parameters (ATR(5) in Scalping, trail x2.0, sensitivity 12) are unchanged: chart == bot.
 indicator("LASOMA: Signals & Overlays Visual", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
 
 // ============================================================================================
@@ -19,7 +28,7 @@ TradingPreset       = input.string("Screener Match", "Trading Preset", options =
 VisualPreset        = input.string("None", "Visual Preset", options = ["None", "Smart Trail", "Trend Catcher", "Trend Tracer", "Neo Cloud", "All", "Custom"], group = "Presets")
 SignalModeOverride  = input.string("Preset Default", "Signal Mode Override", options = ["Preset Default", "Component Score", "Trend Catcher", "Trend Investor"], group = "Presets")
 SignalSensitivity   = input.int(24, "Signal Sensitivity", group = "Presets")
-ShowSignalMarkers   = input.bool(false, "Show Signal Markers", group = "Presets")
+ShowSignalMarkers   = input.bool(true, "Show Signal Markers", group = "Presets")
 EnableAlerts        = input.bool(false, "Enable Alerts", group = "Presets")
 
 UseKnnFilter          = input.bool(false, "Use KNN Filter (pass-through, not reproduced)", group = "KNN (unused)")
@@ -60,6 +69,19 @@ MlBearThreshold                 = input.float(40.0, "ML Bear Threshold", group =
 MinMlConfidence                 = input.int(3, "Minimum ML Confidence (1-5)", group = "ML / Scoring")
 EnableScalpingScoreChangeSignals = input.bool(true, "Enable Scalping Score-Change Signals", group = "ML / Scoring")
 ShowModelScoreHistory            = input.bool(true, "Plot Model Score History (hidden)", group = "ML / Scoring")
+
+// ---- DYNAMIC (paper-v4) inputs ----
+Conf2NearTrailAtr     = input.float(1.0, "Conf 2 Near-Trail ATR", tooltip = "Accept a 2/5 signal when the close is within this many ATR of the Smart Trail", group = "Dynamic (paper-v4)")
+ChaseAtr              = input.float(2.0, "Chase ATR", tooltip = "A signal further than this from the trail is NOT chased -> wait for the retest", group = "Dynamic (paper-v4)")
+RetestAtr             = input.float(1.4, "Retest ATR", tooltip = "Retest level = trail +/- this many ATR", group = "Dynamic (paper-v4)")
+RetestBars            = input.int(12, "Retest Bars", tooltip = "The retest order lives this many bars", group = "Dynamic (paper-v4)")
+ClimaxVolumeZ         = input.float(1.0, "Climax Volume Z", tooltip = "Signal-bar volume z-score above this = climax bar (bot vetoes)", group = "Dynamic (paper-v4)")
+ShowDynamicLabel      = input.bool(true, "Show Zone Label", group = "Dynamic (paper-v4)")
+ShowConfidenceBubbles = input.bool(true, "Show Confidence Bubbles", tooltip = "GREEN = bot takes the long, RED = bot takes the short, GREY = signal only", group = "Dynamic (paper-v4)")
+ShowDecisionBubbles   = input.bool(false, "Show Decision Bubbles", tooltip = "Verbose \"conf | ATR wait/CLX\" bubbles instead of the plain confidence number", group = "Dynamic (paper-v4)")
+ShowEntryArrows       = input.bool(false, "Show Entry Arrows", tooltip = "Arrows on the bars the bot enters (retest fills included)", group = "Dynamic (paper-v4)")
+BubbleCooldownBars    = input.int(0, "Bubble Cooldown Bars", tooltip = "Same verdict on consecutive bars prints once every N bars (score-change signals repeat)", group = "Dynamic (paper-v4)")
+ShowSignalLabel       = input.bool(true, "Show Signal Label", tooltip = "What the last CLOSED bar's signal was and what the bot did with it", group = "Dynamic (paper-v4)")
 
 AtrLength                    = input.int(14, "ATR Length", group = "Core Engine")
 TrailMultiplier               = input.float(3.0, "Trail ATR Multiplier", group = "Core Engine")
@@ -115,6 +137,7 @@ colNeoFill   = color.new(color.rgb(16, 39, 93), 0)
 colStop      = color.new(color.rgb(242, 54, 69), 0)
 colTarget    = color.new(color.rgb(41, 98, 255), 0)
 colEntry     = color.new(color.rgb(120, 123, 134), 0)
+colGrey      = color.rgb(128, 128, 128)   // TOS Color.GRAY
 
 // ============================================================================================
 // HELPER FUNCTIONS  (script Clamp / ConfidenceLevel)
@@ -419,6 +442,8 @@ investorTrailReference = ta.ema(investorTrailingStop, TrailSmoothing)
 futuresTrailReference = useInvestorSignalMode ? investorTrailReference : visualTrailReference
 futuresTrailUpper = futuresTrailReference + atrValue * TrailBandAtrWidth
 futuresTrailLower = futuresTrailReference - atrValue * TrailBandAtrWidth
+// the Smart Trail the signals are measured against (moved up from the plot section; same definition)
+activeTrailVisual = useInvestorSignalMode ? investorTrailReference : visualTrailReference
 
 // ============================================================================================
 // DMI / ADX
@@ -481,9 +506,43 @@ sharedTrendBearish = sharedTrendState == -1
 rawLongCandidate = TradingPreset == "Futures" ? futuresTrailLongCandidate : TradingPreset == "Scalping" ? (investorLongCandidate or scalpingBullishScoreChange) : useInvestorSignalMode ? investorLongCandidate : useCatcherSignalMode ? trendCatcherLongCandidate : componentLongCandidate
 rawShortCandidate = TradingPreset == "Futures" ? futuresTrailShortCandidate : TradingPreset == "Scalping" ? (investorShortCandidate or scalpingBearishScoreChange) : useInvestorSignalMode ? investorShortCandidate : useCatcherSignalMode ? trendCatcherShortCandidate : componentShortCandidate
 
-activeLongSignal  = rawLongCandidate  and activeModelConfidencePass and sharedTrendBullish
-activeShortSignal = rawShortCandidate and activeModelConfidencePass and sharedTrendBearish
+// ---- DYNAMIC: distance from the Smart Trail (ATR, + = on the trade side), volume z, confidence gate ----
+longTrailDistAtr  = (close - activeTrailVisual) / atrSafe
+shortTrailDistAtr = (activeTrailVisual - close) / atrSafe
+volZ = nz((volume - ta.sma(volume, 20)) / math.max(ta.stdev(volume, 20), 1.0))
+climaxBar = volZ > ClimaxVolumeZ
+longConfPass  = activeModelConfidencePass or (activeModelConfidenceLevel == 2 and longTrailDistAtr >= 0 and longTrailDistAtr <= Conf2NearTrailAtr)
+shortConfPass = activeModelConfidencePass or (activeModelConfidenceLevel == 2 and shortTrailDistAtr >= 0 and shortTrailDistAtr <= Conf2NearTrailAtr)
+activeLongSignal  = rawLongCandidate  and longConfPass  and sharedTrendBullish
+activeShortSignal = rawShortCandidate and shortConfPass and sharedTrendBearish
 activeConfidenceLevel = activeModelConfidenceLevel
+
+// ============================================================================================
+// DYNAMIC: what the bot does with the signal (take / wait for retest / climax veto)
+// ============================================================================================
+anySignal = activeLongSignal or activeShortSignal
+signalDistAtr = activeLongSignal and not na(longTrailDistAtr) ? longTrailDistAtr : activeShortSignal and not na(shortTrailDistAtr) ? shortTrailDistAtr : 0.0
+signalVetoed = anySignal and climaxBar
+signalFar    = anySignal and not climaxBar and signalDistAtr > ChaseAtr
+signalTake   = anySignal and not climaxBar and signalDistAtr <= ChaseAtr
+
+var int retestAge = 0
+retestAge := signalFar ? 0 : retestAge[1] + 1
+var int retestSide = 0
+retestSide := signalFar ? (activeLongSignal ? 1 : -1) : retestAge >= RetestBars ? 0 : retestSide[1] == 1 and not sharedTrendBullish ? 0 : retestSide[1] == -1 and not sharedTrendBearish ? 0 : retestSide[1]
+var float retestLvl = na
+retestLvl := signalFar ? (activeLongSignal ? activeTrailVisual + RetestAtr * atrValue : activeTrailVisual - RetestAtr * atrValue) : retestSide == 0 ? na : retestLvl[1]
+retestTouch = retestSide != 0 and not na(retestLvl) and not signalFar and ((retestSide == 1 and low <= retestLvl) or (retestSide == -1 and high >= retestLvl))
+var int retestDone = 0
+retestDone := signalFar ? 0 : retestTouch ? 1 : retestDone[1]
+retestFirstFill = retestTouch and retestDone[1] == 0
+retestOpen = retestSide != 0 and not na(retestLvl) and retestDone == 0
+
+// bubble de-clutter: verdict code 1 = take, 2 = wait, 3 = veto; repeat only when the verdict changes or after the cooldown
+verdict = signalVetoed ? 3 : signalFar ? 2 : signalTake ? 1 : 0
+var int lastBubbleBar = 0
+lastBubbleBar := verdict != 0 and (verdict != verdict[1] or bar_index - lastBubbleBar[1] > BubbleCooldownBars) ? bar_index : lastBubbleBar[1]
+printBubble = verdict != 0 and lastBubbleBar == bar_index
 
 // ============================================================================================
 // TRADE LEVELS
@@ -502,7 +561,6 @@ target2Level = tradeDirection == 1 ? tradeEntry + tradeRisk * Target2R : tradeDi
 target3Level = tradeDirection == 1 ? tradeEntry + tradeRisk * Target3R : tradeDirection == -1 ? tradeEntry - tradeRisk * Target3R : na
 
 activeTrailBullish = TradingPreset == "Futures" ? futuresTrailBullish : useInvestorSignalMode ? investorTrend == 1 : useCatcherSignalMode ? catcherBullish : trailBullish
-activeTrailVisual = useInvestorSignalMode ? investorTrailReference : visualTrailReference
 trailBandWidth = atrValue * TrailBandAtrWidth
 trailBandUpper = activeTrailVisual + trailBandWidth
 trailBandLower = activeTrailVisual - trailBandWidth
@@ -584,10 +642,33 @@ plotshape(showTrendOverlay and not na(close), "Trend Squares", style = shape.squ
 // ============================================================================================
 // SIGNAL / STRUCTURE / LIQUIDITY BUBBLES  (AddChartBubble)
 // ============================================================================================
-if showSignals and activeLongSignal
-    label.new(bar_index, low, str.tostring(activeConfidenceLevel), color = colBull, textcolor = color.white, style = label.style_label_up, size = size.small)
-if showSignals and activeShortSignal
-    label.new(bar_index, high, str.tostring(activeConfidenceLevel), color = colBear, textcolor = color.white, style = label.style_label_down, size = size.small)
+// ---- DYNAMIC: the original confidence bubbles, coloured by what the bot does:
+// green/red = enters here, grey = signal the bot does not take (too far -> retest, or climax veto)
+plainBubbles = visualEnabled and ShowConfidenceBubbles and not ShowDecisionBubbles
+cooldownOk = BubbleCooldownBars == 0 or printBubble
+if plainBubbles and activeLongSignal and cooldownOk
+    label.new(bar_index, low, str.tostring(activeConfidenceLevel), color = signalTake ? colBull : colGrey, textcolor = color.white, style = label.style_label_up, size = size.small)
+if plainBubbles and activeShortSignal and cooldownOk
+    label.new(bar_index, high, str.tostring(activeConfidenceLevel), color = signalTake ? colBear : colGrey, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// ---- DYNAMIC: verbose decision bubbles = "confidence | ATR from trail" + verdict (grey CLX = climax veto, purple wait = retest parked)
+decisionText = str.tostring(activeConfidenceLevel) + " | " + str.tostring(math.round(signalDistAtr, 1)) + "A" + (signalVetoed ? " CLX" : signalFar ? " wait " + str.tostring(math.round(retestLvl, 0)) : "")
+if showSignals and ShowDecisionBubbles and activeLongSignal and printBubble
+    label.new(bar_index, low, decisionText, color = signalVetoed ? colGrey : signalFar ? colNeutral : colBull, textcolor = color.white, style = label.style_label_up, size = size.small)
+if showSignals and ShowDecisionBubbles and activeShortSignal and printBubble
+    label.new(bar_index, high, decisionText, color = signalVetoed ? colGrey : signalFar ? colNeutral : colBear, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// RETEST bubble on the first touch of the parked retest level (shown in either bubble mode)
+if retestFirstFill and (plainBubbles or (showSignals and ShowDecisionBubbles))
+    label.new(bar_index, retestSide == 1 ? low : high, "RETEST", color = retestSide == 1 ? colBull : colBear, textcolor = color.white, style = retestSide == 1 ? label.style_label_up : label.style_label_down, size = size.small)
+
+plot(visualEnabled and retestOpen ? retestLvl : na, "Retest Level", color = retestSide == 1 ? colBull : colBear, linewidth = 2, style = plot.style_linebr, linestyle = plot.linestyle_dashed)
+
+// ---- DYNAMIC: entry arrows = the bars the bot actually enters on (market take, or the retest fill)
+longTakeBar  = (activeLongSignal and signalTake) or (retestFirstFill and retestSide == 1)
+shortTakeBar = (activeShortSignal and signalTake) or (retestFirstFill and retestSide == -1)
+plotshape(ShowEntryArrows and longTakeBar, "Long Entry Arrow", style = shape.arrowup, location = location.belowbar, color = colBull, size = size.normal)
+plotshape(ShowEntryArrows and shortTakeBar, "Short Entry Arrow", style = shape.arrowdown, location = location.abovebar, color = colBear, size = size.normal)
 if visualEnabled and ShowStructure and bullishStructureBreak
     label.new(bar_index, low, bullishChoch ? "CHoCH" : "BOS", color = bullishChoch ? colBullChoch : colBull, textcolor = color.white, style = label.style_label_up, size = size.small)
 if visualEnabled and ShowStructure and bearishStructureBreak
@@ -659,36 +740,178 @@ if visualEnabled and ShowLevels and barstate.islast
         entryLabel := label.new(bar_index, tradeEntry, "Entry " + str.tostring(math.round(tradeEntry * 100) / 100), color = colEntry, textcolor = color.white, style = tradeDirection == -1 ? label.style_label_up : label.style_label_down, size = size.small)
 
 // ============================================================================================
-// INFO TABLE  (AddLabel equivalents: Regime / Strength / Squeeze / Volume Sentiment / KNN note)
+// READOUT STRIP  (AddLabel equivalents, laid out like the Daily Bias / Px vs EMA readouts:
+// one row of coloured chips per label, with an edge-offset spacer so it stacks under them)
+//   row 1: ZONE verdict | conf | ATR from trail | volZ | reason        (last closed bar)
+//   row 2: last signal  | conf | ATR from trail | bot decision          (last closed bar)
+//   row 3: RVOL / Strength / Squeeze / Volume / KNN chips (when enabled)
 // ============================================================================================
-var table infoTable = table.new(position.top_right, 1, 5, border_width = 0)
+// DYNAMIC labels are evaluated on the last CLOSED bar (the bot's view). On the forming bar the trend/confidence
+// flip intrabar, which is the LONG -> SHORT -> LONG flicker; the bot never sees that bar until it closes.
+f_fmt(_v, _dec) =>
+    na(_v) ? "—" : str.tostring(math.round(_v, _dec))
+
+f_signed(_v, _dec) =>
+    na(_v) ? "—" : (_v >= 0 ? "+" : "") + str.tostring(math.round(_v, _dec))
+
+lblTrend = sharedTrendState[1]
+lblConf = activeConfidenceLevel[1]
+lblClimax = climaxBar[1]
+lblVolZ = volZ[1]
+curTrailDistAtr = lblTrend == 1 ? longTrailDistAtr[1] : lblTrend == -1 ? shortTrailDistAtr[1] : na
+
+// zone verdict for the current bar: green LONG ZONE, red SHORT ZONE, grey NO TRADE (with the reason)
+confOk = lblConf >= MinMlConfidence or (lblConf == 2 and curTrailDistAtr <= Conf2NearTrailAtr)
+zoneOk = not na(curTrailDistAtr) and curTrailDistAtr >= 0 and curTrailDistAtr <= ChaseAtr and not lblClimax and confOk
+labelLong = zoneOk and lblTrend == 1
+labelShort = zoneOk and lblTrend == -1
+labelReason = retestOpen ? 1 : na(curTrailDistAtr) ? 2 : lblClimax ? 3 : curTrailDistAtr > ChaseAtr ? 4 : not confOk ? 5 : 0
+reasonText = labelReason == 1 ? "Waiting " + (retestSide == 1 ? "long" : "short") + " pullback " + f_fmt(retestLvl, 2) + " (" + str.tostring(RetestBars - retestAge) + " bars)" :
+     labelReason == 2 ? "No trend" :
+     labelReason == 3 ? "Climax bar" :
+     labelReason == 4 ? "Too far from trail" :
+     labelReason == 5 ? "Conf 2 needs ≤ " + str.tostring(Conf2NearTrailAtr) + " ATR" : ""
+
+// the last CLOSED bar's signal event and the bot's decision on it
+sigL1 = activeLongSignal[1]
+sigS1 = activeShortSignal[1]
+fill1 = retestFirstFill[1]
+fillSide1 = retestSide[1]
+sigLong1 = fill1 ? fillSide1 == 1 : sigL1
+hasSig1 = fill1 or sigL1 or sigS1
+take1 = signalTake[1]
+far1 = signalFar[1]
+veto1 = signalVetoed[1]
+sigDist1 = signalDistAtr[1]
+sigRetest1 = nz(retestLvl[1])
+
+// chip colours (bright fills with contrasting text, same palette as the chart markers)
+colChipDark = color.rgb(67, 70, 81)
+f_confBg(_c) =>
+    _c >= 4 ? colNeutral : _c >= MinMlConfidence ? color.rgb(126, 87, 194) : _c == 2 ? colChipDark : color.gray
+f_distBg(_d) =>
+    na(_d) or _d < 0 ? color.gray : _d > ChaseAtr ? colTrailBear : colTrailBull
+f_distFg(_d) =>
+    na(_d) or _d < 0 ? color.white : color.black
+
+ReadoutPos    = input.string("Top Right", "Readout Position", options = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = "Readout")
+ReadoutOffset = input.float(12.0, "Readout Edge Offset (% of pane)", minval = 0, maxval = 50, step = 1, tooltip = "Pushes the strip away from the pane edge so it stacks under the Px vs EMA (6) and Daily Bias (9) readouts", group = "Readout")
+ReadoutSizeIn = input.string("Normal", "Readout Text Size", options = ["Small", "Normal", "Large"], group = "Readout")
+
+readoutPosition = switch ReadoutPos
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.top_right
+readoutSize = ReadoutSizeIn == "Small" ? size.small : ReadoutSizeIn == "Large" ? size.large : size.normal
+readoutTop  = str.startswith(ReadoutPos, "Top")
+
+// rows: spacer + zone + signal + info (the spacer sits on the pane-edge side)
+var table readout = table.new(readoutPosition, 5, 4, border_width = 1, border_color = color.new(color.black, 100))
+
+f_chip(_col, _row, _text, _bg, _fg) =>
+    table.cell(readout, _col, _row, _text, bgcolor = _bg, text_color = _fg, text_size = readoutSize)
 
 if barstate.islast
-    row = 0
+    table.clear(readout, 0, 0, 4, 3)
+    spacerRow = readoutTop ? 0 : 3
+    zoneRow   = readoutTop ? 1 : 0
+    sigRow    = readoutTop ? 2 : 1
+    infoRow   = readoutTop ? 3 : 2
+    if ReadoutOffset > 0
+        table.cell(readout, 0, spacerRow, "", height = ReadoutOffset)
+
+    if ShowDynamicLabel
+        f_chip(0, zoneRow, labelLong ? "LONG ZONE" : labelShort ? "SHORT ZONE" : "NO TRADE",
+             labelLong ? colBull : labelShort ? colBear : color.gray, labelLong ? color.black : color.white)
+        f_chip(1, zoneRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white)
+        f_chip(2, zoneRow, f_signed(curTrailDistAtr, 1) + " ATR", f_distBg(curTrailDistAtr), f_distFg(curTrailDistAtr))
+        f_chip(3, zoneRow, "volZ " + f_signed(lblVolZ, 1), lblClimax ? colTrailBear : colChipDark, lblClimax ? color.black : color.white)
+        if labelReason != 0
+            f_chip(4, zoneRow, reasonText, labelReason == 1 ? colNeutral : colChipDark, color.white)
+
+    if ShowSignalLabel
+        if not hasSig1
+            f_chip(0, sigRow, "No signal", colChipDark, color.white)
+        else if fill1
+            f_chip(0, sigRow, sigLong1 ? "LONG ENTRY" : "SHORT ENTRY", sigLong1 ? colBull : colBear, sigLong1 ? color.black : color.white)
+            f_chip(1, sigRow, "Pullback fill " + f_fmt(sigRetest1, 2), colNeutral, color.white)
+        else
+            takeBg = sigLong1 ? colBull : colBear
+            f_chip(0, sigRow, sigLong1 ? "LONG signal" : "SHORT signal", take1 ? takeBg : color.gray, take1 and sigLong1 ? color.black : color.white)
+            f_chip(1, sigRow, "Conf " + str.tostring(lblConf) + "/5", f_confBg(lblConf), color.white)
+            f_chip(2, sigRow, f_signed(sigDist1, 1) + " ATR", f_distBg(sigDist1), f_distFg(sigDist1))
+            if veto1
+                f_chip(3, sigRow, "SKIPPED: climax bar", colTrailBear, color.black)
+            else if far1
+                f_chip(3, sigRow, "NOT CHASED: pullback " + f_fmt(sigRetest1, 2), colNeutral, color.white)
+            else
+                f_chip(3, sigRow, "BOT ENTERS", takeBg, sigLong1 ? color.black : color.white)
+
+    col = 0
     if ShowRegime and visualEnabled
-        table.cell(infoTable, 0, row, "RVOL " + str.tostring(math.round(relativeVolumeValue * 100) / 100) + " | ATR Regime " + str.tostring(math.round(volatilityRegimeValue * 100) / 100), text_color = color.white, bgcolor = colNeutral)
-        row += 1
+        f_chip(col, infoRow, "RVOL " + f_fmt(relativeVolumeValue, 2) + " | ATR Regime " + f_fmt(volatilityRegimeValue, 2), colNeutral, color.white)
+        col += 1
     if ShowStrength and visualEnabled
-        table.cell(infoTable, 0, row, "Strength " + str.tostring(math.round(strengthValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
-        row += 1
+        f_chip(col, infoRow, "Strength " + f_fmt(strengthValue, 2) + "%", colNeutral, color.white)
+        col += 1
     if ShowSqueeze and visualEnabled
-        table.cell(infoTable, 0, row, "Squeeze " + str.tostring(math.round(squeezeValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
-        row += 1
+        f_chip(col, infoRow, "Squeeze " + f_fmt(squeezeValue, 2) + "%", colNeutral, color.white)
+        col += 1
     if ShowVolumeSentiment and visualEnabled
-        table.cell(infoTable, 0, row, "Volume " + str.tostring(math.round(volumeSentimentValue * 100) / 100) + "%", text_color = color.white, bgcolor = colNeutral)
-        row += 1
+        f_chip(col, infoRow, "Volume " + f_fmt(volumeSentimentValue, 2) + "%", colNeutral, color.white)
+        col += 1
     if UseKnnFilter
-        table.cell(infoTable, 0, row, "KNN filter omitted in Pine conversion: pass-through", text_color = color.gray, bgcolor = color.new(color.gray, 85))
-        row += 1
+        f_chip(col, infoRow, "KNN omitted: pass-through", color.gray, color.white)
+        col += 1
 
 // ============================================================================================
 // ALERTS
 // ============================================================================================
-alertcondition(activeLongSignal, title = "Bullish ML Confidence Signal", message = "Bullish ML Confidence Signal")
-alertcondition(activeShortSignal, title = "Bearish ML Confidence Signal", message = "Bearish ML Confidence Signal")
+// climax-vetoed signals do not alert (the bot skips them)
+alertcondition(activeLongSignal and not signalVetoed, title = "Bullish ML Confidence Signal", message = "Bullish ML Confidence Signal")
+alertcondition(activeShortSignal and not signalVetoed, title = "Bearish ML Confidence Signal", message = "Bearish ML Confidence Signal")
+alertcondition(retestFirstFill, title = "LASOMA Retest Touched", message = "LASOMA retest level touched")
 
-if EnableAlerts and activeLongSignal
+if EnableAlerts and activeLongSignal and not signalVetoed
     alert("Bullish ML Confidence Signal", alert.freq_once_per_bar_close)
-if EnableAlerts and activeShortSignal
+if EnableAlerts and activeShortSignal and not signalVetoed
     alert("Bearish ML Confidence Signal", alert.freq_once_per_bar_close)
+if EnableAlerts and retestFirstFill
+    alert("LASOMA retest level touched", alert.freq_once_per_bar_close)
+
+// ============================================================================================
+// SCAN  (TOS drop-down scan extension -> hidden 1/0 "Scan" plot for Pine Screener + alert condition)
+// ============================================================================================
+ScanChoice = input.string("Bullish Signal Flip", "Scan Mode", options = ["Bullish Signal Flip", "Bearish Signal Flip", "Bullish Trend Flip", "Bearish Trend Flip",
+     "ML Score Bullish Flip (60+)", "ML Score Bearish Flip (40-)", "High Confidence Bullish (L4+)", "High Confidence Bearish (L4+)",
+     "Scalping Bullish Score Change", "Scalping Bearish Score Change"], group = "Scan")
+
+scanIsMinConfidenceMet = activeConfidenceLevel >= MinMlConfidence
+scanIsHighConfidence   = activeConfidenceLevel >= 4
+scanConfidenceUpgraded = activeConfidenceLevel > activeConfidenceLevel[1]
+scanBullishSignalFlip  = activeLongSignal and not activeLongSignal[1]
+scanBearishSignalFlip  = activeShortSignal and not activeShortSignal[1]
+scanBullishTrendFlip   = sharedTrendBullish and not sharedTrendBullish[1]
+scanBearishTrendFlip   = sharedTrendBearish and not sharedTrendBearish[1]
+scanMlScoreBullishFlip = activeModelScore >= MlBullThreshold and activeModelScore[1] < MlBullThreshold
+scanMlScoreBearishFlip = activeModelScore <= MlBearThreshold and activeModelScore[1] > MlBearThreshold
+
+scanCondition = switch ScanChoice
+    "Bullish Signal Flip"           => scanBullishSignalFlip
+    "Bearish Signal Flip"           => scanBearishSignalFlip
+    "Bullish Trend Flip"            => scanBullishTrendFlip and scanIsMinConfidenceMet
+    "Bearish Trend Flip"            => scanBearishTrendFlip and scanIsMinConfidenceMet
+    "ML Score Bullish Flip (60+)"   => scanMlScoreBullishFlip and scanIsMinConfidenceMet
+    "ML Score Bearish Flip (40-)"   => scanMlScoreBearishFlip and scanIsMinConfidenceMet
+    "High Confidence Bullish (L4+)" => sharedTrendBullish and scanIsHighConfidence and (scanBullishTrendFlip or scanConfidenceUpgraded)
+    "High Confidence Bearish (L4+)" => sharedTrendBearish and scanIsHighConfidence and (scanBearishTrendFlip or scanConfidenceUpgraded)
+    "Scalping Bullish Score Change" => scalpingBullishScoreChange
+    "Scalping Bearish Score Change" => scalpingBearishScoreChange
+    => false
+
+plot(scanCondition ? 1 : 0, "Scan", display = display.data_window)
+alertcondition(scanCondition, title = "LASOMA Scan Match", message = "LASOMA scan match")
 
