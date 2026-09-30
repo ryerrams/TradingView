@@ -1,0 +1,299 @@
+//@version=6
+// Daily Bias Indicator — Pine v6 port of the NinjaTrader 8 DailyBiasIndicator.cs
+//
+// Plots a single letter under price at a configurable interval (default every
+// 30 minutes from session start): L (Long bias), S (Short bias), or N (Neutral),
+// computed from where price sits relative to the PRIOR session's Value Area.
+// The value area is built from bar data (typical price weighted by bar volume,
+// bucketed into fixed-size price bins) — no tick data required.
+//
+// Bias logic:
+//   - Close > prior VAH -> leaning Long
+//   - Close < prior VAL -> leaning Short
+//   - otherwise         -> Neutral (applied immediately, no confirmation delay)
+// A Long/Short lean becomes the confirmed bias only after holding for
+// "Flip Confirmation Bars" consecutive bars.
+//
+// With the intraday qualifier on, "l" / "s" mean the macro bias is Long/Short
+// but price is on the wrong side of TODAY's developing POC.
+//
+// Letters: bright color = the confirmed bias changed since the last letter,
+// dim color = continuation of the same bias.
+//
+// Also draws the prior session's VAH/POC/VAL as flat reference lines, today's
+// developing VAH/POC/VAL as live plots, optional entry/exit bubbles, and a
+// one-line readout strip (current bias + prior VAH/POC/VAL).
+//
+// Differences vs. the NT8 original:
+//   - Today's live VA is always computed (the letter/bubble qualifiers need it);
+//     "Show Today's Live VAH/POC/VAL Bands" only controls whether it's plotted.
+//   - Session boundaries follow the chart's session setting (RTH vs ETH),
+//     the equivalent of NT's trading-hours template.
+//   - On the live bar, values update intrabar and settle at bar close (Pine
+//     rolls back uncommitted state, so the final result matches OnBarClose).
+indicator("Daily Bias Indicator", shorttitle="DailyBias", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ── Inputs ──────────────────────────────────────────────
+grpP = "Parameters"
+grpV = "Visuals"
+grpC = "Colors"
+
+plotInterval   = input.int(30, "Plot Interval (minutes)", minval=0, maxval=240, group=grpP, tooltip="0 = print a letter on every bar")
+vaPct          = input.float(0.70, "Value Area %", minval=0.5, maxval=0.95, step=0.05, group=grpP)
+bucketPts      = input.float(1.0, "Profile Bucket Size (pts)", minval=0.25, maxval=20.0, step=0.25, group=grpP)
+flipBars       = input.int(2, "Flip Confirmation Bars", minval=1, maxval=20, group=grpP)
+useQual        = input.bool(true, "Use Intraday Structure Qualifier (L/l, S/s vs today's POC)", group=grpP)
+
+showRef        = input.bool(true, "Show Prior VAH/POC/VAL Lines", group=grpV)
+showLive       = input.bool(true, "Show Today's Live VAH/POC/VAL Bands", group=grpV)
+letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxval=50, group=grpV)
+letterSizeIn   = input.string("Normal", "Letter Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpV)
+showBubbles    = input.bool(true, "Show Long/Short Entry-Exit Bubbles", group=grpV)
+useQualBubbles = input.bool(true, "Bubbles React to Today's POC (not just macro flips)", group=grpV)
+bubbleOffset   = input.int(14, "Bubble Offset (ticks from bar)", minval=0, maxval=100, group=grpV)
+showReadout    = input.bool(true, "Show Readout Strip", group=grpV)
+readoutPos     = input.string("Top Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV, tooltip="Top Right + 9% offset stacks it just under the ATR Stretch label (Top Right, 6% offset)")
+readoutOffset  = input.float(9.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV, tooltip="Distance from the pane edge. Nudge up/down (0.5 steps) to sit flush under the ATR Stretch label on your pane height.")
+readoutSizeIn  = input.string("Normal", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
+
+flipLongCol    = input.color(color.lime,  "Flip to Long", group=grpC)
+contLongCol    = input.color(#3CB371,     "Continuation Long", group=grpC)
+flipShortCol   = input.color(color.red,   "Flip to Short", group=grpC)
+contShortCol   = input.color(#CD5C5C,     "Continuation Short", group=grpC)
+flipNeutralCol = input.color(color.white, "Flip to Neutral", group=grpC)
+contNeutralCol = input.color(#D3D3D3,     "Continuation Neutral", group=grpC)
+enterLongCol   = input.color(#32CD32,     "Enter Long Bubble", group=grpC)
+exitLongCol    = input.color(#FF4500,     "Exit Long Bubble", group=grpC)
+enterShortCol  = input.color(#FF6347,     "Enter Short Bubble", group=grpC)
+exitShortCol   = input.color(#00BFFF,     "Exit Short Bubble", group=grpC)
+priorVaCol     = input.color(#1E90FF,     "Prior VAH/VAL Line", group=grpC)
+priorPocCol    = input.color(#FFD700,     "Prior POC Line", group=grpC)
+liveVahCol     = input.color(#00FFFF,     "Today VAH", group=grpC)
+livePocCol     = input.color(color.yellow, "Today POC", group=grpC)
+liveValCol     = input.color(#FF00FF,     "Today VAL", group=grpC)
+
+letterSize = letterSizeIn == "Tiny" ? size.tiny : letterSizeIn == "Small" ? size.small : letterSizeIn == "Normal" ? size.normal : letterSizeIn == "Large" ? size.large : size.huge
+
+enum Bias
+    neutral
+    long
+    short
+
+// ── Value Area calc ─────────────────────────────────────
+// Expand from the POC by whichever adjacent bucket has more volume until
+// vaPct of total volume is captured. Returns [vah, poc, val] (na if empty).
+valueArea(map<float, float> hist, float pct) =>
+    float vah = na
+    float poc = na
+    float val = na
+    if hist.size() > 0
+        keys = hist.keys()   // copy, in insertion order
+        float total  = 0.0
+        float maxVol = -1.0
+        float pocKey = na
+        for k in keys
+            v = hist.get(k)
+            total += v
+            if v > maxVol    // strict > keeps the first-inserted key on ties (matches LINQ stable sort)
+                maxVol := v
+                pocKey := k
+        if total > 0
+            keys.sort(order.ascending)
+            int pocIdx = keys.indexof(pocKey)
+            int upIdx  = pocIdx
+            int loIdx  = pocIdx
+            float vahL = pocKey
+            float valL = pocKey
+            float cum  = maxVol
+            while cum < total * pct
+                bool hasUp = upIdx + 1 < keys.size()
+                bool hasLo = loIdx - 1 >= 0
+                if not hasUp and not hasLo
+                    break
+                float upVol = -1.0
+                float loVol = -1.0
+                if hasUp
+                    upVol := hist.get(keys.get(upIdx + 1))
+                if hasLo
+                    loVol := hist.get(keys.get(loIdx - 1))
+                if upVol >= loVol
+                    upIdx += 1
+                    vahL := keys.get(upIdx)
+                    cum += upVol
+                else
+                    loIdx -= 1
+                    valL := keys.get(loIdx)
+                    cum += loVol
+            vah := vahL
+            poc := pocKey
+            val := valL
+    [vah, poc, val]
+
+// ── State ───────────────────────────────────────────────
+var map<float, float> volumeByPrice = map.new<float, float>()
+
+var float priorVah = na
+var float priorVal = na
+var float priorPoc = na
+var bool  havePrior = false
+var int   sessionStartBar = 0
+var int   sessionStartTime = time
+
+var Bias  rawLean = Bias.neutral
+var int   leanStreak = 0
+var Bias  confirmed = Bias.neutral
+var Bias  lastPrinted = Bias.neutral
+var bool  prevStrongLong = false
+var bool  prevStrongShort = false
+var float lastCheckpointElapsed = -1.0
+
+var line lnVah = na
+var line lnPoc = na
+var line lnVal = na
+
+// ── Session rollover ────────────────────────────────────
+if session.isfirstbar or bar_index == 0
+    sessionStartBar := bar_index
+    if volumeByPrice.size() > 0
+        [pVah, pPoc, pVal] = valueArea(volumeByPrice, vaPct)
+        if not na(pPoc)
+            priorVah  := pVah
+            priorPoc  := pPoc
+            priorVal  := pVal
+            havePrior := true
+    volumeByPrice.clear()
+    rawLean               := Bias.neutral
+    leanStreak            := 0
+    confirmed             := Bias.neutral
+    lastPrinted           := Bias.neutral
+    prevStrongLong        := false
+    prevStrongShort       := false
+    lastCheckpointElapsed := -1.0
+    sessionStartTime      := time
+    lnVah := na
+    lnPoc := na
+    lnVal := na
+
+float liveVah = na
+float livePoc = na
+float liveVal = na
+
+if bar_index >= 2
+    // Accumulate this bar into today's histogram
+    if not na(volume) and volume > 0
+        bucket = math.round(hlc3 / bucketPts) * bucketPts
+        volumeByPrice.put(bucket, nz(volumeByPrice.get(bucket)) + volume)
+
+    // Today's developing VAH/POC/VAL
+    if volumeByPrice.size() > 0
+        [a, b, c] = valueArea(volumeByPrice, vaPct)
+        liveVah := a
+        livePoc := b
+        liveVal := c
+
+    if havePrior
+        Bias curRaw = close > priorVah ? Bias.long : close < priorVal ? Bias.short : Bias.neutral
+        if curRaw == rawLean
+            leanStreak += 1
+        else
+            rawLean    := curRaw
+            leanStreak := 1
+
+        if rawLean != Bias.neutral and leanStreak >= flipBars
+            confirmed := rawLean
+        else if rawLean == Bias.neutral
+            confirmed := Bias.neutral   // back inside value area = neutral immediately
+
+        if showBubbles
+            haveToday     = useQualBubbles and volumeByPrice.size() > 0
+            aboveTodayPoc = haveToday and close > livePoc
+
+            // "Strong" = confirmed macro bias AND (if qualifier on) on the right side of today's POC.
+            curStrongLong  = confirmed == Bias.long  and (not haveToday or aboveTodayPoc)
+            curStrongShort = confirmed == Bias.short and (not haveToday or not aboveTodayPoc)
+
+            belowY = low  - bubbleOffset * syminfo.mintick
+            aboveY = high + bubbleOffset * syminfo.mintick
+
+            if curStrongLong and not prevStrongLong
+                label.new(bar_index, belowY, "Long", yloc=yloc.price, style=label.style_label_up, color=enterLongCol, textcolor=color.black, size=size.small)
+            if prevStrongLong and not curStrongLong
+                label.new(bar_index, aboveY, "Exit Long", yloc=yloc.price, style=label.style_label_down, color=exitLongCol, textcolor=color.white, size=size.small)
+            if curStrongShort and not prevStrongShort
+                label.new(bar_index, aboveY, "Short", yloc=yloc.price, style=label.style_label_down, color=enterShortCol, textcolor=color.white, size=size.small)
+            if prevStrongShort and not curStrongShort
+                label.new(bar_index, belowY, "Exit Short", yloc=yloc.price, style=label.style_label_up, color=exitShortCol, textcolor=color.black, size=size.small)
+
+            prevStrongLong  := curStrongLong
+            prevStrongShort := curStrongShort
+
+    // Prior session VAH/POC/VAL as flat lines spanning the current session
+    if showRef and havePrior
+        x1 = bar_index - math.max(1, bar_index - sessionStartBar)
+        if na(lnVah)
+            lnVah := line.new(x1, priorVah, bar_index, priorVah, color=priorVaCol, width=2)
+            lnPoc := line.new(x1, priorPoc, bar_index, priorPoc, color=priorPocCol, width=2)
+            lnVal := line.new(x1, priorVal, bar_index, priorVal, color=priorVaCol, width=2)
+        else
+            lnVah.set_x2(bar_index)
+            lnPoc.set_x2(bar_index)
+            lnVal.set_x2(bar_index)
+
+    // Bias letter at each interval checkpoint
+    elapsed = (time - sessionStartTime) / 60000.0
+    crossed = plotInterval <= 0 or math.floor(elapsed / plotInterval) > math.floor(lastCheckpointElapsed / plotInterval)
+
+    if crossed and havePrior
+        haveToday     = useQual and volumeByPrice.size() > 0
+        aboveTodayPoc = haveToday and close > livePoc
+
+        string letter = switch confirmed
+            Bias.long  => not haveToday or aboveTodayPoc ? "L" : "l"      // "l" = long but today's POC lost
+            Bias.short => not haveToday or not aboveTodayPoc ? "S" : "s"  // "s" = short but today's POC reclaimed
+            => "N"
+
+        isFlip = confirmed != lastPrinted
+        color col = switch confirmed
+            Bias.long  => isFlip ? flipLongCol : contLongCol
+            Bias.short => isFlip ? flipShortCol : contShortCol
+            => isFlip ? flipNeutralCol : contNeutralCol
+
+        label.new(bar_index, low - letterOffset * syminfo.mintick, letter, yloc=yloc.price, style=label.style_none, textcolor=col, size=letterSize)
+        lastPrinted := confirmed
+    lastCheckpointElapsed := elapsed
+
+// ── Live plots ──────────────────────────────────────────
+plot(showLive ? liveVah : na, "Today VAH", color=liveVahCol, linewidth=2)
+plot(showLive ? livePoc : na, "Today POC", color=livePocCol, linewidth=2)
+plot(showLive ? liveVal : na, "Today VAL", color=liveValCol, linewidth=2)
+
+// ── Readout strip: [Bias] [Prior VAH] [Prior POC] [Prior VAL] in one row ──
+fmt(float v) => na(v) ? "—" : str.tostring(v, format.mintick)
+
+readoutPosition = switch readoutPos
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.top_right
+readoutSize = readoutSizeIn == "Small" ? size.small : readoutSizeIn == "Large" ? size.large : size.normal
+readoutTop  = str.startswith(readoutPos, "Top")
+
+// Two rows: an empty spacer row on the pane-edge side, then the strip itself.
+var table readout = table.new(readoutPosition, 4, 2)
+if showReadout and barstate.islast
+    haveToday = useQual and volumeByPrice.size() > 0
+    aboveTodayPoc = haveToday and close > livePoc
+    [biasTxt, biasBg, biasFg] = switch confirmed
+        Bias.long  => [not haveToday or aboveTodayPoc ? "Bias L" : "Bias l", flipLongCol, color.black]
+        Bias.short => [not haveToday or not aboveTodayPoc ? "Bias S" : "Bias s", flipShortCol, color.white]
+        => ["Bias N", color.gray, color.white]
+    spacerRow = readoutTop ? 0 : 1
+    stripRow  = readoutTop ? 1 : 0
+    if readoutOffset > 0
+        readout.cell(0, spacerRow, "", height=readoutOffset)
+    readout.cell(0, stripRow, havePrior ? biasTxt : "Bias —", bgcolor=havePrior ? biasBg : color.gray, text_color=havePrior ? biasFg : color.white, text_size=readoutSize)
+    readout.cell(1, stripRow, "Prior VAH " + fmt(priorVah), bgcolor=priorVaCol, text_color=color.white, text_size=readoutSize)
+    readout.cell(2, stripRow, "POC " + fmt(priorPoc), bgcolor=priorPocCol, text_color=color.black, text_size=readoutSize)
+    readout.cell(3, stripRow, "VAL " + fmt(priorVal), bgcolor=priorVaCol, text_color=color.white, text_size=readoutSize)

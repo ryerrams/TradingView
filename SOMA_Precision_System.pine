@@ -31,7 +31,8 @@ sessionLevelsLayer         = input.bool(false, "Session Levels Layer",         g
 turnSignalsLayer           = input.bool(true,  "Turn Signals Layer",           group=GD, tooltip="Historical Turn arrows and the latest Turn plan.")
 precisionTradesLayer       = input.bool(true,  "Precision Trades Layer",       group=GD, tooltip="Historical Shotgun arrows and the latest precision trade plan.")
 continuationSignalsLayer   = input.bool(true,  "Continuation Signals Layer",   group=GD, tooltip="Confirmed-trend pullback/resumption signals; separate from Turn and Shotgun entries.")
-showTodaysSignals          = input.bool(true,  "Show Today's Signals",         group=GD, tooltip="Mark earlier actionable entries from the current intraday session.")
+signalMarkersIn            = input.string("Latest Only", "Signal Markers", options=["Latest Only", "All History"], group=GD, tooltip="Latest Only: one marker per signal type (Structure, Turn, Continuation, Shotgun), moved to the newest signal; older triangles/arrows and today's earlier-entry dots are hidden. All History: every signal stays on the chart.")
+showTodaysSignals          = input.bool(true,  "Show Today's Signals",         group=GD, tooltip="Mark earlier actionable entries from the current intraday session (All History mode only).")
 showHistoricalSignalLabels = input.bool(false, "Show Historical Signal Labels", group=GD, tooltip="Add a compact BUY/SELL price bubble to earlier signals.")
 showSignalGateDiagnostics  = input.bool(false, "Show Signal Gate Diagnostics", group=GD, tooltip="Show the current Turn and Shotgun gate states for troubleshooting.")
 showTradePlanBubbles       = input.bool(false, "Show Trade Plan Bubbles",      group=GD, tooltip="Show entry, stop, target, and exit bubbles for the newest plan.")
@@ -42,6 +43,12 @@ labelSizeIn                = input.string("Normal", "Info Panel Text Size", opti
 showLineTags               = input.bool(true, "Show Plan Line Tags", group=GD, tooltip="Name and price at the right end of the entry, stop, and target lines.")
 cooldownFromIn             = input.string("Last Fired Signal", "Cooldown Counts From", options=["Last Fired Signal", "Last Setup (TOS original)"], group=GD, tooltip="Last Fired Signal: a blocked setup does not restart the cooldown, so a run of setups every 1-2 bars cannot suppress every entry. Last Setup: original thinkorswim behavior.")
 cooldownFromSignal         = cooldownFromIn == "Last Fired Signal"
+latestOnly                 = signalMarkersIn == "Latest Only"
+
+// Latest-only markers: delete the previous marker of this type and draw the new one.
+f_moveMarker(label prev, int x, bool below, string st, color c, string sz) =>
+    label.delete(prev)
+    label.new(x, close, "", yloc=below ? yloc.belowbar : yloc.abovebar, style=st, color=c, size=sz)
 
 showBands            = trendBandsLayer
 colorTrendBars       = trendBandsLayer
@@ -332,8 +339,11 @@ else if qStructBear3
     structState := -1
 structBullOnce = qStructBull3 and prevStructState != 1
 structBearOnce = qStructBear3 and prevStructState != -1
-plotshape(showStructureArrows and structBullOnce, "Structure Bull", shape.arrowup,   location.belowbar, color.yellow, offset=-3, size=size.small)
-plotshape(showStructureArrows and structBearOnce, "Structure Bear", shape.arrowdown, location.abovebar, cPlum,        offset=-3, size=size.small)
+plotshape(not latestOnly and showStructureArrows and structBullOnce, "Structure Bull", shape.arrowup,   location.belowbar, color.yellow, offset=-3, size=size.small)
+plotshape(not latestOnly and showStructureArrows and structBearOnce, "Structure Bear", shape.arrowdown, location.abovebar, cPlum,        offset=-3, size=size.small)
+var label structMarker = na
+if latestOnly and showStructureArrows and (structBullOnce or structBearOnce)
+    structMarker := f_moveMarker(structMarker, bar_index - 3, structBullOnce, structBullOnce ? label.style_arrowup : label.style_arrowdown, structBullOnce ? color.yellow : cPlum, size.small)
 
 // -----------------------------------------------------------------------------
 // LIS: captured 4:00 PM five-minute close
@@ -527,8 +537,11 @@ turnPlanActive := anyTurnSignal ? true : (isIntraday and newChartDay) ? false : 
 turnTPExitEvent      = prevTurnPlanActive and turnPlanCompleted and not anyTurnSignal
 turnInvalidExitEvent = prevTurnPlanActive and turnPlanInvalidated and not anyTurnSignal
 
-plotshape(showTurnSignals and turnUpSignal,   "Turn Up",   shape.triangleup,   location.belowbar, cTrendyBull, size=size.small)
-plotshape(showTurnSignals and turnDownSignal, "Turn Down", shape.triangledown, location.abovebar, cTrendyBear, size=size.small)
+plotshape(not latestOnly and showTurnSignals and turnUpSignal,   "Turn Up",   shape.triangleup,   location.belowbar, cTrendyBull, size=size.small)
+plotshape(not latestOnly and showTurnSignals and turnDownSignal, "Turn Down", shape.triangledown, location.abovebar, cTrendyBear, size=size.small)
+var label turnMarker = na
+if latestOnly and showTurnSignals and (turnUpSignal or turnDownSignal)
+    turnMarker := f_moveMarker(turnMarker, bar_index, turnUpSignal, turnUpSignal ? label.style_triangleup : label.style_triangledown, turnUpSignal ? cTrendyBull : cTrendyBear, size.small)
 
 // -----------------------------------------------------------------------------
 // Confirmed-trend continuation entries
@@ -552,8 +565,11 @@ contLongSignal  = contLongEdge and contCooldownReady
 contShortSignal = contShortEdge and contCooldownReady
 barsSinceContSignal := (contLongSignal or contShortSignal) ? 0 : math.min(barsSinceContSignal + 1, 100000)
 
-plotshape(continuationSignalsLayer and signalWindow and contLongSignal,  "Continuation Long",  shape.triangleup,   location.belowbar, color.aqua,   size=size.tiny)
-plotshape(continuationSignalsLayer and signalWindow and contShortSignal, "Continuation Short", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+plotshape(not latestOnly and continuationSignalsLayer and signalWindow and contLongSignal,  "Continuation Long",  shape.triangleup,   location.belowbar, color.aqua,   size=size.tiny)
+plotshape(not latestOnly and continuationSignalsLayer and signalWindow and contShortSignal, "Continuation Short", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+var label contMarker = na
+if latestOnly and continuationSignalsLayer and signalWindow and (contLongSignal or contShortSignal)
+    contMarker := f_moveMarker(contMarker, bar_index, contLongSignal, contLongSignal ? label.style_triangleup : label.style_triangledown, contLongSignal ? color.aqua : color.orange, size.tiny)
 if showHistoricalSignalLabels and continuationSignalsLayer and contLongSignal
     label.new(bar_index, low, "CONT BUY " + f_p(close), style=label.style_label_up, color=color.aqua, textcolor=color.black, size=size.small)
 if showHistoricalSignalLabels and continuationSignalsLayer and contShortSignal
@@ -682,8 +698,11 @@ shotgunPlanActive := anyShotgunSignal ? true : (isIntraday and newChartDay) ? fa
 shotgunTPExitEvent   = prevShotgunPlanActive and shotgunPlanCompleted and not anyShotgunSignal
 shotgunStopExitEvent = prevShotgunPlanActive and shotgunPlanStopped and not anyShotgunSignal
 
-plotshape(showShotgunLevels and shotgunLongSignal,  "Shotgun Long",  shape.triangleup,   location.belowbar, cTrendyBull, size=size.normal)
-plotshape(showShotgunLevels and shotgunShortSignal, "Shotgun Short", shape.triangledown, location.abovebar, cTrendyBear, size=size.normal)
+plotshape(not latestOnly and showShotgunLevels and shotgunLongSignal,  "Shotgun Long",  shape.triangleup,   location.belowbar, cTrendyBull, size=size.normal)
+plotshape(not latestOnly and showShotgunLevels and shotgunShortSignal, "Shotgun Short", shape.triangledown, location.abovebar, cTrendyBear, size=size.normal)
+var label shotgunMarker = na
+if latestOnly and showShotgunLevels and (shotgunLongSignal or shotgunShortSignal)
+    shotgunMarker := f_moveMarker(shotgunMarker, bar_index, shotgunLongSignal, shotgunLongSignal ? label.style_triangleup : label.style_triangledown, shotgunLongSignal ? cTrendyBull : cTrendyBear, size.normal)
 
 // -----------------------------------------------------------------------------
 // Newest plan ownership (replaces HighestAll signal/exit bars)
@@ -726,7 +745,7 @@ if newEnabledShotgunPlan
 
 if newCombinedPlan
     // Earlier actionable entries from the current chart day get a point marker.
-    if showTodaysSignals and isIntraday and not na(prevCombBar) and f_dateKey(prevCombTime) == lastDateKey
+    if showTodaysSignals and not latestOnly and isIntraday and not na(prevCombBar) and f_dateKey(prevCombTime) == lastDateKey
         pc = prevCombDir == 1 ? cTrendyBull : cTrendyBear
         label.new(prevCombBar, prevCombEntry, "", style=label.style_circle, color=pc, size=size.tiny)
         if showHistoricalSignalLabels
