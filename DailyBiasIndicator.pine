@@ -1,189 +1,205 @@
 //@version=6
-// Daily Bias Indicator — Pine v6 port of the NinjaTrader 8 DailyBiasIndicator.cs
+// Daily Bias Indicator — Pine v6 port of the thinkScript "Daily/Hourly Tail
+// Confluence" study, whose Daily Bias section is itself a port of the NinjaTrader 8
+// DailyBiasIndicator. Signal logic follows the thinkScript line for line; the chart
+// extras from the earlier NT8 port are kept on top.
 //
-// Plots a single letter under price at a configurable interval (default every
-// 30 minutes from session start): L (Long bias), S (Short bias), or N (Neutral),
-// computed from where price sits relative to the PRIOR session's Value Area.
-// The value area is built from bar data (typical price weighted by bar volume,
-// bucketed into fixed-size price bins) — no tick data required.
+// Two volume profiles are built from bar data at tick resolution (each bar's volume
+// spread evenly across the rows it traded):
+//   - DAY profile: rolls when the trading date changes (thinkScript GetYYYYMMDD), so
+//     on an ETH futures chart one day runs 18:00-17:00 ET, overnight + RTH together.
+//   - HOUR profile: rolls on each clock hour (ET).
+// At each day roll the finished day's value area (default 68%) becomes pVAH/pVAL and
+// its POC becomes pPOC; the last five day POCs are kept as targets.
 //
-// Bias logic:
-//   - Close > prior VAH -> leaning Long
-//   - Close < prior VAL -> leaning Short
-//   - otherwise         -> Neutral (applied immediately, no confirmation delay)
-// A Long/Short lean becomes the confirmed bias only after holding for
-// "Flip Confirmation Bars" consecutive bars.
+// 1) Daily Bias (thinkScript bubble codes):
+//      FBO-Short / FBD-Long  wick past pVAH/pVAL + zone buffer that closes back
+//                            inside; watch for a rotation to the opposite edge
+//      POC-X                 that rotation crossing pPOC
+//      BTC / STC             the rotation reached its target
+//      RS-BTC / RS-STC       it reversed Stall Rebound pts first (hidden by default)
+//      BO-Long / BD-Short    close-confirmed break of pVAH/pVAL (held Flip Confirmation bars)
+//      BO-STC / BD-BTC       that confirmed bias went away: exit the continuation
+//    The down and up rotation watches are independent. A watch voided by the bias
+//    breaking back out ends with no bubble, same as both originals.
+// 2) Hourly tail confluence: the lows (highs) of the last N hourly profiles cluster
+//    within tolerance of the day low (high) and price is back off it -> LONG (SHORT),
+//    at most once per side per day. Target 1 = today's dPOC; Target 2 = the nearest
+//    prior-day POC beyond every closer one (up to 5 days back).
+// 3) Trailing stop: starts at the day low (high), ratchets once per hour to the last
+//    completed hour's VAL (VAH) or extreme. STOPPED OUT when a close crosses it;
+//    CONTINUATION if price later closes back through that same level.
+// 4) Extended target: when price trades through the Target 2 frozen at the last
+//    signal, prints the next prior-day POC beyond it.
 //
-// With the intraday qualifier on, "l" / "s" mean the macro bias is Long/Short
-// but price is on the wrong side of TODAY's developing POC.
+// Extras not in the thinkScript: L/S/N bias letters, shaded pVAH/pVAL boxes with
+// names, dVAH/dPOC/dVAL stubs, hover help, the readout strip, dotted FBO/FBD target
+// lines, optional today-POC entry/exit bubbles and an optional volume-spike cap.
 //
-// Letters: bright color = the confirmed bias changed since the last letter,
-// dim color = continuation of the same bias.
-//
-// Auction Market Theory rotation labels (port of the NT8 indicator's
-// RotationState machine; text-only markers, no orders):
-//   - FAILED BREAKOUT: bar's high pokes above prior VAH + Zone Width but the
-//     bar CLOSES back at/below VAH (wick-based, edge-triggered) -> "Failed
-//     Breakout / Target: Prior VAL" and a watch down to VAL (SHORT idea).
-//   - FAILED BREAKDOWN: mirror -> "Target: Prior VAH" (LONG idea).
-//   - While watching: "Crossing POC" once price closes through the prior POC;
-//     "Rotation Complete" when the opposite edge trades; "Rotation Stalled
-//     (reversed early)" if price rebounds Stall Rebound pts off its best
-//     price; the watch is silently cancelled if the confirmed bias breaks back
-//     out the original way.
-//   - SUCCESSFUL BREAKOUT/BREAKDOWN: the confirmed (close-held) bias flips to
-//     Long/Short; also cancels any rotation watch.
-// The readout's second line tells you what to do at these levels this session.
-// Prior levels carry forward the last smoothed live VA (volume-spike cap +
-// per-bar smoothing), exactly like the NT indicator.
-//
-// Also draws the prior session's VAH/POC/VAL as flat reference lines, today's
-// developing VAH/POC/VAL (default: short stubs at the live bar only, so the
-// stair-stepping history doesn't clutter the chart), right-edge price tags,
-// optional entry/exit bubbles, and a one-line readout strip (current bias +
-// prior VAH/POC/VAL).
-//
-// Differences vs. the NT8 original:
-//   - Today's live VA is always computed (the letter/bubble qualifiers need it);
-//     "Today's VAH/POC/VAL" only controls how (or whether) it's drawn.
-//   - Session boundaries follow the chart's session setting (RTH vs ETH),
-//     the equivalent of NT's trading-hours template.
-//   - On the live bar, values update intrabar and settle at bar close (Pine
-//     rolls back uncommitted state, so the final result matches OnBarClose).
-indicator("Daily Bias Indicator", shorttitle="DailyBias", overlay=true, max_labels_count=500, max_lines_count=500)
+// Built for charts finer than 60m (the hourly profiles need several bars per hour).
+// thinkorswim builds its profiles from its own data; here they come from chart bars,
+// so on some days VAH/VAL can sit a tick or two away from the thinkorswim values.
+indicator("Daily Bias Indicator", shorttitle="DailyBias", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
 
 // ── Inputs ──────────────────────────────────────────────
-grpP = "Parameters"
+grpP = "Profile"
+grpB = "Daily Bias"
+grpT = "Tail Confluence"
+grpS = "Trailing Stop & Targets"
 grpV = "Visuals"
-grpC = "Colors"
-grpF = "Failed Auction"
 grpL = "Labels"
+grpC = "Colors"
 
-plotInterval   = input.int(30, "Plot Interval (minutes)", minval=0, maxval=240, group=grpP, tooltip="0 = print a letter on every bar")
-vaPct          = input.float(0.70, "Value Area %", minval=0.5, maxval=0.95, step=0.05, group=grpP)
-bucketPts      = input.float(1.0, "Profile Bucket Size (pts)", minval=0.25, maxval=20.0, step=0.25, group=grpP)
-flipBars       = input.int(2, "Flip Confirmation Bars", minval=1, maxval=20, group=grpP)
-useQual        = input.bool(true, "Use Intraday Structure Qualifier (L/l, S/s vs today's POC)", group=grpP)
+vaPctIn       = input.int(68, "Value Area %", minval=50, maxval=95, group=grpP)
+rowTicks      = input.int(1, "Profile Row Size (ticks)", minval=1, maxval=100, group=grpP, tooltip="thinkScript uses one tick per row. Raise it only if the script gets slow on very wide-range charts.")
+spikeGuard    = input.bool(false, "Cap Volume Spikes (not in thinkScript)", group=grpP, tooltip="Caps any one bar's volume at a multiple of the recent average so a settlement print can't drag the value area.")
+spikeLookback = input.int(20, "Volume Spike Lookback (bars)", minval=2, maxval=100, group=grpP)
+spikeMult     = input.float(5.0, "Max Volume Spike Multiplier", minval=1.0, maxval=50.0, group=grpP)
 
-showRef        = input.bool(true, "Show Prior VAH/POC/VAL Lines", group=grpV)
-liveMode       = input.string("Stubs", "Today's VAH/POC/VAL", options=["Stubs", "Full History", "Off"], group=grpV, tooltip="Stubs = short line + price tag at the live bar only. Full History = the developing levels plotted across the whole session (stair-steps as the profile builds).")
-stubBars       = input.int(8, "Today Stub Length (bars)", minval=1, maxval=100, group=grpV)
+showDB       = input.bool(true, "Show Daily Bias Bubbles", group=grpB)
+showPocX     = input.bool(true, "Show POC-X", group=grpB)
+showStall    = input.bool(false, "Show Stall Bubbles (RS-BTC / RS-STC)", group=grpB, tooltip="Stall detection still runs and still closes the watch when this is off.")
+flipBars     = input.int(2, "Flip Confirmation Bars", minval=1, maxval=20, group=grpB)
+zonePts      = input.float(2.0, "VAH/VAL Zone Buffer (pts)", minval=0.0, step=0.25, group=grpB, tooltip="A wick must reach this far past pVAH/pVAL, then close back inside, to count as FBO/FBD. Also the half-height of the shaded boxes.")
+stallPts     = input.float(10.0, "Rotation Stall Rebound (pts)", minval=0.0, step=0.5, group=grpB)
+dbOffPts     = input.float(3.0, "Bubble Offset (pts)", minval=0.0, step=0.25, group=grpB)
+faTargetLine = input.bool(true, "Dotted Line From FBO/FBD to Target", group=grpB)
+plotInterval = input.int(30, "Bias Letter Interval (minutes)", minval=0, maxval=240, group=grpB, tooltip="0 = print a letter on every bar")
+useQual      = input.bool(true, "Letters: l / s When On the Wrong Side of dPOC", group=grpB)
+
+tolMode     = input.string("ATR Multiple", "Tolerance Mode", options=["ATR Multiple", "Fixed Points"], group=grpT, tooltip="ATR Multiple self-scales to current volatility.")
+tolAtr      = input.float(0.5, "ATR Multiple", minval=0.05, step=0.05, group=grpT)
+tolPts      = input.float(5.0, "Fixed Points", minval=0.0, step=0.25, group=grpT)
+hrLookback  = input.int(3, "Hourly Lookback (incl. live hour)", minval=1, maxval=4, group=grpT, tooltip="1 = the live hour only, 2 = live plus last completed hour, and so on.")
+minHours    = input.int(2, "Hours Required Near", minval=1, maxval=4, group=grpT)
+needConfirm = input.bool(true, "Require Reversal Confirmation", group=grpT, tooltip="Only signal while price is back above the day low (longs) / below the day high (shorts).")
+incLive     = input.bool(true, "Count the Live Hour", group=grpT)
+onePerDay   = input.bool(true, "One Signal Per Side Per Day", group=grpT)
+showLong    = input.bool(true, "Long Setups", group=grpT)
+showShort   = input.bool(true, "Short Setups", group=grpT)
+showZones   = input.bool(true, "Tolerance Bands", group=grpT)
+showDayHL   = input.bool(true, "Day High / Low Lines", group=grpT)
+
+showStop    = input.bool(true, "Show Trailing Stop", group=grpS)
+stopAnchor  = input.string("Value Area", "Trailing Stop Anchor", options=["Value Area", "Hour Extreme", "Tighter", "Wider"], group=grpS, tooltip="Value Area = last completed hour's VAL/VAH. Hour Extreme = its low/high. Tighter / Wider = whichever of the two is closer to / farther from price.")
+showCont    = input.bool(true, "Show Continuation", group=grpS)
+showExtL    = input.bool(true, "Extended Target: Long", group=grpS)
+showExtS    = input.bool(true, "Extended Target: Short", group=grpS)
+suppressOpp = input.bool(true, "Hide Extended Targets Against the Last Signal", group=grpS)
+
+grpA = "Alerts"
+alertConf     = input.bool(true, "Tail Confluence: entries, continuations, stop-outs", group=grpA, tooltip="LONG / SHORT on CONFLUENCE and CONTINUATION; EXIT on STOPPED OUT or a reversal by the opposite confluence signal.")
+alertDB       = input.bool(true, "Daily Bias: FBD/FBO, BO/BD and their exits", group=grpA, tooltip="LONG on FBD-Long / BO-Long, SHORT on FBO-Short / BD-Short. EXIT on STC / BTC (target), RS-STC / RS-BTC (stalled), BO-STC / BD-BTC, or the rotation being voided by acceptance the other way.")
+alertBarClose = input.bool(true, "Only On Bar Close", group=grpA, tooltip="Recommended. Intrabar, a wick can trigger FBO/FBD or a confluence and then vanish before the bar closes. Applies to the 'Any alert() function call' alert; for the LONG / SHORT / EXIT conditions pick 'Once Per Bar Close' in the alert dialog.")
+
+showRef       = input.bool(true, "Prior VAH/POC/VAL Boxes", group=grpV)
+liveMode      = input.string("Stubs", "Today's dVAH/dPOC/dVAL", options=["Stubs", "Off"], group=grpV)
+stubBars      = input.int(8, "Today Stub Length (bars)", minval=1, maxval=100, group=grpV)
+showBubbles   = input.bool(false, "Today-POC Entry/Exit Bubbles (NT8 extra)", group=grpV)
+showReadout   = input.bool(true, "Show Readout Strip", group=grpV)
+readoutPos    = input.string("Bottom Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV)
+readoutOffset = input.float(3.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV)
+readoutSizeIn = input.string("Large", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
+showDiag      = input.bool(true, "Diagnostics Panel", group=grpV)
+diagPos       = input.string("Bottom Left", "Diagnostics Position", options=["Top Left", "Top Center", "Middle Left", "Bottom Left", "Bottom Center"], group=grpV)
+
 showTags       = input.bool(true, "Show Price Tags on Level Lines", group=grpL)
+levelHelp      = input.bool(true, "Hover Help", group=grpL, tooltip="Hover tags, box names, bubbles and panel rows for what each one means.")
 letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxval=50, group=grpL)
-lblSizeIn      = input.string("Normal", "Label Text Size (signal pills; notes/tags/bubbles are one step smaller)", options=["Small", "Normal", "Large"], group=grpL)
-letterKeepBars  = input.int(10, "Bias Letters: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL, tooltip="Older letters are deleted as the chart advances, so only the most recent ones stay visible.")
-bubbleKeepBars  = input.int(60, "Entry/Exit Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
-faKeepBars      = input.int(60, "Failed-Auction Signals: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL, tooltip="Applies to the Failed Breakout/Breakdown pills, POC / Target / Stalled / Accepted notes, and the dotted target lines.")
+lblSizeIn      = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"], group=grpL)
 letterSizeIn   = input.string("Normal", "Letter Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpL)
-showBubbles    = input.bool(true, "Show Long/Short Entry-Exit Bubbles", group=grpV)
-useQualBubbles = input.bool(true, "Bubbles React to Today's POC (not just macro flips)", group=grpV)
-pillOffset     = input.int(40, "Failed-Auction Pill Offset (ticks from bar, kept clear of bubbles/notes)", minval=0, maxval=300, group=grpL)
-bubbleOffset   = input.int(14, "Bubble Offset (ticks from bar)", minval=0, maxval=100, group=grpL)
-showReadout    = input.bool(true, "Show Readout Strip", group=grpV)
-readoutPos     = input.string("Bottom Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV, tooltip="Defaults to Bottom Right so it never collides with the other top-right tables (ATR Stretch, LASOMA). Existing charts keep their saved position: change it here.")
-readoutOffset  = input.float(3.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV, tooltip="Distance from the pane edge. Nudge up/down (0.5 steps) to sit flush under the ATR Stretch label on your pane height.")
-readoutSizeIn  = input.string("Large", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
+letterKeepBars = input.int(10, "Bias Letters: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+faKeepBars     = input.int(60, "Daily Bias Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+sigKeepBars    = input.int(0, "Confluence / Stop / Target Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+bubbleKeepBars = input.int(60, "Today-POC Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+bubbleOffset   = input.int(14, "Today-POC Bubble Offset (ticks)", minval=0, maxval=100, group=grpL)
 
-showFA         = input.bool(true, "Show Failed Auction Signals", group=grpF, tooltip="Wick past prior VAH/VAL +/- Zone Width that closes back inside: failed breakout = short to prior VAL, failed breakdown = long to prior VAH.")
-faZoneTicks    = input.int(8, "VAH/VAL Zone Width (ticks each side; past it = probe)", minval=0, maxval=100, group=grpF)
-faStallPts     = input.float(15.0, "Rotation Stall Rebound (pts before giving up on target)", minval=0.0, maxval=200.0, group=grpF)
-faDedupe       = input.bool(true, "Suppress Repeat Signals", group=grpF, tooltip="No new failed breakout while a 'to VAL' rotation is already open (same for breakdowns), and no repeat of the same signal within the cooldown. Turn off to match the NinjaTrader indicator exactly, which re-fires on every re-arm.")
-faCooldown     = input.int(6, "Repeat Cooldown (bars)", minval=0, maxval=100, group=grpF)
-faTargetLine   = input.bool(true, "Draw Signal-to-Target Dotted Line", group=grpF)
-faShowPoc      = input.bool(false, "Show 'Crossing POC' Marker", group=grpL)
-faShowDir      = input.bool(true, "Show Direction Line in Readout", group=grpF)
-
-spikeGuard     = input.bool(true, "Guard Against Volume Spikes", group=grpP)
-spikeLookback  = input.int(20, "Volume Spike Lookback (bars)", minval=2, maxval=100, group=grpP)
-spikeMult      = input.float(5.0, "Max Volume Spike Multiplier", minval=1.0, maxval=50.0, group=grpP)
-smoothVa       = input.bool(true, "Smooth Value Area (rate limit jumps)", group=grpP)
-maxMovePts     = input.float(5.0, "Max Move Per Bar (pts, 0 = unlimited)", minval=0.0, maxval=200.0, group=grpP)
-
-flipLongCol    = input.color(#3DDC97,     "Flip to Long", group=grpC)
-contLongCol    = input.color(#2E8B6A,     "Continuation Long", group=grpC)
-flipShortCol   = input.color(#FF5C6C,     "Flip to Short", group=grpC)
-contShortCol   = input.color(#B5505B,     "Continuation Short", group=grpC)
-flipNeutralCol = input.color(#E6E8EB,     "Flip to Neutral", group=grpC)
-contNeutralCol = input.color(#8B919A,     "Continuation Neutral", group=grpC)
-enterLongCol   = input.color(#2EBD85,     "Enter Long Bubble", group=grpC)
-exitLongCol    = input.color(#F0883E,     "Exit Long Bubble", group=grpC)
-enterShortCol  = input.color(#F6465D,     "Enter Short Bubble", group=grpC)
-exitShortCol   = input.color(#4DB6FF,     "Exit Short Bubble", group=grpC)
-failBoCol      = input.color(#FF7A59,     "Failed Breakout Label", group=grpC)
-failBdCol      = input.color(#4DB6FF,     "Failed Breakdown Label", group=grpC)
-pocCrossCol    = input.color(#F5C451,     "Rotation POC-Cross Label", group=grpC)
-rotDoneCol     = input.color(#E6E8EB,     "Rotation Complete Label", group=grpC)
-rotStallCol    = input.color(#B388FF,     "Rotation Stalled Label", group=grpC)
-succBoCol      = input.color(#3DDC97,     "Successful Breakout Label", group=grpC)
-succBdCol      = input.color(#FF5C6C,     "Successful Breakdown Label", group=grpC)
-priorVaCol     = input.color(#4C9AFF,     "Prior VAH/VAL Line", group=grpC)
-priorPocCol    = input.color(#F5C451,     "Prior POC Line", group=grpC)
-liveVahCol     = input.color(#5CE1E6,     "Today VAH", group=grpC)
+flipLongCol    = input.color(#3DDC97, "Flip to Long", group=grpC)
+contLongCol    = input.color(#2E8B6A, "Continuation Long", group=grpC)
+flipShortCol   = input.color(#FF5C6C, "Flip to Short", group=grpC)
+contShortCol   = input.color(#B5505B, "Continuation Short", group=grpC)
+flipNeutralCol = input.color(#E6E8EB, "Flip to Neutral", group=grpC)
+contNeutralCol = input.color(#8B919A, "Continuation Neutral", group=grpC)
+failBoCol      = input.color(#FF9F43, "FBO-Short", group=grpC)
+failBdCol      = input.color(#4DD8FF, "FBD-Long", group=grpC)
+pocCrossCol    = input.color(#F5C451, "POC-X", group=grpC)
+rotDoneCol     = input.color(#E6E8EB, "BTC / STC", group=grpC)
+rotStallCol    = input.color(#D45CFF, "RS-BTC / RS-STC", group=grpC)
+succBoCol      = input.color(#3DDC97, "BO-Long", group=grpC)
+succBdCol      = input.color(#FF5C6C, "BD-Short", group=grpC)
+boExitCol      = input.color(#E07B39, "BO-STC / BD-BTC", group=grpC)
+confLongCol    = input.color(#26A69A, "Confluence Long", group=grpC)
+confShortCol   = input.color(#EF5350, "Confluence Short", group=grpC)
+stopLongCol    = input.color(#00E5FF, "Trailing Stop Long", group=grpC)
+stopShortCol   = input.color(#FF4DFF, "Trailing Stop Short", group=grpC)
+contUpCol      = input.color(#1B7F4F, "Long Continuation", group=grpC)
+contDnCol      = input.color(#9E2A3A, "Short Continuation", group=grpC)
+extLongCol     = input.color(#9BE7B4, "Extended Target Long", group=grpC)
+extShortCol    = input.color(#F7A1A9, "Extended Target Short", group=grpC)
+dayHLCol       = input.color(#F23645, "Day High / Low", group=grpC)
+enterLongCol   = input.color(#2EBD85, "Today-POC Long Bubble", group=grpC)
+exitLongCol    = input.color(#F0883E, "Today-POC Exit Long Bubble", group=grpC)
+enterShortCol  = input.color(#F6465D, "Today-POC Short Bubble", group=grpC)
+exitShortCol   = input.color(#4DB6FF, "Today-POC Exit Short Bubble", group=grpC)
+priorVaCol     = input.color(#4C9AFF, "Prior VAH/VAL", group=grpC)
+priorPocCol    = input.color(#F5C451, "Prior POC", group=grpC)
+liveVahCol     = input.color(#5CE1E6, "Today VAH", group=grpC)
 livePocCol     = input.color(#FFE066, "Today POC", group=grpC)
-liveValCol     = input.color(#E070FF,     "Today VAL", group=grpC)
+liveValCol     = input.color(#E070FF, "Today VAL", group=grpC)
 
-pillSz = lblSizeIn == "Small" ? size.small : lblSizeIn == "Normal" ? size.normal : size.large
-noteSz = lblSizeIn == "Large" ? size.normal : size.small
+noteSz     = lblSizeIn == "Large" ? size.normal : size.small
 letterSize = letterSizeIn == "Tiny" ? size.tiny : letterSizeIn == "Small" ? size.small : letterSizeIn == "Normal" ? size.normal : letterSizeIn == "Large" ? size.large : size.huge
+rowSize    = rowTicks * syminfo.mintick
+vaPct      = vaPctIn / 100.0
+clearCol   = color.new(color.black, 100)
 
-enum Bias
-    neutral
-    long
-    short
+// ── Helpers ─────────────────────────────────────────────
+fmt(float v) => na(v) ? "—" : str.tostring(v, format.mintick)
+help(string s) => levelHelp ? s : ""
 
-// ── Value Area calc ─────────────────────────────────────
-// Expand from the POC by whichever adjacent bucket has more volume until
-// vaPct of total volume is captured. Returns [vah, poc, val] (na if empty).
-valueArea(map<float, float> hist, float pct) =>
-    float vah = na
-    float poc = na
-    float val = na
-    if hist.size() > 0
-        keys = hist.keys()   // copy, in insertion order
-        float total  = 0.0
-        float maxVol = -1.0
-        float pocKey = na
-        for k in keys
-            v = hist.get(k)
+// Spread one bar's volume evenly across rows loIdx..hiIdx; returns the updated
+// [max row volume, POC row]. Strict > keeps the first row to reach a new max.
+addVolume(map<int, float> h, int loIdx, int hiIdx, float share, float maxVol, int pocIdx) =>
+    float mv = maxVol
+    int   pi = pocIdx
+    for i = loIdx to hiIdx
+        float v = nz(h.get(i)) + share
+        h.put(i, v)
+        if v > mv
+            mv := v
+            pi := i
+    [mv, pi]
+
+// Expand from the POC row by whichever neighbouring row has more volume until pct of
+// the total is captured. Returns [VAH row, VAL row].
+valueArea(map<int, float> h, int pocIdx, float pct) =>
+    int vahI = na
+    int valI = na
+    if h.size() > 0 and not na(pocIdx)
+        keys = h.keys()
+        keys.sort(order.ascending)
+        float total = 0.0
+        for v in h.values()
             total += v
-            if v > maxVol    // strict > keeps the first-inserted key on ties (matches LINQ stable sort)
-                maxVol := v
-                pocKey := k
-        if total > 0
-            keys.sort(order.ascending)
-            int pocIdx = keys.indexof(pocKey)
-            int upIdx  = pocIdx
-            int loIdx  = pocIdx
-            float vahL = pocKey
-            float valL = pocKey
-            float cum  = maxVol
-            while cum < total * pct
-                bool hasUp = upIdx + 1 < keys.size()
-                bool hasLo = loIdx - 1 >= 0
-                if not hasUp and not hasLo
-                    break
-                float upVol = -1.0
-                float loVol = -1.0
-                if hasUp
-                    upVol := hist.get(keys.get(upIdx + 1))
-                if hasLo
-                    loVol := hist.get(keys.get(loIdx - 1))
-                if upVol >= loVol
-                    upIdx += 1
-                    vahL := keys.get(upIdx)
-                    cum += upVol
-                else
-                    loIdx -= 1
-                    valL := keys.get(loIdx)
-                    cum += loVol
-            vah := vahL
-            poc := pocKey
-            val := valL
-    [vah, poc, val]
-
-clampMove(float prev, float target, float maxMove) =>
-    float d = target - prev
-    d > maxMove ? prev + maxMove : d < -maxMove ? prev - maxMove : target
+        int   up  = keys.indexof(pocIdx)
+        int   lo  = up
+        float cum = h.get(pocIdx)
+        while cum < total * pct
+            bool hasUp = up + 1 < keys.size()
+            bool hasLo = lo - 1 >= 0
+            if not hasUp and not hasLo
+                break
+            float upVol = hasUp ? h.get(keys.get(up + 1)) : -1.0
+            float loVol = hasLo ? h.get(keys.get(lo - 1)) : -1.0
+            if upVol >= loVol
+                up += 1
+                cum += upVol
+            else
+                lo -= 1
+                cum += loVol
+        vahI := keys.get(up)
+        valI := keys.get(lo)
+    [vahI, valI]
 
 trackLbl(array<label> lbls, array<int> bars, label lb) =>
     lbls.push(lb)
@@ -207,374 +223,645 @@ pruneLns(array<line> lns, array<int> bars, int keep) =>
             line.delete(lns.shift())
             bars.shift()
 
-// ── State ───────────────────────────────────────────────
-var map<float, float> volumeByPrice = map.new<float, float>()
+// thinkScript AddChartBubble: "above" = bubble sits above y, pointing down at it.
+bubble(array<label> lbls, array<int> bars, float y, string txt, bool above, color bg, color fg, string tip) =>
+    trackLbl(lbls, bars, label.new(bar_index, y, txt, yloc=yloc.price, style=above ? label.style_label_down : label.style_label_up, color=bg, textcolor=fg, size=noteSz, tooltip=help(tip)))
 
-var float priorVah = na
+// ── Profiles ────────────────────────────────────────────
+var map<int, float> dayHist  = map.new<int, float>()
+var map<int, float> hourHist = map.new<int, float>()
+var float dayMaxVol  = 0.0
+var int   dayPocIdx  = na
+var float hourMaxVol = 0.0
+var int   hourPocIdx = na
+
+var float dayPOC = na       // today's developing POC (Target 1)
+var float dayLo  = na
+var float dayHi  = na
+var float hrLo   = na
+var float hrHi   = na
+var int   dayStartBar  = 0
+var int   dayStartTime = time
+
+var float priorVah = na     // finished day's value area, frozen at the roll
 var float priorVal = na
-var float priorPoc = na
-var bool  havePrior = false
-var int   sessionStartBar = 0
-var int   sessionStartTime = time
+var int   priorDay = na     // trading date those levels came from
+var float poc1 = na         // prior day POCs, 1 = yesterday
+var float poc2 = na
+var float poc3 = na
+var float poc4 = na
+var float poc5 = na
 
-var Bias  rawLean = Bias.neutral
-var int   leanStreak = 0
-var Bias  confirmed = Bias.neutral
-var Bias  lastPrinted = Bias.neutral
-var bool  prevStrongLong = false
-var bool  prevStrongShort = false
+var float h1Low  = na       // completed-hour tails, 1 = the hour that just closed
+var float h2Low  = na
+var float h3Low  = na
+var float h1High = na
+var float h2High = na
+var float h3High = na
+var float t1HourVAL = na    // last completed hour's value area (trailing-stop anchor)
+var float t1HourVAH = na
+
+// Per-day drawing/extras state
+var box   bxVah = na
+var line  lnPoc = na
+var box   bxVal = na
 var float lastCheckpointElapsed = -1.0
-var array<label> letterLbls = array.new<label>()
-var array<int>   letterBars = array.new<int>()
-var array<label> faLbls = array.new<label>()
-var array<int>   faBars = array.new<int>()
-var array<line>  faLns = array.new<line>()
-var array<int>   faLnBars = array.new<int>()
-var array<label> bubLbls = array.new<label>()
-var array<int>   bubBars = array.new<int>()
+var int   lastPrinted = 0
+var bool  prevStrongLong  = false
+var bool  prevStrongShort = false
 
-// Smoothed live VA carried forward as the prior session (strategy's FinalizePriorSession)
-var float lastVah = na
-var float lastPoc = na
-var float lastVal = na
-var bool  haveLive = false
+bool newDay  = bar_index == 0 or time_tradingday != time_tradingday[1]
+int  hrBlock = hour(time, "America/New_York")
+bool newHour = bar_index == 0 or hrBlock != hrBlock[1]
+int  prevTradingDay = time_tradingday[1]
 
-// Failed-auction state (reset each session)
-var bool  prevRejUp = false
-var bool  prevRejDn = false
-var int   lastFailUpBar = -1000
-var int   lastFailDnBar = -1000
-var int   rotDir = 0         // -1 watching down to VAL (short idea), +1 watching up to VAH (long idea)
-var float rotExtreme = na
-var bool  pocCrossed = false
-var line  tradeLn = na
-
-var box  bxVah = na
-var line lnPoc = na
-var box  bxVal = na
-
-// ── Session rollover ────────────────────────────────────
-if session.isfirstbar or bar_index == 0
-    sessionStartBar := bar_index
-    if haveLive
-        priorVah  := lastVah
-        priorPoc  := lastPoc
-        priorVal  := lastVal
-        havePrior := true
-    haveLive := false
-    volumeByPrice.clear()
-    rawLean               := Bias.neutral
-    leanStreak            := 0
-    confirmed             := Bias.neutral
-    lastPrinted           := Bias.neutral
-    prevStrongLong        := false
-    prevStrongShort       := false
-    lastCheckpointElapsed := -1.0
-    prevRejUp   := false
-    prevRejDn   := false
-    rotDir      := 0
-    rotExtreme  := na
-    pocCrossed  := false
-    tradeLn     := na
-    sessionStartTime      := time
+// Day roll: freeze the finished day's value area and POC, then start fresh
+if newDay
+    if dayHist.size() > 0
+        [dVahI, dValI] = valueArea(dayHist, dayPocIdx, vaPct)
+        priorVah := dVahI * rowSize
+        priorVal := dValI * rowSize
+        priorDay := prevTradingDay
+    else
+        priorVah := na
+        priorVal := na
+    poc5 := poc4
+    poc4 := poc3
+    poc3 := poc2
+    poc2 := poc1
+    poc1 := dayPOC
+    dayHist.clear()
+    dayMaxVol := 0.0
+    dayPocIdx := na
+    dayLo := na
+    dayHi := na
+    dayStartBar  := bar_index
+    dayStartTime := time
     bxVah := na
     lnPoc := na
     bxVal := na
+    lastCheckpointElapsed := -1.0
+    lastPrinted     := 0
+    prevStrongLong  := false
+    prevStrongShort := false
 
-float liveVah = na
-float livePoc = na
-float liveVal = na
-float avgVol  = ta.sma(volume, spikeLookback)
-bool  sigShort = false
-bool  sigLong  = false
+// Hour roll: shift the completed hour into the tail registers
+if newHour
+    if hourHist.size() > 0
+        [hVahI, hValI] = valueArea(hourHist, hourPocIdx, vaPct)
+        t1HourVAH := hVahI * rowSize
+        t1HourVAL := hValI * rowSize
+    else
+        t1HourVAH := na
+        t1HourVAL := na
+    h3Low  := h2Low
+    h2Low  := h1Low
+    h1Low  := hrLo
+    h3High := h2High
+    h2High := h1High
+    h1High := hrHi
+    hourHist.clear()
+    hourMaxVol := 0.0
+    hourPocIdx := na
+    hrLo := na
+    hrHi := na
 
-if bar_index >= 2
-    // Accumulate this bar into today's histogram
-    if not na(volume) and volume > 0
-        float vol = volume
-        if spikeGuard and bar_index >= spikeLookback and avgVol > 0 and vol > avgVol * spikeMult
-            vol := avgVol * spikeMult
-        bucket = math.round(hlc3 / bucketPts) * bucketPts
-        volumeByPrice.put(bucket, nz(volumeByPrice.get(bucket)) + vol)
+// Add this bar to both profiles
+float avgVol = ta.sma(volume, spikeLookback)
+float vol    = nz(volume)
+if spikeGuard and bar_index >= spikeLookback and avgVol > 0 and vol > avgVol * spikeMult
+    vol := avgVol * spikeMult
+int loIdx = int(math.round(low / rowSize))
+int hiIdx = int(math.round(high / rowSize))
+if vol > 0
+    float share = vol / (hiIdx - loIdx + 1)
+    [dmv, dpi] = addVolume(dayHist, loIdx, hiIdx, share, dayMaxVol, dayPocIdx)
+    dayMaxVol := dmv
+    dayPocIdx := dpi
+    [hmv, hpi] = addVolume(hourHist, loIdx, hiIdx, share, hourMaxVol, hourPocIdx)
+    hourMaxVol := hmv
+    hourPocIdx := hpi
+float loP = loIdx * rowSize
+float hiP = hiIdx * rowSize
+dayLo := na(dayLo) ? loP : math.min(dayLo, loP)
+dayHi := na(dayHi) ? hiP : math.max(dayHi, hiP)
+hrLo  := na(hrLo)  ? loP : math.min(hrLo, loP)
+hrHi  := na(hrHi)  ? hiP : math.max(hrHi, hiP)
+dayPOC := na(dayPocIdx) ? na : dayPocIdx * rowSize
 
-    // Today's developing VAH/POC/VAL
-    if volumeByPrice.size() > 0
-        [a, b, c] = valueArea(volumeByPrice, vaPct)
-        liveVah := a
-        livePoc := b
-        liveVal := c
-        if smoothVa and maxMovePts > 0 and haveLive
-            liveVah := clampMove(lastVah, a, maxMovePts)
-            livePoc := clampMove(lastPoc, b, maxMovePts)
-            liveVal := clampMove(lastVal, c, maxMovePts)
-        lastVah  := liveVah
-        lastPoc  := livePoc
-        lastVal  := liveVal
-        haveLive := true
+string priorDayTxt = na(priorDay) ? "prior" : str.format_time(priorDay, "MMM d", "UTC")   // time_tradingday is midnight UTC
 
-    if havePrior
-        Bias curRaw = close > priorVah ? Bias.long : close < priorVal ? Bias.short : Bias.neutral
-        if curRaw == rawLean
-            leanStreak += 1
-        else
-            rawLean    := curRaw
-            leanStreak := 1
+// ── Tail confluence ─────────────────────────────────────
+float atrVal = ta.atr(14)
+float tol    = tolMode == "ATR Multiple" ? tolAtr * atrVal : tolPts
 
-        Bias prevConfirmed = confirmed
-        if rawLean != Bias.neutral and leanStreak >= flipBars
-            confirmed := rawLean
-        else if rawLean == Bias.neutral
-            confirmed := Bias.neutral   // back inside value area = neutral immediately
+bool near0L = incLive and not na(hrLo) and math.abs(hrLo - dayLo) <= tol
+bool near1L = hrLookback >= 2 and not na(h1Low) and math.abs(h1Low - dayLo) <= tol
+bool near2L = hrLookback >= 3 and not na(h2Low) and math.abs(h2Low - dayLo) <= tol
+bool near3L = hrLookback >= 4 and not na(h3Low) and math.abs(h3Low - dayLo) <= tol
+int  countNearLow = (near0L ? 1 : 0) + (near1L ? 1 : 0) + (near2L ? 1 : 0) + (near3L ? 1 : 0)
+bool longConf = countNearLow >= minHours
 
-        if showBubbles
-            haveToday     = useQualBubbles and volumeByPrice.size() > 0
-            aboveTodayPoc = haveToday and close > livePoc
+bool near0H = incLive and not na(hrHi) and math.abs(hrHi - dayHi) <= tol
+bool near1H = hrLookback >= 2 and not na(h1High) and math.abs(h1High - dayHi) <= tol
+bool near2H = hrLookback >= 3 and not na(h2High) and math.abs(h2High - dayHi) <= tol
+bool near3H = hrLookback >= 4 and not na(h3High) and math.abs(h3High - dayHi) <= tol
+int  countNearHigh = (near0H ? 1 : 0) + (near1H ? 1 : 0) + (near2H ? 1 : 0) + (near3H ? 1 : 0)
+bool shortConf = countNearHigh >= minHours
 
-            // "Strong" = confirmed macro bias AND (if qualifier on) on the right side of today's POC.
-            curStrongLong  = confirmed == Bias.long  and (not haveToday or aboveTodayPoc)
-            curStrongShort = confirmed == Bias.short and (not haveToday or not aboveTodayPoc)
+bool longRaw   = longConf  and (not needConfirm or close > dayLo)
+bool shortRaw  = shortConf and (not needConfirm or close < dayHi)
+bool longEdge  = longRaw  and not longRaw[1]
+bool shortEdge = shortRaw and not shortRaw[1]
 
-            belowY = low  - bubbleOffset * syminfo.mintick
-            aboveY = high + bubbleOffset * syminfo.mintick
+// Once-per-day latch: the signal checks the latch as of the previous bar
+var bool dayLongFired  = false
+var bool dayShortFired = false
+bool prevDayLongFired  = dayLongFired
+bool prevDayShortFired = dayShortFired
+dayLongFired  := newDay ? false : longEdge  ? true : dayLongFired
+dayShortFired := newDay ? false : shortEdge ? true : dayShortFired
 
-            if curStrongLong and not prevStrongLong
-                trackLbl(bubLbls, bubBars, label.new(bar_index, belowY, "Long", yloc=yloc.price, style=label.style_label_up, color=enterLongCol, textcolor=color.black, size=noteSz))
-            if prevStrongLong and not curStrongLong
-                trackLbl(bubLbls, bubBars, label.new(bar_index, aboveY, "Exit Long", yloc=yloc.price, style=label.style_label_down, color=exitLongCol, textcolor=color.white, size=noteSz))
-            if curStrongShort and not prevStrongShort
-                trackLbl(bubLbls, bubBars, label.new(bar_index, aboveY, "Short", yloc=yloc.price, style=label.style_label_down, color=enterShortCol, textcolor=color.white, size=noteSz))
-            if prevStrongShort and not curStrongShort
-                trackLbl(bubLbls, bubBars, label.new(bar_index, belowY, "Exit Short", yloc=yloc.price, style=label.style_label_up, color=exitShortCol, textcolor=color.black, size=noteSz))
+bool longSignal  = showLong  and longEdge  and (not onePerDay or not prevDayLongFired)
+bool shortSignal = showShort and shortEdge and (not onePerDay or not prevDayShortFired)
 
-            prevStrongLong  := curStrongLong
-            prevStrongShort := curStrongShort
+// ── POC targets ─────────────────────────────────────────
+// Target 2 cascades back through poc1..poc5, taking the first one past today's POC
+// AND past every closer day already checked.
+float target2Short = not na(poc1) and poc1 < dayPOC ? poc1 :
+     not na(poc2) and poc2 < dayPOC and poc2 < poc1 ? poc2 :
+     not na(poc3) and poc3 < dayPOC and poc3 < poc1 and poc3 < poc2 ? poc3 :
+     not na(poc4) and poc4 < dayPOC and poc4 < poc1 and poc4 < poc2 and poc4 < poc3 ? poc4 :
+     not na(poc5) and poc5 < dayPOC and poc5 < poc1 and poc5 < poc2 and poc5 < poc3 and poc5 < poc4 ? poc5 : na
+float target2Long = not na(poc1) and poc1 > dayPOC ? poc1 :
+     not na(poc2) and poc2 > dayPOC and poc2 > poc1 ? poc2 :
+     not na(poc3) and poc3 > dayPOC and poc3 > poc1 and poc3 > poc2 ? poc3 :
+     not na(poc4) and poc4 > dayPOC and poc4 > poc1 and poc4 > poc2 and poc4 > poc3 ? poc4 :
+     not na(poc5) and poc5 > dayPOC and poc5 > poc1 and poc5 > poc2 and poc5 > poc3 and poc5 > poc4 ? poc5 : na
+int t2ShortDaysBack = target2Short == poc1 ? 1 : target2Short == poc2 ? 2 : target2Short == poc3 ? 3 : target2Short == poc4 ? 4 : target2Short == poc5 ? 5 : 0
+int t2LongDaysBack  = target2Long  == poc1 ? 1 : target2Long  == poc2 ? 2 : target2Long  == poc3 ? 3 : target2Long  == poc4 ? 4 : target2Long  == poc5 ? 5 : 0
 
-        if showFA
-            zone  = faZoneTicks * syminfo.mintick
-            aboveY = high + bubbleOffset * syminfo.mintick
-            belowY = low  - bubbleOffset * syminfo.mintick
-            pillAboveY = high + pillOffset * syminfo.mintick
-            pillBelowY = low  - pillOffset * syminfo.mintick
+// ── Trailing stop ───────────────────────────────────────
+// The stop level is the position state: na = flat, a number = in, stopped there.
+float hourlyLongAnchor  = stopAnchor == "Value Area" ? t1HourVAL : stopAnchor == "Hour Extreme" ? h1Low  : stopAnchor == "Tighter" ? math.max(t1HourVAL, h1Low)  : math.min(t1HourVAL, h1Low)
+float hourlyShortAnchor = stopAnchor == "Value Area" ? t1HourVAH : stopAnchor == "Hour Extreme" ? h1High : stopAnchor == "Tighter" ? math.min(t1HourVAH, h1High) : math.max(t1HourVAH, h1High)
 
-            // Successful breakout/breakdown = the confirmed bias flips to Long/Short; voids any rotation watch
-            if prevConfirmed != Bias.long and confirmed == Bias.long
-                trackLbl(faLbls, faBars, label.new(bar_index, belowY, "Accepted higher ↑", yloc=yloc.price, style=label.style_none, textcolor=succBoCol, size=noteSz))
-                rotDir := 0
-            else if prevConfirmed != Bias.short and confirmed == Bias.short
-                trackLbl(faLbls, faBars, label.new(bar_index, aboveY, "Accepted lower ↓", yloc=yloc.price, style=label.style_none, textcolor=succBdCol, size=noteSz))
-                rotDir := 0
+var float longStop  = na
+var float shortStop = na
+float prevLongStop  = longStop
+float prevShortStop = shortStop
+longStop := longSignal ? (not na(prevLongStop) ? math.max(prevLongStop, dayLo) : dayLo) :
+     shortSignal ? na :
+     not na(prevLongStop) and close < prevLongStop ? na :
+     not na(prevLongStop) and newHour and not na(hourlyLongAnchor) ? math.max(prevLongStop, hourlyLongAnchor) :
+     prevLongStop
+shortStop := shortSignal ? (not na(prevShortStop) ? math.min(prevShortStop, dayHi) : dayHi) :
+     longSignal ? na :
+     not na(prevShortStop) and close > prevShortStop ? na :
+     not na(prevShortStop) and newHour and not na(hourlyShortAnchor) ? math.min(prevShortStop, hourlyShortAnchor) :
+     prevShortStop
 
-            // Wick-based, edge-triggered probe-and-reject
-            rejUpNow = high > priorVah + zone and close <= priorVah
-            rejDnNow = low  < priorVal - zone and close >= priorVal
-            dupUp    = faDedupe and (rotDir == -1 or bar_index - lastFailUpBar < faCooldown)
-            dupDn    = faDedupe and (rotDir == 1  or bar_index - lastFailDnBar < faCooldown)
-            failUp   = rejUpNow and not prevRejUp and not dupUp
-            failDn   = rejDnNow and not prevRejDn and not dupDn
-            prevRejUp := rejUpNow
-            prevRejDn := rejDnNow
+bool longStoppedOut  = not na(prevLongStop)  and na(longStop)  and not shortSignal
+bool shortStoppedOut = not na(prevShortStop) and na(shortStop) and not longSignal
 
-            if failUp
-                lastFailUpBar := bar_index
-                rotDir     := -1
-                pocCrossed := false
-                rotExtreme := low
-                sigShort   := true
-                trackLbl(faLbls, faBars, label.new(bar_index, pillAboveY, "Failed Breakout → VAL", yloc=yloc.price, style=label.style_label_down, color=color.new(failBoCol, 12), textcolor=#0B0E11, size=pillSz))
-                if faTargetLine
-                    tradeLn := trackLn(faLns, faLnBars, line.new(bar_index, close, bar_index, priorVal, color=color.new(failBoCol, 35), style=line.style_dotted, width=1))
-            else if failDn
-                lastFailDnBar := bar_index
-                rotDir     := 1
-                pocCrossed := false
-                rotExtreme := high
-                sigLong    := true
-                trackLbl(faLbls, faBars, label.new(bar_index, pillBelowY, "Failed Breakdown → VAH", yloc=yloc.price, style=label.style_label_up, color=color.new(failBdCol, 12), textcolor=#0B0E11, size=pillSz))
-                if faTargetLine
-                    tradeLn := trackLn(faLns, faLnBars, line.new(bar_index, close, bar_index, priorVah, color=color.new(failBdCol, 35), style=line.style_dotted, width=1))
+// ── Continuation after a stop-out ───────────────────────
+var float longStopOutLvl  = na
+var float shortStopOutLvl = na
+float prevLongSOL  = longStopOutLvl
+float prevShortSOL = shortStopOutLvl
+shortStopOutLvl := shortStoppedOut ? prevShortStop : longSignal or shortSignal ? na : not na(prevShortSOL) and close < prevShortSOL ? na : prevShortSOL
+longStopOutLvl  := longStoppedOut  ? prevLongStop  : longSignal or shortSignal ? na : not na(prevLongSOL)  and close > prevLongSOL  ? na : prevLongSOL
+bool shortContinuation = showCont and not na(prevShortSOL) and close < prevShortSOL
+bool longContinuation  = showCont and not na(prevLongSOL)  and close > prevLongSOL
 
-            // Follow the rotation
-            if rotDir != 0 and not na(tradeLn)
-                tradeLn.set_x2(bar_index)
-            if rotDir == -1
-                rotExtreme := math.min(rotExtreme, low)
-                if faShowPoc and not pocCrossed and close <= priorPoc
-                    pocCrossed := true
-                    trackLbl(faLbls, faBars, label.new(bar_index, aboveY, "POC", yloc=yloc.price, style=label.style_none, textcolor=pocCrossCol, size=noteSz))
-                if low <= priorVal
-                    trackLbl(faLbls, faBars, label.new(bar_index, belowY, "✓ Target · VAL", yloc=yloc.price, style=label.style_none, textcolor=rotDoneCol, size=noteSz))
-                    rotDir := 0
-                else if confirmed == Bias.long
-                    rotDir := 0     // reclaimed VAH again, thesis voided
-                else if close - rotExtreme >= faStallPts
-                    trackLbl(faLbls, faBars, label.new(bar_index, belowY, "Stalled", yloc=yloc.price, style=label.style_none, textcolor=rotStallCol, size=noteSz))
-                    rotDir := 0
-            else if rotDir == 1
-                rotExtreme := math.max(rotExtreme, high)
-                if faShowPoc and not pocCrossed and close >= priorPoc
-                    pocCrossed := true
-                    trackLbl(faLbls, faBars, label.new(bar_index, belowY, "POC", yloc=yloc.price, style=label.style_none, textcolor=pocCrossCol, size=noteSz))
-                if high >= priorVah
-                    trackLbl(faLbls, faBars, label.new(bar_index, aboveY, "✓ Target · VAH", yloc=yloc.price, style=label.style_none, textcolor=rotDoneCol, size=noteSz))
-                    rotDir := 0
-                else if confirmed == Bias.short
-                    rotDir := 0     // lost VAL again, thesis voided
-                else if rotExtreme - close >= faStallPts
-                    trackLbl(faLbls, faBars, label.new(bar_index, aboveY, "Stalled", yloc=yloc.price, style=label.style_none, textcolor=rotStallCol, size=noteSz))
-                    rotDir := 0
+// ── Extended target ─────────────────────────────────────
+var int   currentBias = 0       // +1 last confluence signal was long, -1 short
+var float snapT2Long  = na      // Target 2 as printed in the last signal's bubble
+var float snapT2Short = na
+currentBias := longSignal ? 1 : shortSignal ? -1 : currentBias
+snapT2Long  := longSignal  ? target2Long  : snapT2Long
+snapT2Short := shortSignal ? target2Short : snapT2Short
 
-    // Prior session VAH/POC/VAL as flat lines spanning the current session
-    if showRef and havePrior
-        x1 = bar_index - math.max(1, bar_index - sessionStartBar)
-        zb = faZoneTicks * syminfo.mintick
-        // VAH/VAL as shaded zones (+/- Zone Width), POC as an exact line
-        if na(bxVah)
-            bxVah := box.new(x1, priorVah + zb, bar_index, priorVah - zb, border_color=color.new(priorVaCol, 55), border_width=1, bgcolor=color.new(priorVaCol, 91))
-            lnPoc := line.new(x1, priorPoc, bar_index, priorPoc, color=color.new(priorPocCol, 25), style=line.style_dashed, width=1)
-            bxVal := box.new(x1, priorVal + zb, bar_index, priorVal - zb, border_color=color.new(priorVaCol, 55), border_width=1, bgcolor=color.new(priorVaCol, 91))
-        else
-            bxVah.set_right(bar_index)
-            lnPoc.set_x2(bar_index)
-            bxVal.set_right(bar_index)
+bool t2LongBroken      = not na(snapT2Long)  and high >= snapT2Long
+bool t2ShortBroken     = not na(snapT2Short) and low  <= snapT2Short
+bool t2LongBrokenEdge  = t2LongBroken  and not t2LongBroken[1]
+bool t2ShortBrokenEdge = t2ShortBroken and not t2ShortBroken[1]
 
-    // Bias letter at each interval checkpoint
-    elapsed = (time - sessionStartTime) / 60000.0
-    crossed = plotInterval <= 0 or math.floor(elapsed / plotInterval) > math.floor(lastCheckpointElapsed / plotInterval)
+float target3Long = not na(poc1) and poc1 > snapT2Long ? poc1 : not na(poc2) and poc2 > snapT2Long ? poc2 :
+     not na(poc3) and poc3 > snapT2Long ? poc3 : not na(poc4) and poc4 > snapT2Long ? poc4 :
+     not na(poc5) and poc5 > snapT2Long ? poc5 : na
+float target3Short = not na(poc1) and poc1 < snapT2Short ? poc1 : not na(poc2) and poc2 < snapT2Short ? poc2 :
+     not na(poc3) and poc3 < snapT2Short ? poc3 : not na(poc4) and poc4 < snapT2Short ? poc4 :
+     not na(poc5) and poc5 < snapT2Short ? poc5 : na
 
-    if crossed and havePrior
-        haveToday     = useQual and volumeByPrice.size() > 0
-        aboveTodayPoc = haveToday and close > livePoc
+bool extLongSignal  = showExtL and t2LongBrokenEdge  and (not suppressOpp or currentBias >= 0)
+bool extShortSignal = showExtS and t2ShortBrokenEdge and (not suppressOpp or currentBias <= 0)
 
-        string letter = switch confirmed
-            Bias.long  => not haveToday or aboveTodayPoc ? "L" : "l"      // "l" = long but today's POC lost
-            Bias.short => not haveToday or not aboveTodayPoc ? "S" : "s"  // "s" = short but today's POC reclaimed
-            => "N"
+// ── Daily Bias ──────────────────────────────────────────
+// Lean, streak and confirmed bias run continuously across days (not reset at the roll).
+int dbRawLean = close > priorVah ? 1 : close < priorVal ? -1 : 0
+var int dbLeanStreak = 1
+var int dbBias = 0
+dbLeanStreak := bar_index == 0 ? 1 : dbRawLean == dbRawLean[1] ? dbLeanStreak + 1 : 1
+dbBias := dbRawLean != 0 and dbLeanStreak >= flipBars ? dbRawLean : dbRawLean == 0 ? 0 : dbBias
 
-        isFlip = confirmed != lastPrinted
-        color col = switch confirmed
-            Bias.long  => isFlip ? flipLongCol : contLongCol
-            Bias.short => isFlip ? flipShortCol : contShortCol
-            => isFlip ? flipNeutralCol : contNeutralCol
+bool rejAboveNow = high > priorVah + zonePts and close <= priorVah
+bool rejBelowNow = low  < priorVal - zonePts and close >= priorVal
+bool fbo = rejAboveNow and not rejAboveNow[1]
+bool fbd = rejBelowNow and not rejBelowNow[1]
 
-        letterLbls.push(label.new(bar_index, low - letterOffset * syminfo.mintick, letter, yloc=yloc.price, style=label.style_none, textcolor=col, size=letterSize))
-        letterBars.push(bar_index)
-        lastPrinted := confirmed
-    lastCheckpointElapsed := elapsed
+// Each watch is one series: na = not watching, a number = watching, at this extreme
+var float dbExtLow  = na
+var float dbExtHigh = na
+float prevExtLow  = dbExtLow
+float prevExtHigh = dbExtHigh
+dbExtLow  := fbo ? low  : not na(prevExtLow)  ? (low <= priorVal ? na : dbBias == 1 ? na : close - prevExtLow >= stallPts ? na : math.min(prevExtLow, low)) : na
+dbExtHigh := fbd ? high : not na(prevExtHigh) ? (high >= priorVah ? na : dbBias == -1 ? na : prevExtHigh - close >= stallPts ? na : math.max(prevExtHigh, high)) : na
+bool wasDown = not na(prevExtLow)
+bool wasUp   = not na(prevExtHigh)
 
-    // Drop letters older than the keep window
-    if letterKeepBars > 0
-        while letterBars.size() > 0 and bar_index - letterBars.first() >= letterKeepBars
-            label.delete(letterLbls.shift())
-            letterBars.shift()
-    pruneLbls(faLbls, faBars, faKeepBars)
-    pruneLns(faLns, faLnBars, faKeepBars)
-    pruneLbls(bubLbls, bubBars, bubbleKeepBars)
+var int dbCrossedPoc = 0
+int prevCrossed = dbCrossedPoc
+dbCrossedPoc := fbo or fbd ? 0 : not wasDown and not wasUp ? 0 : wasDown and prevCrossed == 0 and close <= poc1 ? 1 : wasUp and prevCrossed == 0 and close >= poc1 ? 1 : prevCrossed
+bool pocXDown = wasDown and prevCrossed == 0 and close <= poc1
+bool pocXUp   = wasUp   and prevCrossed == 0 and close >= poc1
 
-alertcondition(sigShort, "Failed Breakout -> Short to Prior VAL", "Failed breakout above prior VAH: short, target prior VAL")
-alertcondition(sigLong,  "Failed Breakdown -> Long to Prior VAH", "Failed breakdown below prior VAL: long, target prior VAH")
+bool targetDown  = wasDown and low <= priorVal
+bool stalledDown = wasDown and low > priorVal and dbBias != 1 and close - prevExtLow >= stallPts
+bool targetUp    = wasUp and high >= priorVah
+bool stalledUp   = wasUp and high < priorVah and dbBias != -1 and prevExtHigh - close >= stallPts
 
-// ── Today's developing levels ───────────────────────────
-showFull = liveMode == "Full History"
-plot(showFull ? liveVah : na, "Today VAH", color=liveVahCol, linewidth=2)
-plot(showFull ? livePoc : na, "Today POC", color=livePocCol, linewidth=2)
-plot(showFull ? liveVal : na, "Today VAL", color=liveValCol, linewidth=2)
+int  prevBias = nz(dbBias[1])
+bool boEdge = prevBias != 1  and dbBias == 1
+bool bdEdge = prevBias != -1 and dbBias == -1
+var int dbWatchingBO = 0
+int prevWBO = dbWatchingBO
+dbWatchingBO := boEdge ? 1 : bdEdge ? -1 : prevWBO == 1 and dbBias != 1 ? 0 : prevWBO == -1 and dbBias != -1 ? 0 : prevWBO
+bool boExit = prevWBO == 1  and dbBias != 1
+bool bdExit = prevWBO == -1 and dbBias != -1
 
-// Stubs + tags live only on the last bar, so they're created once and moved.
-var line  stVah = line.new(0, float(na), 0, float(na), color=liveVahCol, width=1)
-var line  stPoc = line.new(0, float(na), 0, float(na), color=livePocCol, width=1)
-var line  stVal = line.new(0, float(na), 0, float(na), color=liveValCol, width=1)
-var label tgVah = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveVahCol, 85), textcolor=liveVahCol, size=noteSz)
-var label tgPoc = label.new(0, float(na), "", style=label.style_label_left, color=color.new(livePocCol, 85), textcolor=livePocCol, size=noteSz)
-var label tgVal = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveValCol, 85), textcolor=liveValCol, size=noteSz)
+// ── Hover help text ─────────────────────────────────────
+tipPVah(string d) => "pVAH · prior day Value Area High (" + d + ")\nTop of the range that held " + str.tostring(vaPctIn) + "% of that day's volume.\nCloses holding above it → BO-Long (accepted higher).\nWick past the shaded zone that closes back inside → FBO-Short, target pVAL."
+tipPVal(string d) => "pVAL · prior day Value Area Low (" + d + ")\nBottom of the range that held " + str.tostring(vaPctIn) + "% of that day's volume.\nCloses holding below it → BD-Short (accepted lower).\nWick past the shaded zone that closes back inside → FBD-Long, target pVAH."
+tipPPoc(string d) => "pPOC · prior day Point of Control (" + d + ")\nThe single price with the most volume that day.\nPOC-X marks a rotation crossing it on the way to the far edge."
+tipDVah = "dVAH · developing Value Area High (today)\nLive: moves as today's profile builds.\nBecomes tomorrow's pVAH when the day closes."
+tipDVal = "dVAL · developing Value Area Low (today)\nLive: moves as today's profile builds.\nBecomes tomorrow's pVAL when the day closes."
+tipDPoc = "dPOC · developing Point of Control (today)\nToday's highest-volume price so far = confluence Target 1.\nBias letters turn lowercase (l / s) when price is on the wrong side of it."
+
+// ── Drawing: Daily Bias bubbles ─────────────────────────
+var array<label> faLbls     = array.new<label>()
+var array<int>   faBars     = array.new<int>()
+var array<line>  faLns      = array.new<line>()
+var array<int>   faLnBars   = array.new<int>()
+var array<label> sigLbls    = array.new<label>()
+var array<int>   sigBars    = array.new<int>()
+var array<label> bubLbls    = array.new<label>()
+var array<int>   bubBars    = array.new<int>()
+var array<label> letterLbls = array.new<label>()
+var array<int>   letterBars = array.new<int>()
+
+float dbAbove = high + dbOffPts
+float dbBelow = low  - dbOffPts
+if showDB
+    if fbo
+        bubble(faLbls, faBars, dbAbove, "FBO-Short", true, failBoCol, #0B0E11, "FBO-Short · failed breakout\nWick above pVAH + " + str.tostring(zonePts) + " pts closed back at/below pVAH " + fmt(priorVah) + ".\nShort idea → target pVAL " + fmt(priorVal) + ".\nEnds at BTC (target), RS-BTC (stalled " + str.tostring(stallPts) + " pts) or silently if price is accepted back above pVAH.")
+    if fbd
+        bubble(faLbls, faBars, dbBelow, "FBD-Long", false, failBdCol, #0B0E11, "FBD-Long · failed breakdown\nWick below pVAL − " + str.tostring(zonePts) + " pts closed back at/above pVAL " + fmt(priorVal) + ".\nLong idea → target pVAH " + fmt(priorVah) + ".\nEnds at STC (target), RS-STC (stalled " + str.tostring(stallPts) + " pts) or silently if price is accepted back below pVAL.")
+    if showPocX and pocXDown
+        bubble(faLbls, faBars, dbAbove, "POC-X", true, pocCrossCol, #0B0E11, "POC-X · the FBO-Short rotation closed through pPOC " + fmt(poc1) + ", the halfway point to pVAL.")
+    if showPocX and pocXUp
+        bubble(faLbls, faBars, dbBelow, "POC-X", false, pocCrossCol, #0B0E11, "POC-X · the FBD-Long rotation closed through pPOC " + fmt(poc1) + ", the halfway point to pVAH.")
+    if targetDown
+        bubble(faLbls, faBars, dbBelow, "BTC", false, rotDoneCol, #0B0E11, "BTC · buy to cover\nThe FBO-Short rotation reached pVAL " + fmt(priorVal) + ". Target hit.")
+    if targetUp
+        bubble(faLbls, faBars, dbAbove, "STC", true, rotDoneCol, #0B0E11, "STC · sell to close\nThe FBD-Long rotation reached pVAH " + fmt(priorVah) + ". Target hit.")
+    if showStall and stalledDown
+        bubble(faLbls, faBars, dbBelow, "RS-BTC", false, rotStallCol, color.white, "RS-BTC · rotation stalled\nPrice bounced " + str.tostring(stallPts) + " pts off its low before reaching pVAL. Cover the short.")
+    if showStall and stalledUp
+        bubble(faLbls, faBars, dbAbove, "RS-STC", true, rotStallCol, color.white, "RS-STC · rotation stalled\nPrice fell " + str.tostring(stallPts) + " pts off its high before reaching pVAH. Close the long.")
+    if boEdge
+        bubble(faLbls, faBars, dbBelow, "BO-Long", false, succBoCol, #0B0E11, "BO-Long · breakout accepted\n" + str.tostring(flipBars) + " closes held above pVAH " + fmt(priorVah) + ". Don't fade it; pVAH is now support.\nExit on BO-STC.")
+    if bdEdge
+        bubble(faLbls, faBars, dbAbove, "BD-Short", true, succBdCol, color.white, "BD-Short · breakdown accepted\n" + str.tostring(flipBars) + " closes held below pVAL " + fmt(priorVal) + ". Don't fade it; pVAL is now resistance.\nExit on BD-BTC.")
+    if boExit
+        bubble(faLbls, faBars, dbAbove, "BO-STC", true, boExitCol, #0B0E11, "BO-STC · exit the breakout long\nPrice closed back at/below pVAH (or flipped short), so the BO-Long bias is gone.")
+    if bdExit
+        bubble(faLbls, faBars, dbBelow, "BD-BTC", false, boExitCol, #0B0E11, "BD-BTC · exit the breakdown short\nPrice closed back at/above pVAL (or flipped long), so the BD-Short bias is gone.")
+
+// Dotted signal-to-target lines, extended while the rotation watch is open
+var line lnDown = na
+var line lnUp   = na
+if faTargetLine and fbo
+    lnDown := trackLn(faLns, faLnBars, line.new(bar_index, close, bar_index, priorVal, color=color.new(failBoCol, 35), style=line.style_dotted, width=1))
+if faTargetLine and fbd
+    lnUp := trackLn(faLns, faLnBars, line.new(bar_index, close, bar_index, priorVah, color=color.new(failBdCol, 35), style=line.style_dotted, width=1))
+if not na(dbExtLow) and not na(lnDown)
+    lnDown.set_x2(bar_index)
+if not na(dbExtHigh) and not na(lnUp)
+    lnUp.set_x2(bar_index)
+
+// ── Drawing: confluence, stops, targets ─────────────────
+if longSignal
+    bubble(sigLbls, sigBars, low, "D/HOURLY CONFLUENCE LONG (" + str.tostring(countNearLow) + "h)\nTarget 1 (immediate POC): " + fmt(dayPOC) + "\nTarget 2 (next POC): " + (na(target2Long) ? "none valid" : fmt(target2Long) + " (" + str.tostring(t2LongDaysBack) + "d back)"), false, confLongCol, color.white,
+         str.tostring(countNearLow) + " of the last " + str.tostring(hrLookback) + " hourly lows sit within " + fmt(tol) + " of the day low " + fmt(dayLo) + ", and price is back above it.\nTarget 1 = today's dPOC. Target 2 = nearest prior-day POC above every closer one.\nTrailing stop starts at the day low.")
+if shortSignal
+    bubble(sigLbls, sigBars, high, "D/HOURLY CONFLUENCE SHORT (" + str.tostring(countNearHigh) + "h)\nTarget 1 (immediate POC): " + fmt(dayPOC) + "\nTarget 2 (next POC): " + (na(target2Short) ? "none valid" : fmt(target2Short) + " (" + str.tostring(t2ShortDaysBack) + "d back)"), true, confShortCol, color.white,
+         str.tostring(countNearHigh) + " of the last " + str.tostring(hrLookback) + " hourly highs sit within " + fmt(tol) + " of the day high " + fmt(dayHi) + ", and price is back below it.\nTarget 1 = today's dPOC. Target 2 = nearest prior-day POC below every closer one.\nTrailing stop starts at the day high.")
+if longStoppedOut
+    bubble(sigLbls, sigBars, prevLongStop, "STOPPED OUT", false, stopLongCol, #0B0E11, "Long trailing stop " + fmt(prevLongStop) + " closed through. Flat.\nLONG CONTINUATION prints if price closes back above this level.")
+if shortStoppedOut
+    bubble(sigLbls, sigBars, prevShortStop, "STOPPED OUT", true, stopShortCol, #0B0E11, "Short trailing stop " + fmt(prevShortStop) + " closed through. Flat.\nSHORT CONTINUATION prints if price closes back below this level.")
+if shortContinuation
+    bubble(sigLbls, sigBars, high, "SHORT CONTINUATION", true, contDnCol, color.white, "Price closed back below the short stop-out level " + fmt(prevShortSOL) + ": the stop-out looks like a whipsaw and the short resumes.")
+if longContinuation
+    bubble(sigLbls, sigBars, low, "LONG CONTINUATION", false, contUpCol, color.white, "Price closed back above the long stop-out level " + fmt(prevLongSOL) + ": the stop-out looks like a whipsaw and the long resumes.")
+if extLongSignal
+    bubble(sigLbls, sigBars, high, "Target 2 broken -> next: " + (na(target3Long) ? "none valid" : fmt(target3Long)), false, extLongCol, #0B0E11, "Price traded through the long Target 2 " + fmt(snapT2Long) + " frozen at the last signal.\nNext prior-day POC above it: " + fmt(target3Long) + ".")
+if extShortSignal
+    bubble(sigLbls, sigBars, low, "Target 2 broken -> next: " + (na(target3Short) ? "none valid" : fmt(target3Short)), true, extShortCol, #0B0E11, "Price traded through the short Target 2 " + fmt(snapT2Short) + " frozen at the last signal.\nNext prior-day POC below it: " + fmt(target3Short) + ".")
+
+plotshape(longSignal,  "Confluence Long",  shape.triangleup,   location.belowbar, confLongCol,  size=size.small)
+plotshape(shortSignal, "Confluence Short", shape.triangledown, location.abovebar, confShortCol, size=size.small)
+
+plot(showDayHL ? dayLo : na, "Day Low",  color=dayHLCol, linewidth=2, style=plot.style_stepline)
+plot(showDayHL ? dayHi : na, "Day High", color=dayHLCol, linewidth=2, style=plot.style_stepline)
+pZoneLo  = plot(showZones ? dayLo : na,       "Long Band Bottom",  display=display.none)
+pZoneLoT = plot(showZones ? dayLo + tol : na, "Long Band Top",     display=display.none)
+pZoneHi  = plot(showZones ? dayHi : na,       "Short Band Top",    display=display.none)
+pZoneHiB = plot(showZones ? dayHi - tol : na, "Short Band Bottom", display=display.none)
+fill(pZoneLo, pZoneLoT, color.new(confLongCol, 85),  "Long Tolerance Band")
+fill(pZoneHi, pZoneHiB, color.new(confShortCol, 85), "Short Tolerance Band")
+
+plot(showStop ? longStop  : na, "Trailing Stop Long",  color=stopLongCol,  linewidth=2, style=plot.style_linebr)
+plot(showStop ? shortStop : na, "Trailing Stop Short", color=stopShortCol, linewidth=2, style=plot.style_linebr)
+
+// ── Drawing: prior value area boxes ─────────────────────
+if showRef and not na(priorVah)
+    if na(bxVah)
+        int x1 = dayStartBar
+        bxVah := box.new(x1, priorVah + zonePts, bar_index, priorVah - zonePts, border_color=color.new(priorVaCol, 55), border_width=1, bgcolor=color.new(priorVaCol, 91))
+        lnPoc := line.new(x1, poc1, bar_index, poc1, color=color.new(priorPocCol, 25), style=line.style_dashed, width=1)
+        bxVal := box.new(x1, priorVal + zonePts, bar_index, priorVal - zonePts, border_color=color.new(priorVaCol, 55), border_width=1, bgcolor=color.new(priorVaCol, 91))
+        // Names sit at the left edge as labels (boxes can't carry tooltips)
+        label.new(x1, priorVah, "pVAH " + priorDayTxt, style=label.style_label_left, color=clearCol, textcolor=priorVaCol, size=size.tiny, tooltip=help(tipPVah(priorDayTxt)))
+        label.new(x1, poc1, "pPOC " + priorDayTxt, style=label.style_label_left, color=clearCol, textcolor=priorPocCol, size=size.tiny, tooltip=help(tipPPoc(priorDayTxt)))
+        label.new(x1, priorVal, "pVAL " + priorDayTxt, style=label.style_label_left, color=clearCol, textcolor=priorVaCol, size=size.tiny, tooltip=help(tipPVal(priorDayTxt)))
+    else
+        bxVah.set_right(bar_index)
+        lnPoc.set_x2(bar_index)
+        bxVal.set_right(bar_index)
+
+// ── Extras: bias letters and today-POC bubbles ──────────
+bool haveToday     = not na(dayPOC)
+bool aboveTodayPoc = haveToday and close > dayPOC
+
+if showBubbles and not na(priorVah)
+    bool curStrongLong  = dbBias == 1  and (not haveToday or aboveTodayPoc)
+    bool curStrongShort = dbBias == -1 and (not haveToday or not aboveTodayPoc)
+    float belowY = low  - bubbleOffset * syminfo.mintick
+    float aboveY = high + bubbleOffset * syminfo.mintick
+    if curStrongLong and not prevStrongLong
+        bubble(bubLbls, bubBars, belowY, "Long", false, enterLongCol, color.black, "Confirmed long bias and price above today's dPOC.")
+    if prevStrongLong and not curStrongLong
+        bubble(bubLbls, bubBars, aboveY, "Exit Long", true, exitLongCol, color.white, "Long bias lost, or price fell back below today's dPOC.")
+    if curStrongShort and not prevStrongShort
+        bubble(bubLbls, bubBars, aboveY, "Short", true, enterShortCol, color.white, "Confirmed short bias and price below today's dPOC.")
+    if prevStrongShort and not curStrongShort
+        bubble(bubLbls, bubBars, belowY, "Exit Short", false, exitShortCol, color.black, "Short bias lost, or price reclaimed today's dPOC.")
+    prevStrongLong  := curStrongLong
+    prevStrongShort := curStrongShort
+
+float elapsed = (time - dayStartTime) / 60000.0
+bool  crossed = plotInterval <= 0 or math.floor(elapsed / plotInterval) > math.floor(lastCheckpointElapsed / plotInterval)
+if crossed and not na(priorVah)
+    bool qual = useQual and haveToday
+    string letter = dbBias == 1 ? (not qual or aboveTodayPoc ? "L" : "l") : dbBias == -1 ? (not qual or not aboveTodayPoc ? "S" : "s") : "N"
+    bool isFlip = dbBias != lastPrinted
+    color col = dbBias == 1 ? (isFlip ? flipLongCol : contLongCol) : dbBias == -1 ? (isFlip ? flipShortCol : contShortCol) : (isFlip ? flipNeutralCol : contNeutralCol)
+    trackLbl(letterLbls, letterBars, label.new(bar_index, low - letterOffset * syminfo.mintick, letter, yloc=yloc.price, style=label.style_none, textcolor=col, size=letterSize))
+    lastPrinted := dbBias
+lastCheckpointElapsed := elapsed
+
+pruneLbls(letterLbls, letterBars, letterKeepBars)
+pruneLbls(faLbls, faBars, faKeepBars)
+pruneLns(faLns, faLnBars, faKeepBars)
+pruneLbls(sigLbls, sigBars, sigKeepBars)
+pruneLbls(bubLbls, bubBars, bubbleKeepBars)
+
+// ── Trade alerts: LONG / SHORT / EXIT LONG / EXIT SHORT ──
+// Each collects every reason that fired on this bar, so one alert covers both systems.
+addWhy(string s, bool on, string reason) => on ? (s == "" ? reason : s + " + " + reason) : s
+
+bool confLongExit  = not na(prevLongStop)  and na(longStop)
+bool confShortExit = not na(prevShortStop) and na(shortStop)
+// A rotation watch that ended without target or stall was voided by acceptance the
+// other way. No bubble for it (as in the originals), but it still closes the trade.
+bool fbdVoided = wasUp   and na(dbExtHigh) and not targetUp   and not stalledUp
+bool fboVoided = wasDown and na(dbExtLow)  and not targetDown and not stalledDown
+
+string whyLong = ""
+whyLong := addWhy(whyLong, alertConf and longSignal, "Tail confluence LONG (T1 " + fmt(dayPOC) + ", T2 " + fmt(target2Long) + ")")
+whyLong := addWhy(whyLong, alertConf and longContinuation, "LONG CONTINUATION through " + fmt(prevLongSOL))
+whyLong := addWhy(whyLong, alertDB and fbd, "FBD-Long (target pVAH " + fmt(priorVah) + ")")
+whyLong := addWhy(whyLong, alertDB and boEdge, "BO-Long (accepted above pVAH " + fmt(priorVah) + ")")
+
+string whyShort = ""
+whyShort := addWhy(whyShort, alertConf and shortSignal, "Tail confluence SHORT (T1 " + fmt(dayPOC) + ", T2 " + fmt(target2Short) + ")")
+whyShort := addWhy(whyShort, alertConf and shortContinuation, "SHORT CONTINUATION through " + fmt(prevShortSOL))
+whyShort := addWhy(whyShort, alertDB and fbo, "FBO-Short (target pVAL " + fmt(priorVal) + ")")
+whyShort := addWhy(whyShort, alertDB and bdEdge, "BD-Short (accepted below pVAL " + fmt(priorVal) + ")")
+
+string whyExitLong = ""
+whyExitLong := addWhy(whyExitLong, alertConf and confLongExit, shortSignal ? "Confluence long reversed by SHORT" : "Trailing stop " + fmt(prevLongStop) + " hit")
+whyExitLong := addWhy(whyExitLong, alertDB and targetUp, "STC: FBD-Long reached pVAH " + fmt(priorVah))
+whyExitLong := addWhy(whyExitLong, alertDB and stalledUp, "RS-STC: FBD-Long stalled")
+whyExitLong := addWhy(whyExitLong, alertDB and fbdVoided, "FBD-Long voided (accepted below pVAL)")
+whyExitLong := addWhy(whyExitLong, alertDB and boExit, "BO-STC: breakout long bias gone")
+
+string whyExitShort = ""
+whyExitShort := addWhy(whyExitShort, alertConf and confShortExit, longSignal ? "Confluence short reversed by LONG" : "Trailing stop " + fmt(prevShortStop) + " hit")
+whyExitShort := addWhy(whyExitShort, alertDB and targetDown, "BTC: FBO-Short reached pVAL " + fmt(priorVal))
+whyExitShort := addWhy(whyExitShort, alertDB and stalledDown, "RS-BTC: FBO-Short stalled")
+whyExitShort := addWhy(whyExitShort, alertDB and fboVoided, "FBO-Short voided (accepted above pVAH)")
+whyExitShort := addWhy(whyExitShort, alertDB and bdExit, "BD-BTC: breakdown short bias gone")
+
+bool alertLong      = whyLong != ""
+bool alertShort     = whyShort != ""
+bool alertExitLong  = whyExitLong != ""
+bool alertExitShort = whyExitShort != ""
+
+// Separate alerts per direction (static text; TradingView fills the placeholders)
+alertcondition(alertLong,      "LONG",       "LONG {{ticker}} @ {{close}} ({{interval}})")
+alertcondition(alertShort,     "SHORT",      "SHORT {{ticker}} @ {{close}} ({{interval}})")
+alertcondition(alertExitLong,  "EXIT LONG",  "EXIT LONG {{ticker}} @ {{close}} ({{interval}})")
+alertcondition(alertExitShort, "EXIT SHORT", "EXIT SHORT {{ticker}} @ {{close}} ({{interval}})")
+
+// One "Any alert() function call" alert covering all four, with the reason in the text
+alertFreq = alertBarClose ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+alertHead = " · " + syminfo.ticker + " @ " + fmt(close) + " · "
+if alertExitLong
+    alert("EXIT LONG" + alertHead + whyExitLong, alertFreq)
+if alertExitShort
+    alert("EXIT SHORT" + alertHead + whyExitShort, alertFreq)
+if alertLong
+    alert("LONG" + alertHead + whyLong, alertFreq)
+if alertShort
+    alert("SHORT" + alertHead + whyShort, alertFreq)
+
+// ── Per-signal alerts ───────────────────────────────────
+alertcondition(longSignal,  "Tail Confluence LONG",  "Hourly tails clustering at the day low")
+alertcondition(shortSignal, "Tail Confluence SHORT", "Hourly tails clustering at the day high")
+alertcondition(extLongSignal,  "Extended Target LONG",  "Long Target 2 broken")
+alertcondition(extShortSignal, "Extended Target SHORT", "Short Target 2 broken")
+alertcondition(fbo, "FBO-Short", "Failed breakout above pVAH: short, target pVAL")
+alertcondition(fbd, "FBD-Long",  "Failed breakdown below pVAL: long, target pVAH")
+alertcondition(longStoppedOut or shortStoppedOut, "Stopped Out", "Trailing stop hit")
+
+// ── Today's developing levels (last bar only) ───────────
+var line  stVah  = line.new(0, float(na), 0, float(na), color=liveVahCol, width=1)
+var line  stPoc  = line.new(0, float(na), 0, float(na), color=livePocCol, width=1)
+var line  stVal  = line.new(0, float(na), 0, float(na), color=liveValCol, width=1)
+var label tgVah  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveVahCol, 85), textcolor=liveVahCol, size=noteSz)
+var label tgPoc  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(livePocCol, 85), textcolor=livePocCol, size=noteSz)
+var label tgVal  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveValCol, 85), textcolor=liveValCol, size=noteSz)
 var label tgPVah = label.new(0, float(na), "", style=label.style_label_left, color=color.new(priorVaCol, 85), textcolor=priorVaCol, size=noteSz)
 var label tgPPoc = label.new(0, float(na), "", style=label.style_label_left, color=color.new(priorPocCol, 85), textcolor=priorPocCol, size=noteSz)
 var label tgPVal = label.new(0, float(na), "", style=label.style_label_left, color=color.new(priorVaCol, 85), textcolor=priorVaCol, size=noteSz)
 
-// Show a stub/tag at (x1..x2, y) with text, or hide it when y is na / disabled.
 setStub(line ln, float y, bool on, int x1, int x2) =>
     ln.set_xy1(x1, on ? y : na)
     ln.set_xy2(x2, on ? y : na)
-// Today's tags sit next to the stubs; prior tags go one column further right so
-// close levels (e.g. VAH vs Prior VAH) don't overlap.
-setTag(label lb, float y, string txt, bool on, int xOff) =>
+// Today's tags sit next to the stubs; prior tags go one column further right
+setTag(label lb, float y, string txt, bool on, int xOff, string tip) =>
     lb.set_xy(bar_index + xOff, on and not na(y) ? y : na)
     lb.set_text(txt + " " + str.tostring(y, format.mintick))
+    lb.set_tooltip(help(tip))
 
 if barstate.islast
-    liveOn = liveMode != "Off"
-    stubOn = liveMode == "Stubs"
-    x1 = bar_index - stubBars + 1
-    setStub(stVah, liveVah, stubOn, x1, bar_index + 2)
-    setStub(stPoc, livePoc, stubOn, x1, bar_index + 2)
-    setStub(stVal, liveVal, stubOn, x1, bar_index + 2)
-    setTag(tgVah, liveVah, "VAH", showTags and liveOn, 3)
-    setTag(tgPoc, livePoc, "POC", showTags and liveOn, 3)
-    setTag(tgVal, liveVal, "VAL", showTags and liveOn, 3)
-    priorOn = showTags and showRef and havePrior
-    setTag(tgPVah, priorVah, "pVAH", priorOn, 18)
-    setTag(tgPPoc, priorPoc, "pPOC", priorOn, 18)
-    setTag(tgPVal, priorVal, "pVAL", priorOn, 18)
+    bool  liveOn  = liveMode != "Off"
+    float liveVah = na
+    float liveVal = na
+    if liveOn
+        [lvI, llI] = valueArea(dayHist, dayPocIdx, vaPct)
+        liveVah := lvI * rowSize
+        liveVal := llI * rowSize
+    int x1 = bar_index - stubBars + 1
+    setStub(stVah, liveVah, liveOn, x1, bar_index + 2)
+    setStub(stPoc, dayPOC, liveOn, x1, bar_index + 2)
+    setStub(stVal, liveVal, liveOn, x1, bar_index + 2)
+    setTag(tgVah, liveVah, "dVAH", showTags and liveOn, 3, tipDVah)
+    setTag(tgPoc, dayPOC, "dPOC", showTags and liveOn, 3, tipDPoc)
+    setTag(tgVal, liveVal, "dVAL", showTags and liveOn, 3, tipDVal)
+    bool priorOn = showTags and showRef and not na(priorVah)
+    setTag(tgPVah, priorVah, "pVAH", priorOn, 18, tipPVah(priorDayTxt))
+    setTag(tgPPoc, poc1, "pPOC", priorOn, 18, tipPPoc(priorDayTxt))
+    setTag(tgPVal, priorVal, "pVAL", priorOn, 18, tipPVal(priorDayTxt))
 
-// ── Readout strip: [Bias] [Prior VAH] [Prior POC] [Prior VAL] in one row ──
-fmt(float v) => na(v) ? "—" : str.tostring(v, format.mintick)
+// ── Readout strip: [Bias] [pVAH] [pPOC] [pVAL] + what to do now ──
+toPosition(string p) =>
+    switch p
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Middle Left"   => position.middle_left
+        "Middle Right"  => position.middle_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right"  => position.bottom_right
+        => position.top_right
 
-readoutPosition = switch readoutPos
-    "Top Left"      => position.top_left
-    "Middle Left"   => position.middle_left
-    "Middle Right"  => position.middle_right
-    "Top Center"    => position.top_center
-    "Bottom Left"   => position.bottom_left
-    "Bottom Center" => position.bottom_center
-    "Bottom Right"  => position.bottom_right
-    => position.top_right
 readoutSize = readoutSizeIn == "Small" ? size.small : readoutSizeIn == "Large" ? size.large : size.normal
 readoutTop  = str.startswith(readoutPos, "Top")
+panelBg = color.new(#161A22, 8)
+panelFg = #E6E8EB
 
-// Two rows: an empty spacer row on the pane-edge side, then the strip itself.
-panelBg  = color.new(#161A22, 8)
-panelFg  = #E6E8EB
-var table readout = table.new(readoutPosition, 4, 3, frame_color=color.new(#2A2E39, 0), frame_width=1, border_color=color.new(#2A2E39, 0), border_width=1)
+var table readout = table.new(toPosition(readoutPos), 4, 3, frame_color=color.new(#2A2E39, 0), frame_width=1, border_color=color.new(#2A2E39, 0), border_width=1)
 if showReadout and barstate.islast
-    haveToday = useQual and volumeByPrice.size() > 0
-    aboveTodayPoc = haveToday and close > livePoc
-    [biasTxt, biasBg, biasFg] = switch confirmed
-        Bias.long  => [not haveToday or aboveTodayPoc ? "Bias L" : "Bias l", flipLongCol, color.black]
-        Bias.short => [not haveToday or not aboveTodayPoc ? "Bias S" : "Bias s", flipShortCol, color.black]
-        => ["Bias N", #8B919A, color.black]
-    spacerRow = readoutTop ? 0 : 2
-    stripRow  = 1
-    dirRow    = readoutTop ? 2 : 0
+    bool havePrior = not na(priorVah)
+    bool qual = useQual and haveToday
+    string biasTxt = dbBias == 1 ? (not qual or aboveTodayPoc ? "Bias L" : "Bias l") : dbBias == -1 ? (not qual or not aboveTodayPoc ? "Bias S" : "Bias s") : "Bias N"
+    color  biasBg  = dbBias == 1 ? flipLongCol : dbBias == -1 ? flipShortCol : #8B919A
+    int spacerRow = readoutTop ? 0 : 2
+    int stripRow  = 1
+    int dirRow    = readoutTop ? 2 : 0
     if readoutOffset > 0
         readout.cell(0, spacerRow, "", height=readoutOffset)
-    readout.cell(0, stripRow, havePrior ? biasTxt : "Bias —", bgcolor=havePrior ? color.new(biasBg, 10) : color.new(color.gray, 20), text_color=havePrior ? #0B0E11 : panelFg, text_size=readoutSize)
-    readout.cell(1, stripRow, "VAH " + fmt(priorVah), bgcolor=panelBg, text_color=priorVaCol, text_size=readoutSize)
-    readout.cell(2, stripRow, "POC " + fmt(priorPoc), bgcolor=panelBg, text_color=priorPocCol, text_size=readoutSize)
-    readout.cell(3, stripRow, "VAL " + fmt(priorVal), bgcolor=panelBg, text_color=priorVaCol, text_size=readoutSize)
+    string biasTip = "Bias vs the prior day's value area (" + priorDayTxt + ")\nL / S = " + str.tostring(flipBars) + " closes held above pVAH / below pVAL.\nl / s = that bias, but price is on the wrong side of dPOC.\nN = inside prior value: fade the edges."
+    readout.cell(0, stripRow, havePrior ? biasTxt : "Bias —", bgcolor=havePrior ? color.new(biasBg, 10) : color.new(color.gray, 20), text_color=havePrior ? #0B0E11 : panelFg, text_size=readoutSize, tooltip=help(biasTip))
+    readout.cell(1, stripRow, "pVAH " + fmt(priorVah), bgcolor=panelBg, text_color=priorVaCol, text_size=readoutSize, tooltip=help(tipPVah(priorDayTxt)))
+    readout.cell(2, stripRow, "pPOC " + fmt(poc1), bgcolor=panelBg, text_color=priorPocCol, text_size=readoutSize, tooltip=help(tipPPoc(priorDayTxt)))
+    readout.cell(3, stripRow, "pVAL " + fmt(priorVal), bgcolor=panelBg, text_color=priorVaCol, text_size=readoutSize, tooltip=help(tipPVal(priorDayTxt)))
 
-    // Direction line: what to do at the prior-session levels right now
-    if faShowDir and showFA
-        string dirTxt = "Waiting for prior session"
-        color  dirAcc = #8B919A
-        if havePrior
-            if rotDir == -1
-                dirTxt := "SHORT ▸ Prior VAL " + fmt(priorVal) + "\nFailed breakout of VAH"
-                dirAcc := failBoCol
-            else if rotDir == 1
-                dirTxt := "LONG ▸ Prior VAH " + fmt(priorVah) + "\nFailed breakdown of VAL"
-                dirAcc := failBdCol
-            else if confirmed == Bias.long
-                dirTxt := "Accepted above VAH\nNo fade · VAH is support"
-                dirAcc := succBoCol
-            else if confirmed == Bias.short
-                dirTxt := "Accepted below VAL\nNo fade · VAL is resistance"
-                dirAcc := succBdCol
-            else if close > priorVah
-                dirTxt := "Above VAH\nFail back inside → short to VAL"
-                dirAcc := #F5C451
-            else if close < priorVal
-                dirTxt := "Below VAL\nFail back inside → long to VAH"
-                dirAcc := #F5C451
-            else
-                dirTxt := "Inside value\nFade VAH → VAL · VAL → VAH"
-        readout.cell(0, dirRow, dirTxt, bgcolor=color.new(dirAcc, 82), text_color=panelFg, text_size=readoutSize)
-        readout.merge_cells(0, dirRow, 3, dirRow)
+    string dirTxt = "Waiting for a completed prior day"
+    color  dirAcc = #8B919A
+    if havePrior
+        if not na(dbExtLow)
+            dirTxt := "FBO-Short ▸ pVAL " + fmt(priorVal) + "\nFailed breakout of pVAH, rotating down"
+            dirAcc := failBoCol
+        else if not na(dbExtHigh)
+            dirTxt := "FBD-Long ▸ pVAH " + fmt(priorVah) + "\nFailed breakdown of pVAL, rotating up"
+            dirAcc := failBdCol
+        else if dbWatchingBO == 1
+            dirTxt := "BO-Long · accepted above pVAH\nNo fade · exit on BO-STC"
+            dirAcc := succBoCol
+        else if dbWatchingBO == -1
+            dirTxt := "BD-Short · accepted below pVAL\nNo fade · exit on BD-BTC"
+            dirAcc := succBdCol
+        else if close > priorVah
+            dirTxt := "Above pVAH, not yet accepted\nWick back inside → FBO-Short"
+            dirAcc := pocCrossCol
+        else if close < priorVal
+            dirTxt := "Below pVAL, not yet accepted\nWick back inside → FBD-Long"
+            dirAcc := pocCrossCol
+        else
+            dirTxt := "Inside value\nFade pVAH → pVAL · pVAL → pVAH"
+    readout.cell(0, dirRow, dirTxt, bgcolor=color.new(dirAcc, 82), text_color=panelFg, text_size=readoutSize)
+    readout.merge_cells(0, dirRow, 3, dirRow)
+
+// ── Diagnostics panel (the thinkScript's AddLabel row) ──
+var table diag = table.new(toPosition(diagPos), 1, 12, frame_color=color.new(#2A2E39, 0), frame_width=1, border_color=color.new(#2A2E39, 0), border_width=1)
+diagRow(int r, string txt, color fg, string tip) =>
+    diag.cell(0, r, txt, bgcolor=color.new(#161A22, 8), text_color=fg, text_size=size.small, text_halign=text.align_left, tooltip=help(tip))
+
+if showDiag and barstate.islast
+    diagRow(0, "Day Lo/Hi: " + fmt(dayLo) + " / " + fmt(dayHi), color.gray, "Today's profile low/high. Confluence measures hourly tails against these.")
+    diagRow(1, "This Hour Lo/Hi: " + fmt(hrLo) + " / " + fmt(hrHi), color.gray, "The live hour's profile low/high (slot 0 of the lookback).")
+    diagRow(2, "Prior Day VAL/VAH: " + fmt(priorVal) + " / " + fmt(priorVah), failBoCol, "pVAL / pVAH from " + priorDayTxt + ". The Daily Bias bubbles key off these.")
+    diagRow(3, "Tolerance: " + fmt(tol), color.gray, "How close an hourly tail must be to the day's tail to count as near. " + (tolMode == "ATR Multiple" ? str.tostring(tolAtr) + " × ATR(14)." : "Fixed points."))
+    diagRow(4, "Near-Low: " + str.tostring(countNearLow) + "/" + str.tostring(hrLookback) + " (need " + str.tostring(minHours) + ")" + (dayLongFired ? " · fired today" : ""), longConf ? confLongCol : color.gray, "Hourly lows within tolerance of the day low. Reaching the requirement while price is above the day low fires CONFLUENCE LONG.")
+    diagRow(5, "Near-High: " + str.tostring(countNearHigh) + "/" + str.tostring(hrLookback) + " (need " + str.tostring(minHours) + ")" + (dayShortFired ? " · fired today" : ""), shortConf ? confShortCol : color.gray, "Hourly highs within tolerance of the day high. Reaching the requirement while price is below the day high fires CONFLUENCE SHORT.")
+    diagRow(6, "POC Target 1 (immediate, today): " + fmt(dayPOC), color.gray, "Today's developing POC (dPOC).")
+    diagRow(7, "POC Target 2 for LONG: " + (na(target2Long) ? "none valid" : fmt(target2Long) + " (" + str.tostring(t2LongDaysBack) + "d back)"), confLongCol, "Nearest prior-day POC above today's POC and above every closer day's POC (up to 5 days back).")
+    diagRow(8, "POC Target 2 for SHORT: " + (na(target2Short) ? "none valid" : fmt(target2Short) + " (" + str.tostring(t2ShortDaysBack) + "d back)"), confShortCol, "Nearest prior-day POC below today's POC and below every closer day's POC (up to 5 days back).")
+    diagRow(9, "Current bias: " + (currentBias > 0 ? "LONG" : currentBias < 0 ? "SHORT" : "none yet"), currentBias > 0 ? confLongCol : currentBias < 0 ? confShortCol : color.gray, "Direction of the last confluence signal. Extended-target bubbles against it are hidden while that option is on.")
+    diagRow(10, "Trail stop: " + (not na(longStop) ? "LONG @ " + fmt(longStop) : not na(shortStop) ? "SHORT @ " + fmt(shortStop) : "flat"), not na(longStop) ? stopLongCol : not na(shortStop) ? stopShortCol : color.gray, "Hypothetical position from the confluence signals. The stop ratchets once per hour using the " + stopAnchor + " anchor.")
+    if timeframe.in_seconds() >= 3600
+        diagRow(11, "Hourly profiles need a chart finer than 60m", flipShortCol, "At 60m and above each hourly profile is a single bar, so the tail confluence and hourly trailing stop do almost nothing. Use 5m or 15m.")
+
+// ── Data Window diagnostics (the thinkScript's hidden plots) ──
+plot(countNearLow,  "Diag NearLowCount",  display=display.data_window)
+plot(countNearHigh, "Diag NearHighCount", display=display.data_window)
+plot(tol,           "Diag Tolerance",     display=display.data_window)
+plot(h1Low,  "Diag H1Low",  display=display.data_window)
+plot(h2Low,  "Diag H2Low",  display=display.data_window)
+plot(h3Low,  "Diag H3Low",  display=display.data_window)
+plot(h1High, "Diag H1High", display=display.data_window)
+plot(h2High, "Diag H2High", display=display.data_window)
+plot(h3High, "Diag H3High", display=display.data_window)
+plot(dayPOC,   "Diag DayPOC",      display=display.data_window)
+plot(priorVal, "Diag PriorDayVAL", display=display.data_window)
+plot(priorVah, "Diag PriorDayVAH", display=display.data_window)
+plot(poc1, "Diag Poc1", display=display.data_window)
+plot(poc2, "Diag Poc2", display=display.data_window)
+plot(poc3, "Diag Poc3", display=display.data_window)
+plot(poc4, "Diag Poc4", display=display.data_window)
+plot(poc5, "Diag Poc5", display=display.data_window)
+plot(target2Long,  "Diag Target2Long",  display=display.data_window)
+plot(target2Short, "Diag Target2Short", display=display.data_window)
+plot(target3Long,  "Diag Target3Long",  display=display.data_window)
+plot(target3Short, "Diag Target3Short", display=display.data_window)
+plot(currentBias,  "Diag CurrentBias",  display=display.data_window)
+plot(longStop,     "Diag LongTrailingStop",  display=display.data_window)
+plot(shortStop,    "Diag ShortTrailingStop", display=display.data_window)
+plot(t1HourVAL, "Diag T1HourVAL", display=display.data_window)
+plot(t1HourVAH, "Diag T1HourVAH", display=display.data_window)
+plot(dbBias,    "Diag DailyBias", display=display.data_window)
