@@ -109,6 +109,7 @@ letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxva
 lblSizeIn      = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"], group=grpL)
 letterSizeIn   = input.string("Normal", "Letter Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpL)
 letterKeepBars = input.int(10, "Bias Letters: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+showNeutralLtr = input.bool(false, "Show Neutral (N) Letters", group=grpL, tooltip="N = price is inside the prior value area (no directional lean). Off hides only the N letter; L/S/l/s still print, and the readout still shows 'Bias N'.")
 faKeepBars     = input.int(60, "Daily Bias Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 sigKeepBars    = input.int(0, "Confluence / Stop / Target Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 bubbleKeepBars = input.int(60, "Today-POC Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
@@ -638,8 +639,9 @@ if crossed and not na(priorVah)
     string letter = dbBias == 1 ? (not qual or aboveTodayPoc ? "L" : "l") : dbBias == -1 ? (not qual or not aboveTodayPoc ? "S" : "s") : "N"
     bool isFlip = dbBias != lastPrinted
     color col = dbBias == 1 ? (isFlip ? flipLongCol : contLongCol) : dbBias == -1 ? (isFlip ? flipShortCol : contShortCol) : (isFlip ? flipNeutralCol : contNeutralCol)
-    trackLbl(letterLbls, letterBars, label.new(bar_index, low - letterOffset * syminfo.mintick, letter, yloc=yloc.price, style=label.style_none, textcolor=col, size=letterSize))
-    lastPrinted := dbBias
+    if dbBias != 0 or showNeutralLtr
+        trackLbl(letterLbls, letterBars, label.new(bar_index, low - letterOffset * syminfo.mintick, letter, yloc=yloc.price, style=label.style_none, textcolor=col, size=letterSize))
+    lastPrinted := dbBias       // tracked even when the N is hidden, so the next L/S still reads as a flip
 lastCheckpointElapsed := elapsed
 
 pruneLbls(letterLbls, letterBars, letterKeepBars)
