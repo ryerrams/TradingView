@@ -674,7 +674,6 @@ if anyShotgunSignal
 var int   shotgunDirection = 0
 var float shotgunEntry = na
 var float shotgunStop  = na
-var float shotgunRisk  = na
 var float shotgunT1    = na
 var float shotgunT2    = na
 var float shotgunT3    = na
@@ -683,7 +682,6 @@ if anyShotgunSignal
     shotgunDirection := newShotgunDirection
     shotgunEntry     := newShotgunEntry
     shotgunStop      := newShotgunStop
-    shotgunRisk      := newShotgunRisk
     shotgunT1        := shotgunLongSignal ? finalLongT1 : finalShortT1
     shotgunT2        := shotgunLongSignal ? finalLongT2 : finalShortT2
     shotgunT3        := shotgunLongSignal ? finalLongT3 : finalShortT3
@@ -881,17 +879,8 @@ if barstate.islast
     if showLabels and turnSignalsLayer and latestSignalIsTurn and turnPlanActive and not na(turnEntry)
         array.push(texts, (isScalp ? "SCALP " : "TREND RUN ") + (turnDirection == 1 ? "BUY " : "SELL ") + f_p(turnEntry) + "   SL " + f_p(turnStopValue) + "\nTP " + f_p(turnT1Value) + " / " + f_p(turnT2Value) + " / " + f_p(turnT3Value))
         array.push(cols, turnDirection == 1 ? cTrendyBull : cTrendyBear)
-    if showLabels and precisionTradesLayer and latestSignalIsShotgun and shotgunPlanActive and not na(shotgunEntry)
-        array.push(texts, "SHOTGUN " + (shotgunDirection == 1 ? "LONG " : "SHORT ") + f_p(shotgunEntry) + "\nSTOP " + f_p(shotgunStop) + "   RISK " + f_p(shotgunRisk))
-        array.push(cols, shotgunDirection == 1 ? cTrendyBull : cTrendyBear)
-    if showLabels and precisionTradesLayer and latestSignalIsShotgun and shotgunPlanActive and not na(shotgunT1)
-        array.push(texts, "T1 " + f_p(shotgunT1) + "\nT2 " + f_p(shotgunT2) + "\nT3 " + f_p(shotgunT3))
-        array.push(cols, cTrendyNeutral)
     if showLabels and turnSignalsLayer and latestSignalIsTurn and not turnPlanActive and lastTurnSignalBar > 0
         array.push(texts, "LAST " + (turnDirection == 1 ? "BUY " : "SELL ") + f_p(turnEntry) + " (CLOSED)\nSL " + f_p(turnStopValue) + "\nT1 " + f_p(turnT1Value) + "  T2 " + f_p(turnT2Value) + "  T3 " + f_p(turnT3Value))
-        array.push(cols, cNeutral)
-    if showLabels and precisionTradesLayer and latestSignalIsShotgun and not shotgunPlanActive and lastShotgunSignalBar > 0
-        array.push(texts, "LAST SHOTGUN " + (shotgunDirection == 1 ? "LONG " : "SHORT ") + f_p(shotgunEntry) + " (CLOSED)\nSTOP " + f_p(shotgunStop) + "\nT1 " + f_p(shotgunT1) + "  T2 " + f_p(shotgunT2) + "  T3 " + f_p(shotgunT3))
         array.push(cols, cNeutral)
     rowOffset = panelIsTop ? 1 : 0
     if panelIsTop
