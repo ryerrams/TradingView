@@ -41,6 +41,7 @@ tradeMode                  = input.string("TrendRun", "Trade Mode", options=["Sc
 labelPosIn                 = input.string("Bottom Left", "Info Panel Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=GD, tooltip="Top positions add a spacer so the panel clears TradingView's toolbar and legend.")
 labelSizeIn                = input.string("Normal", "Info Panel Text Size", options=["Tiny", "Small", "Normal", "Large"], group=GD)
 showLineTags               = input.bool(true, "Show Plan Line Tags", group=GD, tooltip="Name and price at the right end of the entry, stop, and target lines.")
+lineTagOffset              = input.int(12, "Plan Line Tag Offset (bars)", minval=1, maxval=100, group=GD, tooltip="How many bars right of the last bar the plan line tags sit. Raise it to clear other right-side drawings such as Fibonacci pivot zones.")
 cooldownFromIn             = input.string("Last Fired Signal", "Cooldown Counts From", options=["Last Fired Signal", "Last Setup (TOS original)"], group=GD, tooltip="Last Fired Signal: a blocked setup does not restart the cooldown, so a run of setups every 1-2 bars cannot suppress every entry. Last Setup: original thinkorswim behavior.")
 cooldownFromSignal         = cooldownFromIn == "Last Fired Signal"
 latestOnly                 = signalMarkersIn == "Latest Only"
@@ -720,7 +721,7 @@ var int lastShotgunSignalBar = 0
 f_addLine(float y, color c, bool dashed, string name) =>
     array.push(planLines, line.new(bar_index, y, bar_index, y, color=c, width=1, style=dashed ? line.style_dashed : line.style_solid))
     if showLineTags
-        array.push(planTags, label.new(bar_index + 2, y, name + " " + f_p(y), style=label.style_label_left, color=color.new(c, 15), textcolor=f_txt(c), size=size.small))
+        array.push(planTags, label.new(bar_index + lineTagOffset, y, name + " " + f_p(y), style=label.style_label_left, color=color.new(c, 15), textcolor=f_txt(c), size=size.small))
 
 f_addLabel(float y, string txt, color c, bool above, bool dyn) =>
     array.push(planLabels, label.new(bar_index, y, txt, style=above ? label.style_label_down : label.style_label_up, color=c, textcolor=f_txt(c), size=size.small))
@@ -804,7 +805,7 @@ if planActiveNow
     for l in planLines
         line.set_x2(l, bar_index)
     for t in planTags
-        label.set_x(t, bar_index + 2)
+        label.set_x(t, bar_index + lineTagOffset)
 
 // Exit bubbles for the newest plan.
 if showBubbles and planKind == 1 and turnSignalsLayer
