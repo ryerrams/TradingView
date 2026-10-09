@@ -16,6 +16,7 @@
 //  - Stubs and shading also respect the Show Key / R1S1 / R2S2 / R3S3 toggles
 //    (the original only applied them to full lines and labels).
 //  - Added (not in the original): S1/S2/S3 reclaim markers and alerts.
+//  - Added: context help (input tooltips and hover tooltips on stub labels).
 // =============================================================================
 indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_boxes_count=50, max_labels_count=50)
 
@@ -23,20 +24,20 @@ indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_
 // Inputs
 // -----------------------------------------------------------------------------
 GL = "Levels"
-pivotType      = input.string("Fibonacci", "Pivot Type", options=["Fibonacci", "Standard"], group=GL)
-anchorTF       = input.string("Auto", "Anchor Timeframe", options=["Auto", "Daily", "Weekly", "Monthly", "Yearly"], group=GL)
-showKey        = input.bool(true, "Show Key",   group=GL)
-showR1S1       = input.bool(true, "Show R1/S1", group=GL)
-showR2S2       = input.bool(true, "Show R2/S2", group=GL)
-showR3S3       = input.bool(true, "Show R3/S3", group=GL)
+pivotType      = input.string("Fibonacci", "Pivot Type", options=["Fibonacci", "Standard"], group=GL, tooltip="Fibonacci: PT/S levels sit at 0.382, 0.618 and 1.0 of the prior period's range from Key. Standard: classic floor-trader pivots (R1-R3 / S1-S3).")
+anchorTF       = input.string("Auto", "Anchor Timeframe", options=["Auto", "Daily", "Weekly", "Monthly", "Yearly"], group=GL, tooltip="The period whose high, low and close build the levels. Auto: 15m and below uses the prior day, above 15m intraday uses the prior week, 1D uses the prior month, above 1D uses the prior year.")
+showKey        = input.bool(true, "Show Key",   group=GL, tooltip="Key = (prior high + low + close) / 3. The balance line: holding above it leans bullish, below it leans bearish.")
+showR1S1       = input.bool(true, "Show R1/S1", group=GL, tooltip="PT1 and S1: the first profit target above Key and the first support below it.")
+showR2S2       = input.bool(true, "Show R2/S2", group=GL, tooltip="PT2 and S2: the second target and support. Reaching them usually signals a trending period.")
+showR3S3       = input.bool(true, "Show R3/S3", group=GL, tooltip="PT3 and S3: the extended target and support, one full prior range from Key (Fibonacci). Moves this far are often stretched.")
 
 GD = "Display"
 stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tooltip="Length of the right-edge stubs, in bars past the last bar.")
-shadingOn      = input.bool(true, "Shading", group=GD)
+shadingOn      = input.bool(true, "Shading", group=GD, tooltip="Fill the bands between adjacent levels: green above Key, red below.")
 shadingScope   = input.string("StubOnly", "Shading Scope", options=["StubOnly", "FullWidth"], group=GD, tooltip="FullWidth also turns on the full-width lines.")
-showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD)
-showStubLabels = input.bool(true, "Show Stub Labels", group=GD)
-shadeTransp    = input.int(85, "Shading Transparency", minval=0, maxval=100, group=GD)
+showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD, tooltip="Extend each level as a dashed line across the whole chart, not only the right-edge stub.")
+showStubLabels = input.bool(true, "Show Stub Labels", group=GD, tooltip="Name each stub (Key, PT1, S1...). Hover a label for its price, formula and how to read it.")
+shadeTransp    = input.int(85, "Shading Transparency", minval=0, maxval=100, group=GD, tooltip="0 is solid, 100 is invisible.")
 
 GR = "Reclaim Markers"
 showReclaims = input.bool(true, "Show Reclaim Markers", group=GR, tooltip="Marks the first close back above S1/S2/S3 after price dipped below it.")
@@ -47,6 +48,9 @@ colKey = input.color(color.rgb( 60, 200, 255), "Key",      group=GC)
 colR   = input.color(color.rgb( 60, 190,  80), "PT (R)",   group=GC)
 colS   = input.color(color.rgb(220,  60,  60), "Supports", group=GC)
 colRec = input.color(color.rgb(255, 200,  40), "Reclaim",  group=GC)
+
+GH = "Context Help"
+showHelp = input.bool(true, "Show Label Tooltips", group=GH, tooltip="Hover a stub label to see its price, how it is computed and how to read it.")
 
 // -----------------------------------------------------------------------------
 // Anchor timeframe (TV-style Auto mapping)
@@ -59,6 +63,11 @@ anchor = switch anchorTF
     "Monthly" => "M"
     "Yearly"  => "12M"
     => autoTF
+anchorName = switch anchor
+    "D" => "day"
+    "W" => "week"
+    "M" => "month"
+    => "year"
 
 // -----------------------------------------------------------------------------
 // Prior-period OHLC from chart bars
@@ -147,13 +156,13 @@ stubR = bar_index + stubBars
 // Middle stub bar (odd/even handled like the original)
 midStub = bar_index + (stubBars <= 1 ? 1 : stubBars % 2 == 0 ? stubBars / 2 : (stubBars + 1) / 2)
 
-drawLevel(float y, color c, string txt, bool show) =>
+drawLevel(float y, color c, string txt, bool show, string tip) =>
     if show and not na(y)
         lines.push(line.new(stubL, y, stubR, y, color=c, width=2))
         if wantFullLines
             lines.push(line.new(bar_index, y, stubL, y, color=c, width=1, style=line.style_dashed, extend=extend.left))
         if showStubLabels
-            labels.push(label.new(midStub, y, txt, color=c, textcolor=color.white, style=label.style_label_center, size=size.small))
+            labels.push(label.new(midStub, y, txt, color=c, textcolor=color.white, style=label.style_label_center, size=size.small, tooltip=showHelp ? txt + " " + str.tostring(y, format.mintick) + "\n" + tip : na))
 
 shadeBand(float a, float b, color c, bool show) =>
     if shadingOn and show and not na(a) and not na(b)
@@ -181,10 +190,11 @@ if barstate.islast
     shadeBand(s2,  s1,  colS, showR1S1 and showR2S2)
     shadeBand(s3,  s2,  colS, showR2S2 and showR3S3)
 
-    drawLevel(key, colKey, "Key", showKey)
-    drawLevel(pt1, colR,   "PT1", showR1S1)
-    drawLevel(pt2, colR,   "PT2", showR2S2)
-    drawLevel(pt3, colR,   "PT3", showR3S3)
-    drawLevel(s1,  colS,   "S1",  showR1S1)
-    drawLevel(s2,  colS,   "S2",  showR2S2)
-    drawLevel(s3,  colS,   "S3",  showR3S3)
+    prior = "prior " + anchorName
+    drawLevel(key, colKey, "Key", showKey,  "(" + prior + " high + low + close) / 3.\nBalance line: holding above leans bullish, below leans bearish.")
+    drawLevel(pt1, colR,   "PT1", showR1S1, (isStd ? "2 x Key - " + prior + " low." : "Key + 0.382 x " + prior + " range.") + "\nFirst profit target for longs. Expect the first reaction here.")
+    drawLevel(pt2, colR,   "PT2", showR2S2, (isStd ? "Key + " + prior + " range." : "Key + 0.618 x " + prior + " range.") + "\nSecond target. Acceptance above PT1 often runs here.")
+    drawLevel(pt3, colR,   "PT3", showR3S3, (isStd ? prior + " high + 2 x (Key - low)." : "Key + 1.0 x " + prior + " range.") + "\nExtended target. Moves this far are often stretched.")
+    drawLevel(s1,  colS,   "S1",  showR1S1, (isStd ? "2 x Key - " + prior + " high." : "Key - 0.382 x " + prior + " range.") + "\nFirst support. A close back above after a dip prints an S1 reclaim.")
+    drawLevel(s2,  colS,   "S2",  showR2S2, (isStd ? "Key - " + prior + " range." : "Key - 0.618 x " + prior + " range.") + "\nSecond support. Loss of S1 often runs here.")
+    drawLevel(s3,  colS,   "S3",  showR3S3, (isStd ? prior + " low - 2 x (high - Key)." : "Key - 1.0 x " + prior + " range.") + "\nExtended support. Moves this far are often stretched.")
