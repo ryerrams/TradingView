@@ -1,0 +1,190 @@
+//@version=6
+// =============================================================================
+//  KEY PIVOT STUBS  (TradingView port of the thinkorswim study)
+//
+//  Key / PT1-3 / S1-3 pivot levels from the prior anchor period, drawn as short
+//  "stubs" in the empty space right of the last bar, with optional shading,
+//  full-width lines and centered labels.
+//
+//  Port notes:
+//  - Prior-period H/L/C is built from the chart's own bars (like the TOS
+//    rec/CompoundValue logic), so extended-hours bars count when shown.
+//  - Auto anchor: <=15m -> Daily, >15m intraday -> Weekly, 1D -> Monthly,
+//    above 1D -> Yearly (same mapping as the original).
+//  - HighestAll(..._now) "latest value" plots are rebuilt as line/box/label
+//    objects redrawn on the last bar.
+//  - Stubs and shading also respect the Show Key / R1S1 / R2S2 / R3S3 toggles
+//    (the original only applied them to full lines and labels).
+//  - Added (not in the original): S1/S2/S3 reclaim markers and alerts.
+// =============================================================================
+indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_boxes_count=50, max_labels_count=50)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+GL = "Levels"
+pivotType      = input.string("Fibonacci", "Pivot Type", options=["Fibonacci", "Standard"], group=GL)
+anchorTF       = input.string("Auto", "Anchor Timeframe", options=["Auto", "Daily", "Weekly", "Monthly", "Yearly"], group=GL)
+showKey        = input.bool(true, "Show Key",   group=GL)
+showR1S1       = input.bool(true, "Show R1/S1", group=GL)
+showR2S2       = input.bool(true, "Show R2/S2", group=GL)
+showR3S3       = input.bool(true, "Show R3/S3", group=GL)
+
+GD = "Display"
+stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tooltip="Length of the right-edge stubs, in bars past the last bar.")
+shadingOn      = input.bool(true, "Shading", group=GD)
+shadingScope   = input.string("StubOnly", "Shading Scope", options=["StubOnly", "FullWidth"], group=GD, tooltip="FullWidth also turns on the full-width lines.")
+showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD)
+showStubLabels = input.bool(true, "Show Stub Labels", group=GD)
+shadeTransp    = input.int(85, "Shading Transparency", minval=0, maxval=100, group=GD)
+
+GR = "Reclaim Markers"
+showReclaims = input.bool(true, "Show Reclaim Markers", group=GR, tooltip="Marks the first close back above S1/S2/S3 after price dipped below it.")
+reclaimDip   = input.string("Close below", "Dip Trigger", options=["Close below", "Wick below"], group=GR, tooltip="Close below: a bar must close under the support first. Wick below: any trade under it counts, so a hammer that closes back above fires on the same bar.")
+
+GC = "Colors"
+colKey = input.color(color.rgb( 60, 200, 255), "Key",      group=GC)
+colR   = input.color(color.rgb( 60, 190,  80), "PT (R)",   group=GC)
+colS   = input.color(color.rgb(220,  60,  60), "Supports", group=GC)
+colRec = input.color(color.rgb(255, 200,  40), "Reclaim",  group=GC)
+
+// -----------------------------------------------------------------------------
+// Anchor timeframe (TV-style Auto mapping)
+// -----------------------------------------------------------------------------
+tfSec = timeframe.in_seconds()
+autoTF = tfSec <= 900 ? "D" : tfSec < 86400 ? "W" : tfSec == 86400 ? "M" : "12M"
+anchor = switch anchorTF
+    "Daily"   => "D"
+    "Weekly"  => "W"
+    "Monthly" => "M"
+    "Yearly"  => "12M"
+    => autoTF
+
+// -----------------------------------------------------------------------------
+// Prior-period OHLC from chart bars
+// -----------------------------------------------------------------------------
+newPeriod = timeframe.change(anchor)
+prevClose = close[1]
+
+var float hiCur  = na
+var float loCur  = na
+var float hPrev  = na
+var float lPrev  = na
+var float cPrev  = na
+
+if newPeriod
+    hPrev := hiCur
+    lPrev := loCur
+    cPrev := prevClose
+    hiCur := high
+    loCur := low
+else
+    hiCur := na(hiCur) ? high : math.max(high, hiCur)
+    loCur := na(loCur) ? low  : math.min(low,  loCur)
+
+// -----------------------------------------------------------------------------
+// Key / PT / Support math
+// -----------------------------------------------------------------------------
+key = (hPrev + lPrev + cPrev) / 3
+rng = hPrev - lPrev
+isStd = pivotType == "Standard"
+
+pt1 = isStd ? 2 * key - lPrev              : key + 0.382 * rng
+s1  = isStd ? 2 * key - hPrev              : key - 0.382 * rng
+pt2 = isStd ? key + rng                    : key + 0.618 * rng
+s2  = isStd ? key - rng                    : key - 0.618 * rng
+pt3 = isStd ? hPrev + 2 * (key - lPrev)    : key + rng
+s3  = isStd ? lPrev - 2 * (hPrev - key)    : key - rng
+
+// Data window only, so values are readable without cluttering the chart
+plot(key, "Key", colKey, display=display.data_window)
+plot(pt1, "PT1", colR,   display=display.data_window)
+plot(pt2, "PT2", colR,   display=display.data_window)
+plot(pt3, "PT3", colR,   display=display.data_window)
+plot(s1,  "S1",  colS,   display=display.data_window)
+plot(s2,  "S2",  colS,   display=display.data_window)
+plot(s3,  "S3",  colS,   display=display.data_window)
+
+// -----------------------------------------------------------------------------
+// Support reclaims: dip below a support, then the first close back above it.
+// Arming resets each new anchor period since the levels change.
+// -----------------------------------------------------------------------------
+reclaim(float lvl) =>
+    var bool armed = false
+    if newPeriod
+        armed := false
+    dipped = reclaimDip == "Wick below" ? low < lvl : close < lvl
+    if not na(lvl) and dipped
+        armed := true
+    fired = armed and not na(lvl) and close > lvl
+    if fired
+        armed := false
+    fired
+
+recS1 = reclaim(s1)
+recS2 = reclaim(s2)
+recS3 = reclaim(s3)
+
+plotshape(showReclaims and showR1S1 and recS1, "S1 Reclaim", shape.triangleup, location.belowbar, colRec, text="S1", textcolor=colRec, size=size.small)
+plotshape(showReclaims and showR2S2 and recS2, "S2 Reclaim", shape.triangleup, location.belowbar, colRec, text="S2", textcolor=colRec, size=size.small)
+plotshape(showReclaims and showR3S3 and recS3, "S3 Reclaim", shape.triangleup, location.belowbar, colRec, text="S3", textcolor=colRec, size=size.small)
+
+alertcondition(recS1, "S1 Reclaim", "{{ticker}} reclaimed S1 at {{close}}")
+alertcondition(recS2, "S2 Reclaim", "{{ticker}} reclaimed S2 at {{close}}")
+alertcondition(recS3, "S3 Reclaim", "{{ticker}} reclaimed S3 at {{close}}")
+alertcondition(recS1 or recS2 or recS3, "Any Support Reclaim", "{{ticker}} reclaimed a support level at {{close}}")
+
+// -----------------------------------------------------------------------------
+// Drawing (last bar only)
+// -----------------------------------------------------------------------------
+var array<line>  lines  = array.new<line>()
+var array<box>   boxes  = array.new<box>()
+var array<label> labels = array.new<label>()
+
+wantFullLines = shadingScope == "FullWidth" or showFullLines
+stubL = bar_index + 1
+stubR = bar_index + stubBars
+// Middle stub bar (odd/even handled like the original)
+midStub = bar_index + (stubBars <= 1 ? 1 : stubBars % 2 == 0 ? stubBars / 2 : (stubBars + 1) / 2)
+
+drawLevel(float y, color c, string txt, bool show) =>
+    if show and not na(y)
+        lines.push(line.new(stubL, y, stubR, y, color=c, width=2))
+        if wantFullLines
+            lines.push(line.new(bar_index, y, stubL, y, color=c, width=1, style=line.style_dashed, extend=extend.left))
+        if showStubLabels
+            labels.push(label.new(midStub, y, txt, color=c, textcolor=color.white, style=label.style_label_center, size=size.small))
+
+shadeBand(float a, float b, color c, bool show) =>
+    if shadingOn and show and not na(a) and not na(b)
+        fillCol = color.new(c, shadeTransp)
+        if shadingScope == "StubOnly"
+            boxes.push(box.new(stubL, math.max(a, b), stubR, math.min(a, b), border_color=na, bgcolor=fillCol))
+        else
+            boxes.push(box.new(bar_index, math.max(a, b), stubR, math.min(a, b), border_color=na, bgcolor=fillCol, extend=extend.left))
+
+if barstate.islast
+    for l in lines
+        l.delete()
+    for b in boxes
+        b.delete()
+    for lb in labels
+        lb.delete()
+    lines.clear()
+    boxes.clear()
+    labels.clear()
+
+    shadeBand(key, pt1, colR, showKey  and showR1S1)
+    shadeBand(pt1, pt2, colR, showR1S1 and showR2S2)
+    shadeBand(pt2, pt3, colR, showR2S2 and showR3S3)
+    shadeBand(s1,  key, colS, showKey  and showR1S1)
+    shadeBand(s2,  s1,  colS, showR1S1 and showR2S2)
+    shadeBand(s3,  s2,  colS, showR2S2 and showR3S3)
+
+    drawLevel(key, colKey, "Key", showKey)
+    drawLevel(pt1, colR,   "PT1", showR1S1)
+    drawLevel(pt2, colR,   "PT2", showR2S2)
+    drawLevel(pt3, colR,   "PT3", showR3S3)
+    drawLevel(s1,  colS,   "S1",  showR1S1)
+    drawLevel(s2,  colS,   "S2",  showR2S2)
+    drawLevel(s3,  colS,   "S3",  showR3S3)
