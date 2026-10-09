@@ -36,7 +36,7 @@ stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tool
 shadingOn      = input.bool(true, "Shading", group=GD, tooltip="Fill the bands between adjacent levels: green above Key, red below.")
 shadingScope   = input.string("StubOnly", "Shading Scope", options=["StubOnly", "FullWidth"], group=GD, tooltip="FullWidth also turns on the full-width lines.")
 showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD, tooltip="Extend each level as a dashed line across the whole chart, not only the right-edge stub.")
-showStubLabels = input.bool(true, "Show Stub Labels", group=GD, tooltip="Name each stub (Key, PT1, S1...). Hover a label for its price, formula and how to read it.")
+showStubLabels = input.bool(true, "Show Stub Labels", group=GD, tooltip="Name each stub (Key, PT1, S1...). Hover a label for its formula and how to read it.")
 shadeTransp    = input.int(85, "Shading Transparency", minval=0, maxval=100, group=GD, tooltip="0 is solid, 100 is invisible.")
 
 GR = "Reclaim Markers"
@@ -50,7 +50,7 @@ colS   = input.color(color.rgb(220,  60,  60), "Supports", group=GC)
 colRec = input.color(color.rgb(255, 200,  40), "Reclaim",  group=GC)
 
 GH = "Context Help"
-showHelp = input.bool(true, "Show Label Tooltips", group=GH, tooltip="Hover a stub label to see its price, how it is computed and how to read it.")
+showHelp = input.bool(true, "Show Label Tooltips", group=GH, tooltip="Hover a stub label to see how it is computed and how to read it.")
 
 // -----------------------------------------------------------------------------
 // Anchor timeframe (TV-style Auto mapping)
@@ -162,7 +162,7 @@ drawLevel(float y, color c, string txt, bool show, string tip) =>
         if wantFullLines
             lines.push(line.new(bar_index, y, stubL, y, color=c, width=1, style=line.style_dashed, extend=extend.left))
         if showStubLabels
-            labels.push(label.new(midStub, y, txt, color=c, textcolor=color.white, style=label.style_label_center, size=size.small, tooltip=showHelp ? txt + " " + str.tostring(y, format.mintick) + "\n" + tip : na))
+            labels.push(label.new(midStub, y, txt, color=c, textcolor=color.white, style=label.style_label_center, size=size.small, tooltip=showHelp ? tip : na))
 
 shadeBand(float a, float b, color c, bool show) =>
     if shadingOn and show and not na(a) and not na(b)
