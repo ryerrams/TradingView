@@ -13,10 +13,10 @@
 //  price is at/above the EMA, below it when price is under. By default only
 //  the live bar gets one; turn on historical labels to see it on every bar.
 //
-//  BUY: price was deeply oversold (factor <= -BUY Threshold on this bar or
-//  within the lookback) AND price closes above the prior candle's open.
-//  Defaults (3.5x, lookback 1, confirm on close) match Keyur's backtest;
-//  turn "Confirm on Bar Close" off to fire intrabar (can repaint).
+//  BUY: the previous candle was Extended below the EMA
+//  (factor[1] <= -Extended Threshold) AND this candle closes above the
+//  previous candle's close. Fires once, on the first bar of the setup.
+//  Turn "Confirm on Bar Close" off to fire intrabar (can repaint).
 // =====================================================================
 indicator("ATR Stretch from EMA", overlay=true, max_labels_count=500)
 
@@ -27,8 +27,6 @@ atrAverageType    = input.string("Wilders", "ATR Average Type", options=["Wilder
 extendedThreshold = input.float(2.0, "Extended Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extended (red)")
 extremeThreshold  = input.float(3.0, "Extreme Threshold (|factor|)", minval=0, step=0.1, tooltip="|factor| at/above this is flagged extreme (fuchsia), above or below the EMA")
 showEma           = input.bool(false, "Show EMA on Price")
-buyThreshold      = input.float(3.5, "BUY Threshold (ATR below EMA)", minval=0, step=0.1, tooltip="BUY when price is this many ATR BELOW the EMA (oversold)")
-oversoldLookback  = input.int(1, "BUY Oversold Lookback (bars)", minval=1, maxval=20, tooltip="1 = oversold must be on the reclaim bar itself (original ToS behavior). 2 = this bar or the prior bar.")
 confirmOnClose    = input.bool(true, "BUY: Confirm on Bar Close", tooltip="Off = BUY can fire intrabar and disappear if price falls back (like ToS). On = only once the bar has closed.")
 showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
 showFactorLabels  = input.bool(true, "Show Per-Bar Factor Labels")
@@ -58,11 +56,11 @@ stretchColor(float f) =>
 textColorFor(color bg) =>
     bg == color.yellow ? color.black : color.white
 
-// ── BUY setup: deeply oversold (now or within the lookback) AND price reclaims the prior candle's open ──
-minFactor = ta.lowest(factor, oversoldLookback)   // deepest stretch within the lookback
-oversold  = minFactor <= -buyThreshold            // at least buyThreshold ATR BELOW the EMA
-reclaim   = close > open[1]                       // current (live) price back above the previous candle's open
-rawBuy    = oversold and reclaim
+// ── BUY setup: previous candle Extended below the EMA AND this candle closes above the previous close ──
+prevFactor = factor[1]
+extended   = prevFactor <= -extendedThreshold     // previous candle at least Extended Threshold ATR BELOW the EMA
+reclaim    = close > close[1]                     // this candle closes above the previous candle's close
+rawBuy    = extended and reclaim
 buyNow    = rawBuy and not rawBuy[1] and (not confirmOnClose or barstate.isconfirmed)   // fire once, when the setup first triggers
 
 // ── EMA ─────────────────────────────────────────────────
@@ -78,7 +76,7 @@ var label buyLbl = na
 if barstate.isnew
     buyLbl := na
 if showBuy
-    txt = "BUY\n" + str.tostring(math.abs(minFactor), "0.0") + "x ATR"
+    txt = "BUY\n" + str.tostring(math.abs(prevFactor), "0.0") + "x ATR"
     if na(buyLbl)
         buyLbl := label.new(bar_index, low - atr * 0.5, txt, style=label.style_label_up, color=color.green, textcolor=color.white)
     else
@@ -90,7 +88,7 @@ else if not na(buyLbl)
 
 alertcondition(buyNow, "ATR reversion BUY", "ATR reversion BUY on {{ticker}} ({{interval}})")
 if buyNow
-    alert("ATR reversion BUY: " + syminfo.ticker + " " + str.tostring(math.abs(minFactor), "0.0") + "x ATR below " + str.tostring(emaLength) + " EMA", alert.freq_once_per_bar)
+    alert("ATR reversion BUY: " + syminfo.ticker + " " + str.tostring(math.abs(prevFactor), "0.0") + "x ATR below " + str.tostring(emaLength) + " EMA", alert.freq_once_per_bar)
 
 // ── Per-bar factor label: above the bar when price >= EMA, below when under ──
 // Skipped on BUY bars so it doesn't overlap the BUY bubble.
