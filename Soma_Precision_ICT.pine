@@ -75,7 +75,7 @@ showKillzones = input.bool(true, "Shade Killzones", group=GS, tooltip="Shade the
 kzTransp      = input.int(92, "Shading Transparency", minval=0, maxval=100, group=GS, tooltip="0 is solid, 100 is invisible.")
 sessMarks     = input.string("Opens + Closes", "Session Markers", options=["Opens + Closes", "Opens Only", "Off"], group=GS, tooltip="A short tick at the top of the chart, exactly on the bar where a session starts (tagged Asia / London / NY KZ) or ends (tagged 'end'). Times are New York.")
 sessLines     = input.bool(true, "Full Vertical Lines", group=GS, tooltip="Draw a light line through the whole chart height at every session start and end, in the session's color. Candles left of a start line were before that session.")
-sessLineTr    = input.int(50, "Vertical Line Transparency", minval=0, maxval=100, group=GS, tooltip="0 is solid, 100 is invisible. Higher = lighter.")
+sessLineTr    = input.int(80, "Vertical Line Transparency", minval=0, maxval=100, group=GS, tooltip="0 is solid, 100 is invisible. Higher = lighter.")
 showNextSess  = input.bool(true, "Mark Current + Next Session", group=GS, tooltip="In the empty space right of the last bar: vertical lines where the session in progress ends, and where the next session starts and ends, with its name. Hover the name for the times.\nThe name sits just above the recent high, because Pine cannot read the top of the chart for future bars.\nWeekends are skipped. Exchange holidays are not.")
 
 GA = "Action Panel"
@@ -529,8 +529,21 @@ if nyBeg
     nyT0 := time
 
 recentTop  = ta.highest(high, 50)
-recentHigh = ta.highest(high, 300)
-recentLow  = ta.lowest(low, 300)
+// Height of the future lines: the candles in view plus every drawn liquidity
+// line, with a small margin (TradingView does not extend future-time lines)
+var float visHi = na
+var float visLo = na
+if time >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+    visHi := na(visHi) ? high : math.max(visHi, high)
+    visLo := na(visLo) ? low  : math.min(visLo, low)
+var float spanTop = na
+var float spanBot = na
+f_lvlHi(Slot s, float acc) =>
+    Liq l = s.cur
+    not na(l) and not na(l.ln) and not l.taken ? math.max(acc, l.lvl) : acc
+f_lvlLo(Slot s, float acc) =>
+    Liq l = s.cur
+    not na(l) and not na(l.ln) and not l.taken ? math.min(acc, l.lvl) : acc
 var array<line>  spanLns = array.new<line>()
 var array<label> spanLbs = array.new<label>()
 
@@ -538,12 +551,12 @@ var array<label> spanLbs = array.new<label>()
 // TradingView does not extend future-time lines, so these span the price
 // range of the last 300 bars instead (inside the range: no autoscale change)
 f_futLine(int t, color c) =>
-    spanLns.push(line.new(t, recentLow, t, recentHigh, xloc=xloc.bar_time, color=color.new(c, sessLineTr), style=line.style_solid, width=1))
+    spanLns.push(line.new(t, spanBot, t, spanTop, xloc=xloc.bar_time, color=color.new(c, sessLineTr), style=line.style_solid, width=1))
 
 f_span(int t0, int t1, string nm, string tip, float y, color c, bool started) =>
     if not started
         f_futLine(t0, c)
-        spanLbs.push(label.new(t0, recentHigh, nm, xloc=xloc.bar_time, color=color.new(color.white, 100), textcolor=c, style=label.style_label_lower_left, size=size.tiny, tooltip=tip))
+        spanLbs.push(label.new(t0, spanTop, nm, xloc=xloc.bar_time, color=color.new(color.white, 100), textcolor=c, style=label.style_label_lower_left, size=size.small, tooltip=tip))
     f_futLine(t1, c)
 
 if barstate.islast
@@ -554,6 +567,12 @@ if barstate.islast
     spanLns.clear()
     spanLbs.clear()
     if ictOn and showNextSess
+        float hi = nz(visHi, high)
+        float lo = nz(visLo, low)
+        hi := f_lvlHi(sLnH, f_lvlHi(sAsH, f_lvlHi(sPWH, f_lvlHi(sPDH, hi))))
+        lo := f_lvlLo(sLnL, f_lvlLo(sAsL, f_lvlLo(sPWL, f_lvlLo(sPDL, lo))))
+        spanTop := hi + atr14
+        spanBot := lo - atr14
         float y = recentTop + atr14 * 1.5
         // Session in progress: from its start to its end
         if inAsia and not na(asiaT0)

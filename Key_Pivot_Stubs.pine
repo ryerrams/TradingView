@@ -17,6 +17,7 @@
 //    (the original only applied them to full lines and labels).
 //  - Added (not in the original): S1/S2/S3 reclaim markers and alerts.
 //  - Added: context help (input tooltips and hover tooltips on stub labels).
+//  - Added: Stub Offset, to move the stubs right of other indicators' tags.
 // =============================================================================
 indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_boxes_count=50, max_labels_count=50)
 
@@ -32,7 +33,8 @@ showR2S2       = input.bool(true, "Show R2/S2", group=GL, tooltip="PT2 and S2: t
 showR3S3       = input.bool(true, "Show R3/S3", group=GL, tooltip="PT3 and S3: the extended target and support, one full prior range from Key (Fibonacci). Moves this far are often stretched.")
 
 GD = "Display"
-stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tooltip="Length of the right-edge stubs, in bars past the last bar.")
+stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tooltip="Length of the right-edge stubs, in bars.")
+stubGap        = input.int(32, "Stub Offset (bars)", minval=0, maxval=400, group=GD, tooltip="Empty bars between the last candle and the start of the stubs. Raise it to move the levels clear of other indicators' right-edge tags. The default 32 clears Daily Bias pVAH/pPOC/pVAL tags (at +18 bars) and SOMA plan tags (at +12). Tag text has a fixed pixel width, so when you zoom far out it can reach further: raise this if they touch. 0 = start right after the last bar (the original position).")
 shadingOn      = input.bool(true, "Shading", group=GD, tooltip="Fill the bands between adjacent levels: green above Key, red below.")
 shadingScope   = input.string("StubOnly", "Shading Scope", options=["StubOnly", "FullWidth"], group=GD, tooltip="FullWidth also turns on the full-width lines.")
 showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD, tooltip="Extend each level as a dashed line across the whole chart, not only the right-edge stub.")
@@ -151,10 +153,10 @@ var array<box>   boxes  = array.new<box>()
 var array<label> labels = array.new<label>()
 
 wantFullLines = shadingScope == "FullWidth" or showFullLines
-stubL = bar_index + 1
-stubR = bar_index + stubBars
+stubL = bar_index + 1 + stubGap
+stubR = bar_index + stubGap + stubBars
 // Middle stub bar (odd/even handled like the original)
-midStub = bar_index + (stubBars <= 1 ? 1 : stubBars % 2 == 0 ? stubBars / 2 : (stubBars + 1) / 2)
+midStub = bar_index + stubGap + (stubBars <= 1 ? 1 : stubBars % 2 == 0 ? stubBars / 2 : (stubBars + 1) / 2)
 
 drawLevel(float y, color c, string txt, bool show, string tip) =>
     if show and not na(y)
