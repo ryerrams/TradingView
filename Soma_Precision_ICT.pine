@@ -1,0 +1,697 @@
+//@version=6
+// =============================================================================
+//  SOMA PRECISION ICT  (TradingView port of the thinkorswim PRECISION_ICT study)
+//
+//  ICT markings for intraday charts (1 hour and below), made to pair with
+//  PRECISION_AUTO:
+//  - Liquidity lines: prior day / week high-low and Asia / London session
+//    high-low. A line ends once price trades through it (liquidity taken).
+//  - Sweeps: a closed candle that trades through an untaken line and closes
+//    back inside it (a stop run).
+//  - Fair value gaps (FVGs), kept until price fills them.
+//  - London and New York killzone shading.
+//  - An action panel: WAIT / WATCH / READY, and which PRECISION arrow to take.
+//
+//  Port notes:
+//  - Session times are New York (America/New_York), like the original.
+//  - Prior day / week / month / year high-low come from request.security with
+//    [1] + lookahead_on, so they do not repaint.
+//  - "Closed candles only" (!isLastDataBar) is barstate.isconfirmed here, so a
+//    sweep can also print on the live bar once it closes.
+//  - HighestAll "current instance only" plots are rebuilt as line/label
+//    objects that are deleted when a newer instance starts.
+//  - The 3+3 FVG slots become arrays (Max Unfilled per Side input, 1-50).
+//  - The action panel and nearest-liquidity map use every level and FVG even
+//    when their drawings are switched off (the original tied them to the
+//    display toggles).
+//  - Added (not in the original): line starts at the wick that made the level,
+//    optional faded history for taken lines and filled gaps, FVG midpoint (CE)
+//    line, CE fill rule, gap shrink, configurable sessions, a status panel
+//    with per-check rows and distances in ATR, alerts, and context help
+//    (input tooltips plus hover tooltips on labels, markers and panel cells).
+//  - Clean-chart defaults: taken lines and filled gaps disappear, sweeps are
+//    small triangles, the panel is two short lines. The help lives in hover
+//    tooltips so it adds nothing to the chart.
+// =============================================================================
+indicator("Soma Precision ICT", "SomaICT", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+TZ = "America/New_York"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+GL = "Liquidity Lines"
+showLiquidity    = input.bool(true,  "Show Liquidity Lines", group=GL, tooltip="Liquidity = an obvious high or low where many traders keep their stop orders. Price is often drawn to these levels to trigger those stops.\n\nGold lines are highs (buy-side liquidity: stops of short sellers sit above). Blue lines are lows (sell-side liquidity: stops of buyers sit below).\n\nA line ends (turns faded and dotted) as soon as price trades through it. The liquidity is then 'taken'.")
+showPD           = input.bool(true,  "Prior Day H/L",  inline="lq1", group=GL, tooltip="PDH / PDL: the high and low of the previous trading day.")
+showPW           = input.bool(true,  "Prior Week H/L", inline="lq1", group=GL, tooltip="PWH / PWL: the high and low of the previous week.")
+showAs           = input.bool(true,  "Asia H/L",       inline="lq2", group=GL, tooltip="The high and low of the Asia session (default 20:00-24:00 New York). London and New York often sweep these before the real move of the day. The chart must show extended hours, or these lines do not appear.")
+showLn           = input.bool(true,  "London H/L",     inline="lq2", group=GL, tooltip="The high and low of the London session (default 02:00-05:00 New York). New York often sweeps one of these early in its session. The chart must show extended hours, or these lines do not appear.")
+liquidityLabels  = input.bool(true,  "Line Labels", group=GL, tooltip="Write the name (PDH, Asia L...) at the right end of each line. Hover a name for an explanation.")
+labelSizeIn      = input.string("Small", "Line Label Size", options=["Tiny", "Small", "Normal"], group=GL, tooltip="Text size of the line names (PDH, Asia L...).")
+showTakenLines   = input.bool(false, "Keep Taken Lines (faded)", group=GL, tooltip="Off: a line disappears as soon as price trades through it, so the chart only shows liquidity that is still waiting.\nOn: a taken line stays as a faded dotted line that ends where price took it.")
+liquidityHistory = input.bool(false, "Keep Older Lines", group=GL, tooltip="Off: show only the current day / week / session lines and their sweeps.\nOn: keep older lines on the chart as history (faded once taken or replaced).")
+cutSessLines     = input.bool(true,  "End Asia / London Lines at NY Killzone End", group=GL, tooltip="On: the Asia and London lines stop at the end of the NY killzone (default 10:00 New York). Those levels matter most up to then, and this keeps them from running across the rest of the day.\nThe action panel keeps using the levels after the lines stop (sweeps, nearest liquidity).\nOff: the lines run until price takes them.")
+startAtWick      = input.bool(true,  "Start Line at the Wick", group=GL, tooltip="On: each line starts at the candle that made the high or low, when that candle is on the chart.\nOff: the line starts where the level becomes known (the new day / week, or the end of the session), like the thinkorswim study.")
+
+GSW = "Sweeps"
+showSweeps = input.bool(true, "Show Sweeps", group=GSW, tooltip="A sweep (stop run) is a CLOSED candle that trades through an untaken liquidity line and then closes back on the other side.\n\nBullish sweep (lime, under the candle): price dips below a low, grabs the stops there, and closes back above it. Buyers often step in next.\nBearish sweep (orange, over the candle): price spikes above a high and closes back below it. Sellers often step in next.")
+sweepStyle = input.string("Triangle", "Sweep Marker", options=["Triangle", "Label"], group=GSW, tooltip="Triangle: a small triangle only. Hover it to see which line was swept.\nLabel: a tag with the line name (for example 'PDL sweep').")
+
+GF = "Fair Value Gaps"
+showFVG       = input.bool(true, "Show Fair Value Gaps", group=GF, tooltip="A fair value gap (FVG) is a 3-candle pattern where the wick of candle 1 and the wick of candle 3 do not overlap. The middle candle moved so fast that it left a price zone with one-sided trading.\n\nPrice often comes back to 'fill' that zone. A bullish gap (blue) can act as support on the way down. A bearish gap (purple) can act as resistance on the way up.\n\nEach box stays until price fills it.")
+fvgMax        = input.int(3, "Max Unfilled per Side", minval=1, maxval=50, group=GF, tooltip="How many unfilled bullish gaps and how many unfilled bearish gaps to keep. When a new gap appears and the list is full, the oldest gap is dropped. The original study used 3.")
+fvgMinATR     = input.float(0.25, "Min Gap Size (x ATR 14)", minval=0.0, step=0.05, group=GF, tooltip="Ignore gaps smaller than this fraction of the average candle range (ATR 14). Higher = fewer, bigger gaps. 0 = every gap.")
+fvgFill       = input.string("Full", "Gap Is Filled When", options=["Full", "Midpoint (CE)"], group=GF, tooltip="Full: price must trade through the whole gap (the original rule).\nMidpoint (CE): price only needs to reach the middle of the gap. ICT calls the midpoint the 'consequent encroachment' (CE).")
+fvgMitigate   = input.bool(false, "Shrink Box as Price Trades In", group=GF, tooltip="On: when price trades part of the way into a gap, the box shrinks to show only the part that is still unfilled.\nOff: the box keeps its full size until it is filled.")
+fvgShowCE     = input.bool(false, "Show Midpoint Line (CE)", group=GF, tooltip="Draw a thin line through the middle of each gap. Price often reacts at the midpoint.")
+fvgKeepFilled = input.bool(false, "Keep Filled Gaps (faded)", group=GF, tooltip="On: a filled or dropped gap stays on the chart as a faded box that ends where it was filled.\nOff: it is deleted.")
+fvgTransp     = input.int(85, "Box Transparency", minval=0, maxval=100, group=GF, tooltip="0 is solid, 100 is invisible.")
+
+GS = "Sessions and Killzones (New York time)"
+asiaSess      = input.session("2000-0000", "Asia Range", group=GS, tooltip="The window that builds the Asia high and low. Default 20:00-24:00 New York.")
+ldnSess       = input.session("0200-0500", "London Range + Killzone", group=GS, tooltip="The window that builds the London high and low. It is also the London killzone.\n\nA killzone is a time window when large players are most active and the cleanest moves usually happen. The action panel only says READY inside a killzone.")
+nySess        = input.session("0700-1000", "New York Killzone", group=GS, tooltip="The New York killzone. Default 07:00-10:00 New York.")
+showKillzones = input.bool(true, "Shade Killzones", group=GS, tooltip="Shade the chart background during the London and New York killzones.")
+kzTransp      = input.int(92, "Shading Transparency", minval=0, maxval=100, group=GS, tooltip="0 is solid, 100 is invisible.")
+sessMarks     = input.string("Opens + Closes", "Session Markers", options=["Opens + Closes", "Opens Only", "Off"], group=GS, tooltip="A short tick at the top of the chart, exactly on the bar where a session starts (tagged Asia / London / NY KZ) or ends (tagged 'end'). Times are New York.")
+sessLines     = input.bool(true, "Full Vertical Lines", group=GS, tooltip="Draw a light line through the whole chart height at every session start and end, in the session's color. Candles left of a start line were before that session.")
+sessLineTr    = input.int(50, "Vertical Line Transparency", minval=0, maxval=100, group=GS, tooltip="0 is solid, 100 is invisible. Higher = lighter.")
+showNextSess  = input.bool(true, "Mark Current + Next Session", group=GS, tooltip="In the empty space right of the last bar: vertical lines where the session in progress ends, and where the next session starts and ends, with its name. Hover the name for the times.\nThe name sits just above the recent high, because Pine cannot read the top of the chart for future bars.\nWeekends are skipped. Exchange holidays are not.")
+
+GA = "Action Panel"
+showStatus       = input.bool(true, "Show Action Panel", group=GA, tooltip="A panel that runs the PRECISION + ICT playbook as a checklist:\n1. Bias: do the day / week / month / year ranges lean one way?\n2. EMAs: are the 9/13/22 EMAs not stacked against the bias?\n3. Killzone: is it London or New York time?\n4. Location: is price at a good place to enter (fresh sweep, inside a gap, or the cheap / expensive half of yesterday's range)?\n\nWAIT (grey) = a check fails. WATCH (yellow) = all checks pass except location. READY (green / red) = all checks pass: take the next PRECISION arrow in that direction.\n\nHover any row in the panel for help.")
+panelStyle       = input.string("Compact", "Panel Style", options=["Compact", "Full"], group=GA, tooltip="Compact: one short status line plus the nearest liquidity. Hover the status for the full reason.\nFull: one row per check (Bias, EMAs, Killzone, Location), so you can see why the status is what it is.")
+panelPos         = input.string("Top Right", "Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GA)
+panelSize        = input.string("Small", "Panel Text Size", options=["Tiny", "Small", "Normal"], group=GA)
+showLiquidityMap = input.bool(true, "Show Nearest Untaken Liquidity", group=GA, tooltip="Show the closest untaken liquidity line above and below price. These are likely targets, and places where a move may stall.")
+readyBars        = input.int(12, "Sweep Stays Fresh (bars)", minval=1, group=GA, tooltip="After a sweep, the 'location' check counts it for this many bars. After that the sweep is old news.")
+
+GAL = "Alerts"
+alertReady = input.bool(true,  "READY Status",    group=GAL, tooltip="Alert when the panel turns READY LONG or READY SHORT (checked at bar close).\n\nTo use alerts: create an alert on this indicator and pick 'Any alert() function call'.")
+alertSweep = input.bool(true,  "Sweeps",          group=GAL, tooltip="Alert when a candle closes as a sweep of a liquidity line.")
+alertTaken = input.bool(false, "Liquidity Taken", group=GAL, tooltip="Alert as soon as price trades through an untaken liquidity line (during the bar).")
+alertFvg   = input.bool(false, "New FVG",         group=GAL, tooltip="Alert when a new fair value gap forms (at bar close).")
+
+GC = "Colors"
+colBuy    = input.color(color.rgb(255, 210, 120), "Buy-side Liquidity (highs)", group=GC)
+colSell   = input.color(color.rgb(170, 200, 255), "Sell-side Liquidity (lows)", group=GC)
+colSwBull = input.color(color.lime,               "Bullish Sweep",              group=GC)
+colSwBear = input.color(color.orange,             "Bearish Sweep",              group=GC)
+colBullF  = input.color(color.rgb( 80, 170, 255), "Bullish FVG",                group=GC)
+colBearF  = input.color(color.rgb(200, 120, 255), "Bearish FVG",                group=GC)
+colLdn    = input.color(color.rgb( 70,  70, 120), "London Killzone",            group=GC)
+colNY     = input.color(color.rgb( 40, 100, 100), "NY Killzone",                group=GC)
+colAsia   = input.color(color.rgb(220, 120, 170), "Asia Session",               group=GC)
+colLdnMk  = input.color(color.rgb(130, 130, 230), "London Session",             group=GC)
+colNYMk   = input.color(color.rgb( 60, 180, 180), "NY Killzone",                group=GC)
+
+// -----------------------------------------------------------------------------
+lineLblSize = labelSizeIn == "Tiny" ? size.tiny : labelSizeIn == "Normal" ? size.normal : size.small
+
+// Context help text (hover tooltips)
+// -----------------------------------------------------------------------------
+TIP_PDH = "PDH - prior day high.\nBuy-side liquidity: stops of short sellers sit above it.\nIf price trades above and closes back below, that is a bearish sweep. If price breaks and holds above, the next highs become targets."
+TIP_PDL = "PDL - prior day low.\nSell-side liquidity: stops of buyers sit below it.\nIf price trades below and closes back above, that is a bullish sweep. If price breaks and holds below, the next lows become targets."
+TIP_PWH = "PWH - prior week high.\nBuy-side liquidity on the weekly scale. A bigger, more important level than PDH."
+TIP_PWL = "PWL - prior week low.\nSell-side liquidity on the weekly scale. A bigger, more important level than PDL."
+TIP_ASH = "Asia H - high of the Asia session.\nBuy-side liquidity. London and New York often run this high before they choose the real direction of the day."
+TIP_ASL = "Asia L - low of the Asia session.\nSell-side liquidity. London and New York often run this low before they choose the real direction of the day."
+TIP_LNH = "London H - high of the London session.\nBuy-side liquidity. New York often sweeps the London high or low early in its session."
+TIP_LNL = "London L - low of the London session.\nSell-side liquidity. New York often sweeps the London high or low early in its session."
+
+// -----------------------------------------------------------------------------
+// Base values
+// -----------------------------------------------------------------------------
+tfSec = timeframe.in_seconds()
+ictOn = timeframe.isintraday and tfSec <= 3600
+
+tfD = tfSec <= timeframe.in_seconds("D")   ? "D"   : timeframe.period
+tfW = tfSec <= timeframe.in_seconds("W")   ? "W"   : timeframe.period
+tfM = tfSec <= timeframe.in_seconds("M")   ? "M"   : timeframe.period
+tfY = tfSec <= timeframe.in_seconds("12M") ? "12M" : timeframe.period
+[pdh, pdl] = request.security(syminfo.tickerid, tfD, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, tfW, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pmh, pml] = request.security(syminfo.tickerid, tfM, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pyh, pyl] = request.security(syminfo.tickerid, tfY, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+atr14 = ta.sma(ta.tr(true), 14)
+
+// Day / week roll
+newDay  = barstate.isfirst or timeframe.change("D") or pdh != pdh[1] or pdl != pdl[1]
+newWeek = barstate.isfirst or timeframe.change("W") or pwh != pwh[1] or pwl != pwl[1]
+
+// Sessions (bar start time, New York)
+inAsia = ictOn and not na(time(timeframe.period, asiaSess, TZ))
+inLdn  = ictOn and not na(time(timeframe.period, ldnSess,  TZ))
+inNY   = ictOn and not na(time(timeframe.period, nySess,   TZ))
+asiaEnd = not inAsia and inAsia[1]
+ldnEnd  = not inLdn  and inLdn[1]
+asiaBeg = inAsia and not inAsia[1]
+ldnBeg  = inLdn  and not inLdn[1]
+nyBeg   = inNY   and not inNY[1]
+nyEnd   = not inNY and inNY[1]
+
+// Running high / low (and its bar) of the current period. On a reset bar this
+// returns the finished period's values before it starts the new period.
+f_runHL(bool reset) =>
+    var float rh  = na
+    var int   rhb = na
+    var float rl  = na
+    var int   rlb = na
+    float ph  = rh
+    int   phb = rhb
+    float pl  = rl
+    int   plb = rlb
+    if reset
+        rh  := high
+        rhb := bar_index
+        rl  := low
+        rlb := bar_index
+    else
+        if na(rh) or high > rh
+            rh  := high
+            rhb := bar_index
+        if na(rl) or low < rl
+            rl  := low
+            rlb := bar_index
+    [ph, phb, pl, plb]
+
+// Running high / low of a session window
+f_sessHL(bool inS, bool startS) =>
+    var float rh  = na
+    var int   rhb = na
+    var float rl  = na
+    var int   rlb = na
+    if startS
+        rh  := high
+        rhb := bar_index
+        rl  := low
+        rlb := bar_index
+    else if inS
+        if high > rh
+            rh  := high
+            rhb := bar_index
+        if low < rl
+            rl  := low
+            rlb := bar_index
+    [rh, rhb, rl, rlb]
+
+[dPH, dPHB, dPL, dPLB] = f_runHL(newDay)
+[wPH, wPHB, wPL, wPLB] = f_runHL(newWeek)
+[asH, asHB, asL, asLB] = f_sessHL(inAsia, inAsia and not inAsia[1])
+[lnH, lnHB, lnL, lnLB] = f_sessHL(inLdn,  inLdn  and not inLdn[1])
+
+// Start bar of a prior day / week line: the wick on the chart when it matches
+f_wickX(float chartLvl, int chartBar, float lvl) =>
+    startAtWick and not na(chartLvl) and not na(lvl) and math.abs(chartLvl - lvl) <= syminfo.mintick ? chartBar : bar_index
+
+// =============================================================================
+// Liquidity lines and sweeps
+// =============================================================================
+type Liq
+    string       name
+    bool         isHigh
+    float        lvl
+    bool         taken = false
+    bool         frozen = false
+    line         ln
+    label        lb
+    array<label> marks
+
+type Slot
+    Liq cur
+
+// End a line (taken or replaced): faded and dotted from here on
+method retire(Liq l, int x) =>
+    if not na(l.ln)
+        l.ln.set_x2(x)
+        l.ln.set_style(line.style_dotted)
+        l.ln.set_color(color.new(l.isHigh ? colBuy : colSell, 50))
+    if not na(l.lb)
+        l.lb.set_x(x)
+        l.lb.set_textcolor(color.new(l.isHigh ? colBuy : colSell, 50))
+
+// Delete a line with its label and sweep markers
+method wipe(Liq l) =>
+    if not na(l.ln)
+        l.ln.delete()
+    if not na(l.lb)
+        l.lb.delete()
+    if not na(l.marks)
+        for m in l.marks
+            m.delete()
+
+// One bar of one liquidity level. Returns [sweep, taken this bar].
+// cut: stop drawing this line here (the level itself stays live for the panel)
+method step(Slot s, bool reset, float lvl, int x1, string name, bool isHigh, bool vis, string tip, bool cut = false) =>
+    bool drawLn = ictOn and showLiquidity and vis
+    bool drawSw = ictOn and showSweeps and vis
+    if reset
+        Liq old = s.cur
+        if not na(old)
+            if not liquidityHistory
+                old.wipe()
+            else if not old.taken
+                old.retire(bar_index - 1)
+        s.cur := na
+        if not na(lvl)
+            Liq nl = Liq.new(name, isHigh, lvl)
+            nl.marks := array.new<label>()
+            if drawLn
+                color c = isHigh ? colBuy : colSell
+                nl.ln := line.new(math.max(x1, bar_index - 9000), lvl, bar_index, lvl, color=c, style=line.style_dashed, width=1)
+                if liquidityLabels
+                    nl.lb := label.new(bar_index, lvl, name, color=color.new(color.white, 100), textcolor=c, style=label.style_label_left, size=lineLblSize, tooltip=tip)
+            s.cur := nl
+    bool sweep = false
+    bool took  = false
+    Liq cur = s.cur
+    if not na(cur) and not cur.taken and not cur.frozen and cut
+        cur.frozen := true
+        if not na(cur.ln)
+            cur.ln.set_x2(bar_index)
+        if not na(cur.lb)
+            cur.lb.set_x(bar_index)
+    if not na(cur) and not cur.taken
+        bool through = isHigh ? high > cur.lvl : low < cur.lvl
+        bool back    = isHigh ? close < cur.lvl : close > cur.lvl
+        sweep := through and back and barstate.isconfirmed
+        int xr = barstate.islast and not through ? bar_index + 3 : bar_index
+        if not cur.frozen and not na(cur.ln)
+            cur.ln.set_x2(xr)
+        if not cur.frozen and not na(cur.lb)
+            cur.lb.set_x(xr)
+        if through
+            cur.taken := true
+            took      := true
+            if cur.frozen
+                na
+            else if showTakenLines
+                cur.retire(bar_index)
+            else
+                if not na(cur.ln)
+                    cur.ln.delete()
+                if not na(cur.lb)
+                    cur.lb.delete()
+        if sweep and drawSw and not cur.frozen
+            color  mc   = isHigh ? colSwBear : colSwBull
+            string txt  = name + " sweep"
+            string stip = isHigh ? txt + " (bearish).\nThis candle traded above the " + name + ", grabbed the stops resting there, and closed back below it.\nIn a SHORT bias this is a strong location: watch for the next RED PRECISION arrow." : txt + " (bullish).\nThis candle traded below the " + name + ", grabbed the stops resting there, and closed back above it.\nIn a LONG bias this is a strong location: watch for the next GREEN PRECISION arrow."
+            label m = sweepStyle == "Label" ? label.new(bar_index, 0.0, txt, yloc=isHigh ? yloc.abovebar : yloc.belowbar, color=mc, textcolor=color.black, style=isHigh ? label.style_label_down : label.style_label_up, size=size.small, tooltip=stip) : label.new(bar_index, 0.0, "", yloc=isHigh ? yloc.abovebar : yloc.belowbar, color=mc, style=isHigh ? label.style_triangledown : label.style_triangleup, size=size.tiny, tooltip=stip)
+            cur.marks.push(m)
+    [sweep, took]
+
+var Slot sPDH = Slot.new()
+var Slot sPDL = Slot.new()
+var Slot sPWH = Slot.new()
+var Slot sPWL = Slot.new()
+var Slot sAsH = Slot.new()
+var Slot sAsL = Slot.new()
+var Slot sLnH = Slot.new()
+var Slot sLnL = Slot.new()
+
+[swPDH, tkPDH] = sPDH.step(newDay,  pdh, f_wickX(dPH, dPHB, pdh), "PDH", true,  showPD, TIP_PDH)
+[swPDL, tkPDL] = sPDL.step(newDay,  pdl, f_wickX(dPL, dPLB, pdl), "PDL", false, showPD, TIP_PDL)
+[swPWH, tkPWH] = sPWH.step(newWeek, pwh, f_wickX(wPH, wPHB, pwh), "PWH", true,  showPW, TIP_PWH)
+[swPWL, tkPWL] = sPWL.step(newWeek, pwl, f_wickX(wPL, wPLB, pwl), "PWL", false, showPW, TIP_PWL)
+[swAsH, tkAsH] = sAsH.step(asiaEnd, asH, startAtWick ? asHB : bar_index, "Asia H",   true,  showAs, TIP_ASH, cutSessLines and nyEnd)
+[swAsL, tkAsL] = sAsL.step(asiaEnd, asL, startAtWick ? asLB : bar_index, "Asia L",   false, showAs, TIP_ASL, cutSessLines and nyEnd)
+[swLnH, tkLnH] = sLnH.step(ldnEnd,  lnH, startAtWick ? lnHB : bar_index, "London H", true,  showLn, TIP_LNH, cutSessLines and nyEnd)
+[swLnL, tkLnL] = sLnL.step(ldnEnd,  lnL, startAtWick ? lnLB : bar_index, "London L", false, showLn, TIP_LNL, cutSessLines and nyEnd)
+
+bullSw = ictOn and (swPDL or swPWL or swAsL or swLnL)
+bearSw = ictOn and (swPDH or swPWH or swAsH or swLnH)
+
+// Which line the latest sweep took (first match wins on the same bar: PD, PW, Asia, London)
+var string bullSwName = ""
+var string bearSwName = ""
+if bullSw
+    bullSwName := swPDL ? "PDL" : swPWL ? "PWL" : swAsL ? "Asia L" : "London L"
+if bearSw
+    bearSwName := swPDH ? "PDH" : swPWH ? "PWH" : swAsH ? "Asia H" : "London H"
+bullSwAge   = ta.barssince(bullSw)
+bearSwAge   = ta.barssince(bearSw)
+freshBullSw = nz(bullSwAge, 999999) < readyBars
+freshBearSw = nz(bearSwAge, 999999) < readyBars
+
+// =============================================================================
+// Fair value gaps
+// =============================================================================
+type Fvg
+    float top
+    float bot
+    float top0
+    float bot0
+    int   born
+    color col
+    box   bx
+    line  ce
+
+f_fvgClose(Fvg f, int x) =>
+    if fvgKeepFilled
+        if not na(f.bx)
+            f.bx.set_right(x)
+            f.bx.set_bgcolor(color.new(f.col, math.min(100, fvgTransp + (100 - fvgTransp) * 0.6)))
+        if not na(f.ce)
+            f.ce.set_x2(x)
+            f.ce.set_color(color.new(color.gray, 70))
+    else
+        if not na(f.bx)
+            f.bx.delete()
+        if not na(f.ce)
+            f.ce.delete()
+
+// One bar of the open gaps on one side: fill check, shrink, extend
+f_fvgStep(array<Fvg> arr, bool bull) =>
+    int n = arr.size()
+    if n > 0
+        int xr = barstate.islast ? bar_index + 3 : bar_index
+        for i = n - 1 to 0
+            Fvg f = arr.get(i)
+            bool done = false
+            if bar_index > f.born
+                float mid     = (f.top0 + f.bot0) / 2
+                float fillLvl = fvgFill == "Full" ? (bull ? f.bot0 : f.top0) : mid
+                done := bull ? low <= fillLvl : high >= fillLvl
+                if not done and fvgMitigate
+                    if bull and low < f.top
+                        f.top := low
+                    if not bull and high > f.bot
+                        f.bot := high
+            if done
+                f_fvgClose(f, bar_index)
+                arr.remove(i)
+            if not done and not na(f.bx)
+                f.bx.set_right(xr)
+                f.bx.set_top(f.top)
+                f.bx.set_bottom(f.bot)
+            if not done and not na(f.ce)
+                f.ce.set_x2(xr)
+
+var array<Fvg> bullFvgs = array.new<Fvg>()
+var array<Fvg> bearFvgs = array.new<Fvg>()
+f_fvgStep(bullFvgs, true)
+f_fvgStep(bearFvgs, false)
+
+bullNew = ictOn and barstate.isconfirmed and low > high[2] and (low - high[2]) >= fvgMinATR * atr14
+bearNew = ictOn and barstate.isconfirmed and high < low[2] and (low[2] - high) >= fvgMinATR * atr14
+
+f_fvgAdd(array<Fvg> arr, float top, float bot, color c) =>
+    Fvg f = Fvg.new(top, bot, top, bot, bar_index, c)
+    if showFVG
+        f.bx := box.new(bar_index - 2, top, bar_index, bot, border_color=color.new(c, 100), bgcolor=color.new(c, fvgTransp))
+        if fvgShowCE
+            f.ce := line.new(bar_index - 2, (top + bot) / 2, bar_index, (top + bot) / 2, color=color.new(c, 20), style=line.style_dotted, width=1)
+    arr.push(f)
+    if arr.size() > fvgMax
+        f_fvgClose(arr.shift(), bar_index)
+
+if bullNew
+    f_fvgAdd(bullFvgs, low, high[2], colBullF)
+if bearNew
+    f_fvgAdd(bearFvgs, low[2], high, colBearF)
+
+f_inFvg(array<Fvg> arr) =>
+    bool inside = false
+    for f in arr
+        if close <= f.top0 and close >= f.bot0
+            inside := true
+    inside
+
+inBullFVG = f_inFvg(bullFvgs)
+inBearFVG = f_inFvg(bearFvgs)
+
+// =============================================================================
+// Killzones
+// =============================================================================
+bgcolor(ictOn and showKillzones and inLdn ? color.new(colLdn, kzTransp) : na, title="London Killzone")
+bgcolor(ictOn and showKillzones and inNY  ? color.new(colNY,  kzTransp) : na, title="NY Killzone")
+
+// =============================================================================
+// Action status
+// Bias: Tr3ndy Edges ALIGN count. Each prior Day / Week / Month / Year range is
+// cut into bands (0.113 / 0.236 / 0.382 / 0.618 / 0.764 / 0.887). Close in the
+// upper bands = +1..+3, lower bands = -1..-3, middle = 0.
+// =============================================================================
+f_state(float c, float H, float L) =>
+    float R = H - L
+    na(R) ? na : c >= L + R * 0.887 ? 3 : c >= H - R * 0.236 ? 2 : c >= H - R * 0.382 ? 1 : c > L + R * 0.382 ? 0 : c > L + R * 0.236 ? -1 : c > H - R * 0.887 ? -2 : -3
+
+stD = f_state(close, pdh, pdl)
+stW = f_state(close, pwh, pwl)
+stM = f_state(close, pmh, pml)
+stY = f_state(close, pyh, pyl)
+
+f_cnt(float s, int want) =>
+    na(s) ? 0 : want == 0 ? 1 : want > 0 ? (s > 0 ? 1 : 0) : (s < 0 ? 1 : 0)
+
+alN     = f_cnt(stD, 0) + f_cnt(stW, 0) + f_cnt(stM, 0) + f_cnt(stY, 0)
+alBulls = f_cnt(stD, 1) + f_cnt(stW, 1) + f_cnt(stM, 1) + f_cnt(stY, 1)
+alBears = f_cnt(stD, -1) + f_cnt(stW, -1) + f_cnt(stM, -1) + f_cnt(stY, -1)
+// Bias = at least two more timeframes for than against (3-1, 3-0, 4-0, 2-0)
+biasLong  = alBulls - alBears >= 2
+biasShort = alBears - alBulls >= 2
+
+ema9  = ta.ema(close, 9)
+ema13 = ta.ema(close, 13)
+ema22 = ta.ema(close, 22)
+stackUp = ema9 > ema13 and ema13 > ema22
+stackDn = ema9 < ema13 and ema13 < ema22
+
+kzNow = inLdn or inNY
+f_hhmm(string s) =>
+    str.substring(s, 0, 2) + ":" + str.substring(s, 2, 4)
+f_mins(string s) =>
+    int(str.tonumber(str.substring(s, 0, 2))) * 60 + int(str.tonumber(str.substring(s, 2, 4)))
+nowMin    = hour(time, TZ) * 60 + minute(time, TZ)
+nextKZTxt = nowMin < f_mins(ldnSess) ? "London " + f_hhmm(ldnSess) : nowMin < f_mins(nySess) ? "NY " + f_hhmm(nySess) : "London " + f_hhmm(ldnSess)
+
+// -----------------------------------------------------------------------------
+// Session markers: a tick pinned to the top of the pane on the exact bar
+// -----------------------------------------------------------------------------
+mkOpen  = ictOn and sessMarks != "Off"
+mkClose = ictOn and sessMarks == "Opens + Closes"
+plotchar(mkOpen  and asiaBeg, "Asia start",   "│", location.top, colAsia,  text="Asia",   textcolor=colAsia, size=size.tiny, display=display.pane)
+plotchar(mkClose and asiaEnd, "Asia end",     "│", location.top, colAsia,  text="end",    textcolor=colAsia, size=size.tiny, display=display.pane)
+plotchar(mkOpen  and ldnBeg,  "London start", "│", location.top, colLdnMk, text="London", textcolor=colLdnMk, size=size.tiny, display=display.pane)
+plotchar(mkClose and ldnEnd,  "London end",   "│", location.top, colLdnMk, text="end",    textcolor=colLdnMk, size=size.tiny, display=display.pane)
+plotchar(mkOpen  and nyBeg,   "NY KZ start",  "│", location.top, colNYMk,  text="NY KZ",  textcolor=colNYMk, size=size.tiny, display=display.pane)
+plotchar(mkClose and nyEnd,   "NY KZ end",    "│", location.top, colNYMk,  text="end",    textcolor=colNYMk, size=size.tiny, display=display.pane)
+
+// Full-height session lines. Only the newest 60 are kept, so they never push
+// the liquidity lines out of TradingView's 500-line budget.
+var array<line> sessVLines = array.new<line>()
+f_vline(bool on, color c) =>
+    if on
+        sessVLines.push(line.new(bar_index, low, bar_index, high + syminfo.mintick, extend=extend.both, color=color.new(c, sessLineTr), style=line.style_solid, width=1))
+        if sessVLines.size() > 60
+            sessVLines.shift().delete()
+bool vOn = sessLines and mkOpen
+f_vline(vOn and asiaBeg, colAsia)
+f_vline(vOn and mkClose and asiaEnd, colAsia)
+f_vline(vOn and ldnBeg, colLdnMk)
+f_vline(vOn and mkClose and ldnEnd, colLdnMk)
+f_vline(vOn and nyBeg, colNYMk)
+f_vline(vOn and mkClose and nyEnd, colNYMk)
+
+// Session length in ms (a window that ends at 0000 runs to midnight)
+f_durMs(string s) =>
+    int a = f_mins(s)
+    int b = int(str.tonumber(str.substring(s, 5, 7))) * 60 + int(str.tonumber(str.substring(s, 7, 9)))
+    int d = (b - a + 1440) % 1440
+    (d == 0 ? 1440 : d) * 60000
+
+f_range(string s) =>
+    f_hhmm(s) + "-" + str.substring(s, 5, 7) + ":" + str.substring(s, 7, 9)
+
+// Next session start (New York time), skipping days with no session
+f_nextStart(string sess, bool isAsia) =>
+    int t = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), int(str.tonumber(str.substring(sess, 0, 2))), int(str.tonumber(str.substring(sess, 2, 4))), 0)
+    if t <= time
+        t += 86400000
+    // Asia runs Sunday-Thursday evenings; London / NY run Monday-Friday
+    for k = 0 to 3
+        int dw = dayofweek(t, TZ)
+        bool skip = isAsia ? (dw == dayofweek.friday or dw == dayofweek.saturday) : (dw == dayofweek.saturday or dw == dayofweek.sunday)
+        if skip
+            t += 86400000
+    t
+
+// Start time of the session in progress
+var int asiaT0 = na
+var int ldnT0  = na
+var int nyT0   = na
+if asiaBeg
+    asiaT0 := time
+if ldnBeg
+    ldnT0 := time
+if nyBeg
+    nyT0 := time
+
+recentTop  = ta.highest(high, 50)
+recentHigh = ta.highest(high, 300)
+recentLow  = ta.lowest(low, 300)
+var array<line>  spanLns = array.new<line>()
+var array<label> spanLbs = array.new<label>()
+
+// Future session lines (full height) and one name at the start
+// TradingView does not extend future-time lines, so these span the price
+// range of the last 300 bars instead (inside the range: no autoscale change)
+f_futLine(int t, color c) =>
+    spanLns.push(line.new(t, recentLow, t, recentHigh, xloc=xloc.bar_time, color=color.new(c, sessLineTr), style=line.style_solid, width=1))
+
+f_span(int t0, int t1, string nm, string tip, float y, color c, bool started) =>
+    if not started
+        f_futLine(t0, c)
+        spanLbs.push(label.new(t0, recentHigh, nm, xloc=xloc.bar_time, color=color.new(color.white, 100), textcolor=c, style=label.style_label_lower_left, size=size.tiny, tooltip=tip))
+    f_futLine(t1, c)
+
+if barstate.islast
+    for l in spanLns
+        l.delete()
+    for b in spanLbs
+        b.delete()
+    spanLns.clear()
+    spanLbs.clear()
+    if ictOn and showNextSess
+        float y = recentTop + atr14 * 1.5
+        // Session in progress: from its start to its end
+        if inAsia and not na(asiaT0)
+            f_span(asiaT0, asiaT0 + f_durMs(asiaSess), "Asia", "", y, colAsia, true)
+        if inLdn and not na(ldnT0)
+            f_span(ldnT0, ldnT0 + f_durMs(ldnSess), "London", "", y, colLdnMk, true)
+        if inNY and not na(nyT0)
+            f_span(nyT0, nyT0 + f_durMs(nySess), "NY KZ", "", y, colNYMk, true)
+        // Next session
+        int tA = f_nextStart(asiaSess, true)
+        int tL = f_nextStart(ldnSess, false)
+        int tN = f_nextStart(nySess, false)
+        int tx = math.min(tA, tL, tN)
+        string nm = tx == tL ? "London" : tx == tN ? "NY KZ" : "Asia"
+        string ss = tx == tL ? ldnSess : tx == tN ? nySess : asiaSess
+        color nc = tx == tL ? colLdnMk : tx == tN ? colNYMk : colAsia
+        f_span(tx, tx + f_durMs(ss), nm, (tx == tN ? "NY killzone " : nm + " ") + f_range(ss) + " New York time (next).\nREADY can only appear inside the London or NY killzone.", y, nc, false)
+
+pdMid    = (pdh + pdl) / 2
+discount = not na(pdMid) and close < pdMid
+premium  = not na(pdMid) and close > pdMid
+
+locLong  = freshBullSw or inBullFVG or discount
+locShort = freshBearSw or inBearFVG or premium
+
+// 0 no bias, 1 EMAs against, 2 outside killzone, 3 WATCH, 4 READY
+stLong  = not biasLong  ? 0 : stackDn ? 1 : not kzNow ? 2 : not locLong  ? 3 : 4
+stShort = not biasShort ? 0 : stackUp ? 1 : not kzNow ? 2 : not locShort ? 3 : 4
+dir  = biasLong ? 1 : biasShort ? -1 : 0
+stat = dir == 1 ? stLong : dir == -1 ? stShort : 0
+
+readyLong  = ictOn and stat == 4 and dir == 1
+readyShort = ictOn and stat == 4 and dir == -1
+
+dirTxt    = dir == 1 ? "LONG" : "SHORT"
+whyLong   = freshBullSw ? "sell-side swept (" + bullSwName + ")" : inBullFVG ? "in bullish FVG" : "in discount (below prior-day 50%)"
+whyShort  = freshBearSw ? "buy-side swept (" + bearSwName + ")" : inBearFVG ? "in bearish FVG" : "in premium (above prior-day 50%)"
+statWord  = stat == 4 ? "READY " + dirTxt : stat == 3 ? "WATCH " + dirTxt : "WAIT"
+statWhy   = stat == 0 ? "no clear bias (ALIGN " + str.tostring(alBulls) + " bull / " + str.tostring(alBears) + " bear of " + str.tostring(alN) + ")" : stat == 1 ? "bias " + dirTxt + ", but EMAs stacked " + (dir == 1 ? "down" : "up") : stat == 2 ? "bias " + dirTxt + ", outside killzone (next: " + nextKZTxt + " ET)" : stat == 3 ? (dir == 1 ? "price in premium: wait for a pullback, sell-side sweep or bullish FVG" : "price in discount: wait for a bounce, buy-side sweep or bearish FVG") : (dir == 1 ? whyLong : whyShort)
+statAct   = stat == 4 ? (dir == 1 ? "take the next GREEN PRECISION arrow" : "take the next RED PRECISION arrow") : stat == 3 ? "do not enter yet - wait for a better location" : "stand aside"
+statShort = stat == 0 ? "no bias" : stat == 1 ? "EMAs against bias" : stat == 2 ? "outside killzone" : stat == 3 ? "wait for location" : dir == 1 ? (freshBullSw ? bullSwName + " sweep" : inBullFVG ? "bull FVG" : "discount") : (freshBearSw ? bearSwName + " sweep" : inBearFVG ? "bear FVG" : "premium")
+nextKZName = nowMin < f_mins(ldnSess) ? "London" : nowMin < f_mins(nySess) ? "NY" : "London"
+// Compact panel: outside a killzone, show the bias to plan the next session
+cWord  = kzNow ? statWord : dir == 0 ? "No bias" : dirTxt + " bias"
+cShort = kzNow ? statShort : dir == 0 ? "sit out" : stat == 1 ? "EMAs against - wait" : "wait for " + nextKZName
+cColor = kzNow or dir == 0 ? na : color.new(dir == 1 ? color.green : color.red, 55)
+statColor = stat == 4 ? (dir == 1 ? color.green : color.red) : stat == 3 ? color.yellow : color.gray
+
+// =============================================================================
+// Alerts
+// =============================================================================
+alertcondition(readyLong  and not readyLong[1],  "READY LONG",     "Soma ICT: READY LONG on {{ticker}} - take the next GREEN PRECISION arrow")
+alertcondition(readyShort and not readyShort[1], "READY SHORT",    "Soma ICT: READY SHORT on {{ticker}} - take the next RED PRECISION arrow")
+alertcondition(bullSw, "Bullish sweep", "Soma ICT: bullish (sell-side) sweep on {{ticker}}")
+alertcondition(bearSw, "Bearish sweep", "Soma ICT: bearish (buy-side) sweep on {{ticker}}")
+
+if alertReady and (readyLong and not readyLong[1] or readyShort and not readyShort[1])
+    alert("Soma ICT " + syminfo.ticker + ": " + statWord + " - " + statWhy + " - " + statAct, alert.freq_once_per_bar_close)
+if alertSweep and bullSw
+    alert("Soma ICT " + syminfo.ticker + ": bullish sweep of " + bullSwName + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if alertSweep and bearSw
+    alert("Soma ICT " + syminfo.ticker + ": bearish sweep of " + bearSwName + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if alertTaken and ictOn
+    string tk = (tkPDH ? " PDH" : "") + (tkPDL ? " PDL" : "") + (tkPWH ? " PWH" : "") + (tkPWL ? " PWL" : "") + (tkAsH ? " Asia-H" : "") + (tkAsL ? " Asia-L" : "") + (tkLnH ? " London-H" : "") + (tkLnL ? " London-L" : "")
+    if tk != ""
+        alert("Soma ICT " + syminfo.ticker + ": liquidity taken -" + tk, alert.freq_once_per_bar)
+if alertFvg and showFVG and (bullNew or bearNew)
+    alert("Soma ICT " + syminfo.ticker + ": new " + (bullNew ? "bullish" : "bearish") + " FVG", alert.freq_once_per_bar_close)
+
+// =============================================================================
+// Action panel
+// =============================================================================
+f_nearest(array<Slot> slots, bool above) =>
+    float best = na
+    string nm  = ""
+    for s in slots
+        Liq l = s.cur
+        if not na(l) and not l.taken and (above ? l.lvl > close : l.lvl < close)
+            if na(best) or (above ? l.lvl < best : l.lvl > best)
+                best := l.lvl
+                nm   := l.name
+    [best, nm]
+
+f_liqTxt(float lvl, string nm) =>
+    na(lvl) ? "none" : nm + " " + str.tostring(lvl, format.mintick) + "  (" + str.tostring(math.abs(lvl - close) / atr14, "#.0") + " ATR away)"
+
+f_sgn(float s) =>
+    na(s) ? "-" : s > 0 ? "+" + str.tostring(s) : str.tostring(s)
+
+var array<Slot> highSlots = array.from(sPDH, sPWH, sAsH, sLnH)
+var array<Slot> lowSlots  = array.from(sPDL, sPWL, sAsL, sLnL)
+
+tblPos  = panelPos == "Top Left" ? position.top_left : panelPos == "Bottom Right" ? position.bottom_right : panelPos == "Bottom Left" ? position.bottom_left : position.top_right
+tblSize = panelSize == "Tiny" ? size.tiny : panelSize == "Normal" ? size.normal : size.small
+var table panel = table.new(tblPos, 2, 9, bgcolor=color.new(color.black, 25), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 80), border_width=1)
+
+TIP_STATUS = "The playbook result.\nWAIT (grey): at least one of Bias / EMAs / Killzone fails. Do not trade.\nWATCH (yellow): Bias, EMAs and Killzone pass, but price is not at a good location yet.\nREADY (green / red): every check passes. Take the next PRECISION arrow in that direction.\n\nThis panel uses the live close, so it can change during a bar."
+TIP_BIAS   = "Bias from the Tr3ndy Edges ALIGN count.\nFor each prior Day / Week / Month / Year range: + means today's close sits in the upper part of that range (bullish), - means the lower part (bearish), 0 means the middle.\nBias is LONG (SHORT) when at least 2 more timeframes are bullish (bearish) than the other way."
+TIP_EMA    = "The 9, 13 and 22 period EMAs on this chart.\nStacked up (9 > 13 > 22) = short-term trend is up. Stacked down = short-term trend is down. Mixed = no clear short-term trend.\nThe check fails only when the EMAs are stacked AGAINST the bias. Mixed is allowed."
+TIP_KZ     = "Killzones are the time windows (New York time) when the biggest players trade and the cleanest moves usually happen: London " + f_hhmm(ldnSess) + " and New York " + f_hhmm(nySess) + ".\nREADY only appears inside a killzone. The shaded background on the chart shows them."
+TIP_LOC    = "Is price at a good place to enter?\nFor LONG, one of these is enough: a fresh sell-side sweep (a low was run and price closed back above), price inside a bullish FVG, or price below the middle of yesterday's range (discount = cheap).\nFor SHORT, the mirror: a fresh buy-side sweep, price inside a bearish FVG, or price above the middle (premium = expensive).\nA sweep or an FVG is a stronger reason than discount / premium alone."
+TIP_UP     = "The closest untaken buy-side liquidity (a high) above price. Price is often drawn to it. Use it as a target for longs, or as a place where a short may begin."
+TIP_DN     = "The closest untaken sell-side liquidity (a low) below price. Price is often drawn to it. Use it as a target for shorts, or as a place where a long may begin."
+
+f_row(int r, string k, string v, color vbg, color vtx, string tip) =>
+    panel.cell(0, r, k, text_color=color.silver, text_size=tblSize, text_halign=text.align_left, tooltip=tip)
+    panel.cell(1, r, v, text_color=vtx, bgcolor=vbg, text_size=tblSize, text_halign=text.align_left, tooltip=tip)
+
+if barstate.islast
+    panel.clear(0, 0, 1, 8)
+    if showStatus or showLiquidityMap
+        if not ictOn
+            panel.cell(0, 0, "Soma Precision ICT works on 1 hour charts and below", text_color=color.silver, text_size=tblSize, tooltip="Switch the chart to 1h or a lower timeframe to see liquidity lines, sweeps, fair value gaps, killzones and the action panel.")
+        else
+            [upLvl, upNm] = f_nearest(highSlots, true)
+            [dnLvl, dnNm] = f_nearest(lowSlots, false)
+            color sTx = stat == 3 ? color.black : color.white
+            if panelStyle == "Compact"
+                if showStatus
+                    panel.cell(0, 0, cWord + " · " + cShort, text_color=na(cColor) ? sTx : color.white, bgcolor=na(cColor) ? statColor : cColor, text_size=tblSize, text_halign=text.align_left, tooltip=statWord + " - " + statWhy + " - " + statAct + "\n\n" + TIP_STATUS)
+                if showLiquidityMap
+                    string upS = na(upLvl) ? "none" : upNm + " " + str.tostring(upLvl, format.mintick)
+                    string dnS = na(dnLvl) ? "none" : dnNm + " " + str.tostring(dnLvl, format.mintick)
+                    panel.cell(0, 1, "▲ " + upS + "   ▼ " + dnS, text_color=color.silver, text_size=tblSize, text_halign=text.align_left, tooltip="Above: " + f_liqTxt(upLvl, upNm) + "\nBelow: " + f_liqTxt(dnLvl, dnNm) + "\n\n" + TIP_UP + "\n\n" + TIP_DN)
+            else
+                int r = 0
+                if showStatus
+                    f_row(0, "Status", statWord + " - " + statAct, statColor, sTx, TIP_STATUS)
+                    f_row(1, "Why", statWhy, na, color.white, TIP_STATUS)
+                    string biasTxt = (dir == 0 ? "none" : dirTxt) + "   D " + f_sgn(stD) + "  W " + f_sgn(stW) + "  M " + f_sgn(stM) + "  Y " + f_sgn(stY)
+                    f_row(2, "Bias", biasTxt, na, dir == 1 ? color.lime : dir == -1 ? color.red : color.silver, TIP_BIAS)
+                    bool emaBad = dir == 1 and stackDn or dir == -1 and stackUp
+                    f_row(3, "EMA 9/13/22", stackUp ? "stacked up" : stackDn ? "stacked down" : "mixed", na, emaBad ? color.red : color.white, TIP_EMA)
+                    f_row(4, "Killzone", inLdn ? "London (active)" : inNY ? "New York (active)" : "none", na, kzNow ? color.lime : color.silver, TIP_KZ)
+                    string locTxt = (discount ? "discount" : premium ? "premium" : "at 50%") + (inBullFVG ? " | in bull FVG" : "") + (inBearFVG ? " | in bear FVG" : "") + (freshBullSw ? " | sell-side swept " + bullSwName + " (" + str.tostring(bullSwAge) + " bars ago)" : "") + (freshBearSw ? " | buy-side swept " + bearSwName + " (" + str.tostring(bearSwAge) + " bars ago)" : "")
+                    bool locOk = dir == 1 and locLong or dir == -1 and locShort
+                    f_row(5, "Location", locTxt, na, locOk ? color.lime : color.white, TIP_LOC)
+                    r := 6
+                if showLiquidityMap
+                    f_row(r,     "Untaken above", f_liqTxt(upLvl, upNm), na, colBuy,  TIP_UP)
+                    f_row(r + 1, "Untaken below", f_liqTxt(dnLvl, dnNm), na, colSell, TIP_DN)
