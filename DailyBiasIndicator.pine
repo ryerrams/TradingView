@@ -97,10 +97,10 @@ liveMode      = input.string("Stubs", "Today's dVAH/dPOC/dVAL", options=["Stubs"
 stubBars      = input.int(8, "Today Stub Length (bars)", minval=1, maxval=100, group=grpV)
 showBubbles   = input.bool(false, "Today-POC Entry/Exit Bubbles (NT8 extra)", group=grpV)
 showReadout   = input.bool(true, "Show Readout Strip", group=grpV)
-readoutPos    = input.string("Bottom Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV)
-readoutOffset = input.float(3.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV)
-readoutSizeIn = input.string("Large", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
-showDiag      = input.bool(true, "Diagnostics Panel", group=grpV)
+readoutPos    = input.string("Top Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV)
+readoutOffset = input.float(10.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV, tooltip="Push the readout away from the pane edge. Stack it under other top-right panels without overlap (Soma Precision ICT 0, ATR Stretch 6, this readout 10). Raise it if they touch on a short pane.")
+readoutSizeIn = input.string("Small", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
+showDiag      = input.bool(false, "Diagnostics Panel", group=grpV, tooltip="Debug table (bottom left): day and hour ranges, hourly-tail confluence counts, POC targets, the confluence trade direction and its trail stop. Off by default to keep the chart clean.")
 diagPos       = input.string("Bottom Left", "Diagnostics Position", options=["Top Left", "Top Center", "Middle Left", "Bottom Left", "Bottom Center"], group=grpV)
 
 showTags       = input.bool(true, "Show Price Tags on Level Lines", group=grpL)
@@ -776,7 +776,7 @@ readoutTop  = str.startswith(readoutPos, "Top")
 panelBg = color.new(#161A22, 8)
 panelFg = #E6E8EB
 
-var table readout = table.new(toPosition(readoutPos), 4, 3, frame_color=color.new(#2A2E39, 0), frame_width=1, border_color=color.new(#2A2E39, 0), border_width=1)
+var table readout = table.new(toPosition(readoutPos), 4, 3, frame_color=color.new(#2A2E39, 0), frame_width=0, border_color=color.new(#2A2E39, 0), border_width=1)
 if showReadout and barstate.islast
     bool havePrior = not na(priorVah)
     bool qual = useQual and haveToday
