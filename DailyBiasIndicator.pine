@@ -86,7 +86,7 @@ onePerDay   = input.bool(true, "One Signal Per Side Per Day", group=grpT)
 showLong    = input.bool(true, "Long Setups", group=grpT)
 showShort   = input.bool(true, "Short Setups", group=grpT)
 showZones   = input.bool(true, "Tolerance Bands", group=grpT)
-showDayHL   = input.bool(true, "Day High / Low Lines", group=grpT)
+showDayHL   = input.bool(false, "Day High / Low Lines", group=grpT)   // default OFF (owner 2026-10-13): hides the red day-range rectangles
 
 showStop    = input.bool(true, "Show Trailing Stop", group=grpS)
 stopAnchor  = input.string("Value Area", "Trailing Stop Anchor", options=["Value Area", "Hour Extreme", "Tighter", "Wider"], group=grpS, tooltip="Value Area = last completed hour's VAL/VAH. Hour Extreme = its low/high. Tighter / Wider = whichever of the two is closer to / farther from price.")
