@@ -34,7 +34,7 @@ showR3S3       = input.bool(true, "Show R3/S3", group=GL, tooltip="PT3 and S3: t
 
 GD = "Display"
 stubBars       = input.int(10, "Stub Bars", minval=1, maxval=450, group=GD, tooltip="Length of the right-edge stubs, in bars.")
-stubGap        = input.int(32, "Stub Offset (bars)", minval=0, maxval=400, group=GD, tooltip="Empty bars between the last candle and the start of the stubs. Raise it to move the levels clear of other indicators' right-edge tags. The default 32 clears Daily Bias pVAH/pPOC/pVAL tags (at +18 bars) and SOMA plan tags (at +12). Tag text has a fixed pixel width, so when you zoom far out it can reach further: raise this if they touch. 0 = start right after the last bar (the original position).")
+stubGap        = input.int(44, "Stub Offset (bars)", minval=0, maxval=400, group=GD, tooltip="Empty bars between the last candle and the start of the stubs. Raise it to move the levels clear of other indicators' right-edge tags. The default 44 starts the stubs at +45, right of the Daily Bias pVAH/pPOC/pVAL tags (at +18 bars) and the SOMA plan tags (at +30). Tag text has a fixed pixel width, so when you zoom far out it can reach further: raise this if they touch. 0 = start right after the last bar (the original position).")
 shadingOn      = input.bool(true, "Shading", group=GD, tooltip="Fill the bands between adjacent levels: green above Key, red below.")
 shadingScope   = input.string("StubOnly", "Shading Scope", options=["StubOnly", "FullWidth"], group=GD, tooltip="FullWidth also turns on the full-width lines.")
 showFullLines  = input.bool(false, "Show Full-Width Lines", group=GD, tooltip="Extend each level as a dashed line across the whole chart, not only the right-edge stub.")
