@@ -7,3 +7,5 @@ __pycache__/
 replay/*.csv
 replay/*.mp4
 venv/
+backtest/data/
+backtest/results/
