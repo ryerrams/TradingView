@@ -113,8 +113,8 @@ showDiag      = input.bool(false, "Diagnostics Panel", group=grpV, tooltip="Debu
 diagPos       = input.string("Bottom Left", "Diagnostics Position", options=["Top Left", "Top Center", "Middle Left", "Bottom Left", "Bottom Center"], group=grpV)
 
 showTags       = input.bool(true, "Show Price Tags on Level Lines", group=grpL)
-todayTagOffset = input.int(5, "dVAH/dPOC/dVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar today's tags sit. The dVAH/dPOC/dVAL stub lines run up to the tags.")
-priorTagOffset = input.int(13, "pVAH/pPOC/pVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar the prior-day tags sit. Right-edge columns by default: Daily Bias today +5, prior day +13, Soma Trendrun plan tags +21, Key Pivot Stubs +29. Tag text has a fixed pixel width, so raise these if the tags touch when you zoom out.")
+todayTagOffset = input.int(4, "dVAH/dPOC/dVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar today's tags sit. The dVAH/dPOC/dVAL stub lines run up to the tags.")
+priorTagOffset = input.int(11, "pVAH/pPOC/pVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar the prior-day tags sit. Right-edge columns by default: Daily Bias today +4, prior day +11, Soma Trendrun plan tags +18, Key Pivot Stubs +26. Tag text has a fixed pixel width, so raise these if the tags touch when you zoom out.")
 levelHelp      = input.bool(true, "Hover Help", group=grpL, tooltip="Hover tags, box names, bubbles and panel rows for what each one means.")
 letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxval=50, group=grpL)
 lblSizeIn      = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"], group=grpL)
