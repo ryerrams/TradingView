@@ -113,6 +113,8 @@ showDiag      = input.bool(false, "Diagnostics Panel", group=grpV, tooltip="Debu
 diagPos       = input.string("Bottom Left", "Diagnostics Position", options=["Top Left", "Top Center", "Middle Left", "Bottom Left", "Bottom Center"], group=grpV)
 
 showTags       = input.bool(true, "Show Price Tags on Level Lines", group=grpL)
+todayTagOffset = input.int(5, "dVAH/dPOC/dVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar today's tags sit. The dVAH/dPOC/dVAL stub lines run up to the tags.")
+priorTagOffset = input.int(13, "pVAH/pPOC/pVAL Tag Offset (bars)", minval=1, maxval=200, group=grpL, tooltip="How many bars right of the last bar the prior-day tags sit. Right-edge columns by default: Daily Bias today +5, prior day +13, Soma Trendrun plan tags +21, Key Pivot Stubs +29. Tag text has a fixed pixel width, so raise these if the tags touch when you zoom out.")
 levelHelp      = input.bool(true, "Hover Help", group=grpL, tooltip="Hover tags, box names, bubbles and panel rows for what each one means.")
 letterOffset   = input.int(6, "Letter Offset (ticks below bar)", minval=0, maxval=50, group=grpL)
 lblSizeIn      = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"], group=grpL)
@@ -733,9 +735,9 @@ alertcondition(fbd, "FBD-Long",  "Failed breakdown below pVAL: long, target pVAH
 alertcondition(longStoppedOut or shortStoppedOut, "Stopped Out", "Trailing stop hit")
 
 // ── Today's developing levels (last bar only) ───────────
-var line  stVah  = line.new(0, float(na), 0, float(na), color=liveVahCol, width=1)
-var line  stPoc  = line.new(0, float(na), 0, float(na), color=livePocCol, width=1)
-var line  stVal  = line.new(0, float(na), 0, float(na), color=liveValCol, width=1)
+var line  stVah  = line.new(0, float(na), 0, float(na), color=color.new(liveVahCol, 35), width=1, style=line.style_dotted)
+var line  stPoc  = line.new(0, float(na), 0, float(na), color=color.new(livePocCol, 35), width=1, style=line.style_dotted)
+var line  stVal  = line.new(0, float(na), 0, float(na), color=color.new(liveValCol, 35), width=1, style=line.style_dotted)
 var label tgVah  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveVahCol, 85), textcolor=liveVahCol, size=noteSz)
 var label tgPoc  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(livePocCol, 85), textcolor=livePocCol, size=noteSz)
 var label tgVal  = label.new(0, float(na), "", style=label.style_label_left, color=color.new(liveValCol, 85), textcolor=liveValCol, size=noteSz)
@@ -761,16 +763,17 @@ if barstate.islast
         liveVah := lvI * rowSize
         liveVal := llI * rowSize
     int x1 = bar_index - stubBars + 1
-    setStub(stVah, liveVah, liveOn, x1, bar_index + 2)
-    setStub(stPoc, dayPOC, liveOn, x1, bar_index + 2)
-    setStub(stVal, liveVal, liveOn, x1, bar_index + 2)
-    setTag(tgVah, liveVah, "dVAH", showTags and liveOn, 3, tipDVah)
-    setTag(tgPoc, dayPOC, "dPOC", showTags and liveOn, 3, tipDPoc)
-    setTag(tgVal, liveVal, "dVAL", showTags and liveOn, 3, tipDVal)
+    int x2 = bar_index + todayTagOffset - 1   // stubs run up to today's tags
+    setStub(stVah, liveVah, liveOn, x1, x2)
+    setStub(stPoc, dayPOC, liveOn, x1, x2)
+    setStub(stVal, liveVal, liveOn, x1, x2)
+    setTag(tgVah, liveVah, "dVAH", showTags and liveOn, todayTagOffset, tipDVah)
+    setTag(tgPoc, dayPOC, "dPOC", showTags and liveOn, todayTagOffset, tipDPoc)
+    setTag(tgVal, liveVal, "dVAL", showTags and liveOn, todayTagOffset, tipDVal)
     bool priorOn = symOk and showTags and showRef and not na(priorVah)
-    setTag(tgPVah, priorVah, "pVAH", priorOn, 18, tipPVah(priorDayTxt))
-    setTag(tgPPoc, poc1, "pPOC", priorOn, 18, tipPPoc(priorDayTxt))
-    setTag(tgPVal, priorVal, "pVAL", priorOn, 18, tipPVal(priorDayTxt))
+    setTag(tgPVah, priorVah, "pVAH", priorOn, priorTagOffset, tipPVah(priorDayTxt))
+    setTag(tgPPoc, poc1, "pPOC", priorOn, priorTagOffset, tipPPoc(priorDayTxt))
+    setTag(tgPVal, priorVal, "pVAL", priorOn, priorTagOffset, tipPVal(priorDayTxt))
 
 // ── Readout strip: [Bias] [pVAH] [pPOC] [pVAL] + what to do now ──
 toPosition(string p) =>
