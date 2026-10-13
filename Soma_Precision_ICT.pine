@@ -34,7 +34,7 @@
 //    small triangles, the panel is two short lines. The help lives in hover
 //    tooltips so it adds nothing to the chart.
 // =============================================================================
-indicator("Soma ICT Levels (no tags)", "SomaICT", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("Soma ICT Levels (no tags)", "Soma ICT Levels", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 TZ = "America/New_York"
 

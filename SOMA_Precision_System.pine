@@ -19,7 +19,7 @@
 //    [-1..-3]); here they are confirmed 3 bars later and drawn with offset=-3.
 //  - TTM_Squeeze histogram uses the standard thinkorswim-equivalent formula.
 // =============================================================================
-indicator("Soma TrendRun Signals (plan tags)", "SomaTrend", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+indicator("Soma TrendRun Signals (plan tags)", "Soma TrendRun Signals", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
 
 // -----------------------------------------------------------------------------
 // Display
