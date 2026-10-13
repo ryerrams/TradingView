@@ -48,6 +48,14 @@ grpT = "Tail Confluence"
 grpS = "Trailing Stop & Targets"
 grpV = "Visuals"
 grpL = "Labels"
+grpSy = "Symbols"
+
+activeOn = input.string("NQ, MNQ", "Active On (symbol roots)", group=grpSy, tooltip="Comma-separated symbol roots where this indicator runs. NQ covers NQ1! and every NQ contract month, MNQ the same for micros. On any other symbol it draws nothing, shows no panels and sends no alerts (the point-based settings, like the 2-pt zone buffer, are sized for NQ).\nLeave empty to run on every symbol.")
+// syminfo.root is "NQ" for NQ1! and NQZ2026, "MNQ" for micros
+f_symOk() =>
+    string lst = str.upper(str.replace_all(activeOn, " ", ""))
+    lst == "" or array.includes(str.split(lst, ","), str.upper(syminfo.root))
+symOk = f_symOk()
 grpC = "Colors"
 
 vaPctIn       = input.int(68, "Value Area %", minval=50, maxval=95, group=grpP)
@@ -99,8 +107,8 @@ showBubbles   = input.bool(false, "Today-POC Entry/Exit Bubbles (NT8 extra)", gr
 showReadout   = input.bool(true, "Show Readout Strip", group=grpV)
 readoutPos    = input.string("Top Right", "Readout Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpV)
 readoutOffset = input.float(10.0, "Readout Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=grpV, tooltip="Push the readout away from the pane edge. Stack it under other top-right panels without overlap (Soma Precision ICT 0, ATR Stretch 6, this readout 10). Raise it if they touch on a short pane.")
-readoutSizeIn = input.string("Small", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
-readoutStack  = input.int(6, "Stack Below (text lines)", minval=0, maxval=40, group=grpV, tooltip="Top positions: leave this many lines of small text above the readout, so it sits under other top-right panels at any pane height. 6 = below Soma Precision ICT (2 lines) and the ATR Stretch label, with a small gap. 0 = use Readout Edge Offset (% of pane) instead.")
+readoutSizeIn = input.string("Normal", "Readout Text Size", options=["Small", "Normal", "Large"], group=grpV)
+readoutStack  = input.int(8, "Stack Below (text lines)", minval=0, maxval=40, group=grpV, tooltip="Top positions: leave this many lines of small text above the readout, so it sits under other top-right panels at any pane height. 8 = below Soma Precision ICT (2 lines) and the ATR Stretch label at Normal text size, with a small gap (use 6 for Small). 0 = use Readout Edge Offset (% of pane) instead.")
 showDiag      = input.bool(false, "Diagnostics Panel", group=grpV, tooltip="Debug table (bottom left): day and hour ranges, hourly-tail confluence counts, POC targets, the confluence trade direction and its trail stop. Off by default to keep the chart clean.")
 diagPos       = input.string("Bottom Left", "Diagnostics Position", options=["Top Left", "Top Center", "Middle Left", "Bottom Left", "Bottom Center"], group=grpV)
 
@@ -204,11 +212,15 @@ valueArea(map<int, float> h, int pocIdx, float pct) =>
     [vahI, valI]
 
 trackLbl(array<label> lbls, array<int> bars, label lb) =>
+    if not symOk
+        label.delete(lb)
     lbls.push(lb)
     bars.push(bar_index)
     lb
 
 trackLn(array<line> lns, array<int> bars, line ln) =>
+    if not symOk
+        line.delete(ln)
     lns.push(ln)
     bars.push(bar_index)
     ln
@@ -582,23 +594,23 @@ if extLongSignal
 if extShortSignal
     bubble(sigLbls, sigBars, low, "Target 2 broken -> next: " + (na(target3Short) ? "none valid" : fmt(target3Short)), true, extShortCol, #0B0E11, "Price traded through the short Target 2 " + fmt(snapT2Short) + " frozen at the last signal.\nNext prior-day POC below it: " + fmt(target3Short) + ".")
 
-plotshape(longSignal,  "Confluence Long",  shape.triangleup,   location.belowbar, confLongCol,  size=size.small)
-plotshape(shortSignal, "Confluence Short", shape.triangledown, location.abovebar, confShortCol, size=size.small)
+plotshape(symOk and longSignal,  "Confluence Long",  shape.triangleup,   location.belowbar, confLongCol,  size=size.small)
+plotshape(symOk and shortSignal, "Confluence Short", shape.triangledown, location.abovebar, confShortCol, size=size.small)
 
-plot(showDayHL ? dayLo : na, "Day Low",  color=dayHLCol, linewidth=2, style=plot.style_stepline)
-plot(showDayHL ? dayHi : na, "Day High", color=dayHLCol, linewidth=2, style=plot.style_stepline)
-pZoneLo  = plot(showZones ? dayLo : na,       "Long Band Bottom",  display=display.none)
-pZoneLoT = plot(showZones ? dayLo + tol : na, "Long Band Top",     display=display.none)
-pZoneHi  = plot(showZones ? dayHi : na,       "Short Band Top",    display=display.none)
-pZoneHiB = plot(showZones ? dayHi - tol : na, "Short Band Bottom", display=display.none)
+plot(symOk and showDayHL ? dayLo : na, "Day Low",  color=dayHLCol, linewidth=2, style=plot.style_stepline)
+plot(symOk and showDayHL ? dayHi : na, "Day High", color=dayHLCol, linewidth=2, style=plot.style_stepline)
+pZoneLo  = plot(symOk and showZones ? dayLo : na,       "Long Band Bottom",  display=display.none)
+pZoneLoT = plot(symOk and showZones ? dayLo + tol : na, "Long Band Top",     display=display.none)
+pZoneHi  = plot(symOk and showZones ? dayHi : na,       "Short Band Top",    display=display.none)
+pZoneHiB = plot(symOk and showZones ? dayHi - tol : na, "Short Band Bottom", display=display.none)
 fill(pZoneLo, pZoneLoT, color.new(confLongCol, 85),  "Long Tolerance Band")
 fill(pZoneHi, pZoneHiB, color.new(confShortCol, 85), "Short Tolerance Band")
 
-plot(showStop ? longStop  : na, "Trailing Stop Long",  color=stopLongCol,  linewidth=2, style=plot.style_linebr)
-plot(showStop ? shortStop : na, "Trailing Stop Short", color=stopShortCol, linewidth=2, style=plot.style_linebr)
+plot(symOk and showStop ? longStop  : na, "Trailing Stop Long",  color=stopLongCol,  linewidth=2, style=plot.style_linebr)
+plot(symOk and showStop ? shortStop : na, "Trailing Stop Short", color=stopShortCol, linewidth=2, style=plot.style_linebr)
 
 // ── Drawing: prior value area boxes ─────────────────────
-if showRef and not na(priorVah)
+if symOk and showRef and not na(priorVah)
     if na(bxVah)
         int x1 = dayStartBar
         bxVah := box.new(x1, priorVah + zonePts, bar_index, priorVah - zonePts, border_color=color.new(priorVaCol, 55), border_width=1, bgcolor=color.new(priorVaCol, 91))
@@ -688,10 +700,10 @@ whyExitShort := addWhy(whyExitShort, alertDB and stalledDown, "RS-BTC: FBO-Short
 whyExitShort := addWhy(whyExitShort, alertDB and fboVoided, "FBO-Short voided (accepted above pVAH)")
 whyExitShort := addWhy(whyExitShort, alertDB and bdExit, "BD-BTC: breakdown short bias gone")
 
-bool alertLong      = whyLong != ""
-bool alertShort     = whyShort != ""
-bool alertExitLong  = whyExitLong != ""
-bool alertExitShort = whyExitShort != ""
+bool alertLong      = symOk and whyLong != ""
+bool alertShort     = symOk and whyShort != ""
+bool alertExitLong  = symOk and whyExitLong != ""
+bool alertExitShort = symOk and whyExitShort != ""
 
 // Separate alerts per direction (static text; TradingView fills the placeholders)
 alertcondition(alertLong,      "LONG",       "LONG {{ticker}} @ {{close}} ({{interval}})")
@@ -741,7 +753,7 @@ setTag(label lb, float y, string txt, bool on, int xOff, string tip) =>
     lb.set_tooltip(help(tip))
 
 if barstate.islast
-    bool  liveOn  = liveMode != "Off"
+    bool  liveOn  = symOk and liveMode != "Off"
     float liveVah = na
     float liveVal = na
     if liveOn
@@ -755,7 +767,7 @@ if barstate.islast
     setTag(tgVah, liveVah, "dVAH", showTags and liveOn, 3, tipDVah)
     setTag(tgPoc, dayPOC, "dPOC", showTags and liveOn, 3, tipDPoc)
     setTag(tgVal, liveVal, "dVAL", showTags and liveOn, 3, tipDVal)
-    bool priorOn = showTags and showRef and not na(priorVah)
+    bool priorOn = symOk and showTags and showRef and not na(priorVah)
     setTag(tgPVah, priorVah, "pVAH", priorOn, 18, tipPVah(priorDayTxt))
     setTag(tgPPoc, poc1, "pPOC", priorOn, 18, tipPPoc(priorDayTxt))
     setTag(tgPVal, priorVal, "pVAL", priorOn, 18, tipPVal(priorDayTxt))
@@ -778,7 +790,7 @@ panelBg = color.new(#161A22, 8)
 panelFg = #E6E8EB
 
 var table readout = table.new(toPosition(readoutPos), 4, 3, frame_color=color.new(#2A2E39, 0), frame_width=0, border_color=color.new(#2A2E39, 0), border_width=0)
-if showReadout and barstate.islast
+if symOk and showReadout and barstate.islast
     bool havePrior = not na(priorVah)
     bool qual = useQual and haveToday
     string biasTxt = dbBias == 1 ? (not qual or aboveTodayPoc ? "Bias L" : "Bias l") : dbBias == -1 ? (not qual or not aboveTodayPoc ? "Bias S" : "Bias s") : "Bias N"
@@ -831,7 +843,7 @@ var table diag = table.new(toPosition(diagPos), 1, 12, frame_color=color.new(#2A
 diagRow(int r, string txt, color fg, string tip) =>
     diag.cell(0, r, txt, bgcolor=color.new(#161A22, 8), text_color=fg, text_size=size.small, text_halign=text.align_left, tooltip=help(tip))
 
-if showDiag and barstate.islast
+if symOk and showDiag and barstate.islast
     diagRow(0, "Day Lo/Hi: " + fmt(dayLo) + " / " + fmt(dayHi), color.gray, "Today's profile low/high. Confluence measures hourly tails against these.")
     diagRow(1, "This Hour Lo/Hi: " + fmt(hrLo) + " / " + fmt(hrHi), color.gray, "The live hour's profile low/high (slot 0 of the lookback).")
     diagRow(2, "Prior Day VAL/VAH: " + fmt(priorVal) + " / " + fmt(priorVah), failBoCol, "pVAL / pVAH from " + priorDayTxt + ". The Daily Bias bubbles key off these.")

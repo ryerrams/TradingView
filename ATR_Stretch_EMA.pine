@@ -34,8 +34,8 @@ showHistFactor    = input.bool(false, "Factor Labels on Historical Bars", toolti
 factorSizeInput   = input.string("Small", "Factor Label Size", options=["Tiny", "Small", "Normal"])
 labelPos          = input.string("Top Right", "Label Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"])
 labelOffset       = input.float(6.0, "Label Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, tooltip="Pushes the label away from the pane edge. Stack it with other top-right panels without overlap (Soma Precision ICT 0, this label 6, Daily Bias readout 10).")
-labelSizeInput    = input.string("Small", "Label Text Size", options=["Small", "Normal", "Large"])
-stackLines        = input.int(3, "Stack Below (text lines)", minval=0, maxval=40, tooltip="Top positions: leave this many lines of small text above the label, so it sits under other top-right panels at any pane height. 3 = below the 2-line Soma Precision ICT panel. 0 = use Label Edge Offset (% of pane) instead.")
+labelSizeInput    = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"])
+stackLines        = input.int(4, "Stack Below (text lines)", minval=0, maxval=40, tooltip="Top positions: leave this many lines of small text above the label, so it sits under other top-right panels at any pane height. 4 = below the 2-line Soma Precision ICT panel at Normal text size (use 3 for Small). 0 = use Label Edge Offset (% of pane) instead.")
 
 // ── Calculation ─────────────────────────────────────────
 tr  = ta.tr(true)

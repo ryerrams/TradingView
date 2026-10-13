@@ -40,6 +40,9 @@ TZ = "America/New_York"
 // -----------------------------------------------------------------------------
 // Inputs
 // -----------------------------------------------------------------------------
+GSY = "Symbols"
+activeOn = input.string("NQ, MNQ", "Active On (symbol roots)", group=GSY, tooltip="Comma-separated symbol roots where this indicator runs. NQ covers NQ1! and every NQ contract month (NQZ2026...), MNQ the same for micros. On any other symbol it draws nothing and shows no panel.\nLeave empty to run on every symbol.")
+
 GL = "Liquidity Lines"
 showLiquidity    = input.bool(true,  "Show Liquidity Lines", group=GL, tooltip="Liquidity = an obvious high or low where many traders keep their stop orders. Price is often drawn to these levels to trigger those stops.\n\nGold lines are highs (buy-side liquidity: stops of short sellers sit above). Blue lines are lows (sell-side liquidity: stops of buyers sit below).\n\nA line ends (turns faded and dotted) as soon as price trades through it. The liquidity is then 'taken'.")
 showPD           = input.bool(true,  "Prior Day H/L",  inline="lq1", group=GL, tooltip="PDH / PDL: the high and low of the previous trading day.")
@@ -82,7 +85,7 @@ GA = "Action Panel"
 showStatus       = input.bool(true, "Show Action Panel", group=GA, tooltip="A panel that runs the PRECISION + ICT playbook as a checklist:\n1. Bias: do the day / week / month / year ranges lean one way?\n2. EMAs: are the 9/13/22 EMAs not stacked against the bias?\n3. Killzone: is it London or New York time?\n4. Location: is price at a good place to enter (fresh sweep, inside a gap, or the cheap / expensive half of yesterday's range)?\n\nWAIT (grey) = a check fails. WATCH (yellow) = all checks pass except location. READY (green / red) = all checks pass: take the next PRECISION arrow in that direction.\n\nHover any row in the panel for help.")
 panelStyle       = input.string("Compact", "Panel Style", options=["Compact", "Full"], group=GA, tooltip="Compact: one short status line plus the nearest liquidity. Hover the status for the full reason.\nFull: one row per check (Bias, EMAs, Killzone, Location), so you can see why the status is what it is.")
 panelPos         = input.string("Top Right", "Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GA)
-panelSize        = input.string("Small", "Panel Text Size", options=["Tiny", "Small", "Normal"], group=GA)
+panelSize        = input.string("Normal", "Panel Text Size", options=["Tiny", "Small", "Normal", "Large"], group=GA, tooltip="Normal matches the Daily Bias readout and the ATR Stretch label.")
 panelOffset      = input.float(0.0, "Panel Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=GA, tooltip="Push the panel away from the pane edge. Use it to stack panels from several indicators in the same corner without overlap (for example: this panel 0, ATR Stretch 6, Daily Bias readout 10).")
 showLiquidityMap = input.bool(true, "Show Nearest Untaken Liquidity", group=GA, tooltip="Show the closest untaken liquidity line above and below price. These are likely targets, and places where a move may stall.")
 readyBars        = input.int(12, "Sweep Stays Fresh (bars)", minval=1, group=GA, tooltip="After a sweep, the 'location' check counts it for this many bars. After that the sweep is old news.")
@@ -124,7 +127,12 @@ TIP_LNL = "London L - low of the London session.\nSell-side liquidity. New York 
 // Base values
 // -----------------------------------------------------------------------------
 tfSec = timeframe.in_seconds()
-ictOn = timeframe.isintraday and tfSec <= 3600
+// Symbol filter: syminfo.root is "NQ" for NQ1! and NQZ2026, "MNQ" for micros
+f_symOk() =>
+    string lst = str.upper(str.replace_all(activeOn, " ", ""))
+    lst == "" or array.includes(str.split(lst, ","), str.upper(syminfo.root))
+symOk = f_symOk()
+ictOn = symOk and timeframe.isintraday and tfSec <= 3600
 
 tfD = tfSec <= timeframe.in_seconds("D")   ? "D"   : timeframe.period
 tfW = tfSec <= timeframe.in_seconds("W")   ? "W"   : timeframe.period
@@ -667,7 +675,7 @@ var array<Slot> highSlots = array.from(sPDH, sPWH, sAsH, sLnH)
 var array<Slot> lowSlots  = array.from(sPDL, sPWL, sAsL, sLnL)
 
 tblPos  = panelPos == "Top Left" ? position.top_left : panelPos == "Bottom Right" ? position.bottom_right : panelPos == "Bottom Left" ? position.bottom_left : position.top_right
-tblSize = panelSize == "Tiny" ? size.tiny : panelSize == "Normal" ? size.normal : size.small
+tblSize = panelSize == "Tiny" ? size.tiny : panelSize == "Normal" ? size.normal : panelSize == "Large" ? size.large : size.small
 PANEL_BG = color.new(#161A22, 8)
 PANEL_FG = #E6E8EB
 PANEL_MUTED = #8B919A
@@ -691,7 +699,7 @@ if barstate.islast
     panel.clear(0, 0, 1, 9)
     if panelOffset > 0 and (showStatus or showLiquidityMap)
         panel.cell(0, 0, "", height=panelOffset, bgcolor=color.new(color.black, 100))
-    if showStatus or showLiquidityMap
+    if symOk and (showStatus or showLiquidityMap)
         if not ictOn
             panel.cell(0, R0, "Soma Precision ICT works on 1 hour charts and below", text_color=color.silver, text_size=tblSize, tooltip="Switch the chart to 1h or a lower timeframe to see liquidity lines, sweeps, fair value gaps, killzones and the action panel.")
         else
