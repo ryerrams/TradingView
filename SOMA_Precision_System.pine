@@ -1,6 +1,8 @@
 //@version=6
 // =============================================================================
-//  SOMA_PRECISION_SYSTEM  (TradingView port of the thinkorswim study)
+//  SOMA TRENDRUN SIGNALS (plan tags)  (TradingView port of the thinkorswim
+//  SOMA_PRECISION_SYSTEM study). Turn / Shotgun / Continuation entries with
+//  ENTRY / STOP / T1-T3 price tags. Trade Mode: TrendRun (default) or Scalp.
 //
 //  Design goals:
 //  - No future-bar references in actionable signals.
@@ -17,7 +19,7 @@
 //    [-1..-3]); here they are confirmed 3 bars later and drawn with offset=-3.
 //  - TTM_Squeeze histogram uses the standard thinkorswim-equivalent formula.
 // =============================================================================
-indicator("SOMA Precision System", "SOMA", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+indicator("Soma TrendRun Signals (plan tags)", "SomaTrend", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
 
 // -----------------------------------------------------------------------------
 // Display
