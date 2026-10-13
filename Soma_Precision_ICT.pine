@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-//  SOMA ICT LEVELS (no tags)  (TradingView port of the thinkorswim PRECISION_ICT study)
+//  SOMA ICT  (TradingView port of the thinkorswim PRECISION_ICT study)
 //  Line ends show level names only (PDH, Asia L...), never price tags.
 //
 //  ICT markings for intraday charts (1 hour and below), made to pair with
@@ -34,7 +34,7 @@
 //    small triangles, the panel is two short lines. The help lives in hover
 //    tooltips so it adds nothing to the chart.
 // =============================================================================
-indicator("Soma ICT Levels (no tags)", "Soma ICT Levels", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("Soma ICT", "Soma ICT", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 TZ = "America/New_York"
 
@@ -702,7 +702,7 @@ if barstate.islast
         panel.cell(0, 0, "", height=panelOffset, bgcolor=color.new(color.black, 100))
     if symOk and (showStatus or showLiquidityMap)
         if not ictOn
-            panel.cell(0, R0, "Soma ICT Levels works on 1 hour charts and below", text_color=color.silver, text_size=tblSize, tooltip="Switch the chart to 1h or a lower timeframe to see liquidity lines, sweeps, fair value gaps, killzones and the action panel.")
+            panel.cell(0, R0, "Soma ICT works on 1 hour charts and below", text_color=color.silver, text_size=tblSize, tooltip="Switch the chart to 1h or a lower timeframe to see liquidity lines, sweeps, fair value gaps, killzones and the action panel.")
         else
             [upLvl, upNm] = f_nearest(highSlots, true)
             [dnLvl, dnNm] = f_nearest(lowSlots, false)
