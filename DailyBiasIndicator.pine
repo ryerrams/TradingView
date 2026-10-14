@@ -83,8 +83,8 @@ minHours    = input.int(2, "Hours Required Near", minval=1, maxval=4, group=grpT
 needConfirm = input.bool(true, "Require Reversal Confirmation", group=grpT, tooltip="Only signal while price is back above the day low (longs) / below the day high (shorts).")
 incLive     = input.bool(true, "Count the Live Hour", group=grpT)
 onePerDay   = input.bool(true, "One Signal Per Side Per Day", group=grpT)
-showLong    = input.bool(true, "Long Setups", group=grpT)
-showShort   = input.bool(true, "Short Setups", group=grpT)
+showLong    = input.bool(false, "Long Setups", group=grpT, tooltip="D/Hourly Confluence LONG bubbles, their trailing stop, STOPPED OUT, continuation and extended-target bubbles. Off by default (owner 2026-10-13): too noisy, especially early in the session.")
+showShort   = input.bool(false, "Short Setups", group=grpT, tooltip="D/Hourly Confluence SHORT bubbles, their trailing stop, STOPPED OUT, continuation and extended-target bubbles. Off by default (owner 2026-10-13): too noisy, especially early in the session.")
 showZones   = input.bool(true, "Tolerance Bands", group=grpT)
 showDayHL   = input.bool(false, "Day High / Low Lines", group=grpT)   // default OFF (owner 2026-10-13): hides the red day-range rectangles
 
