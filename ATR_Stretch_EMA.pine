@@ -29,6 +29,7 @@ extremeThreshold  = input.float(3.0, "Extreme Threshold (|factor|)", minval=0, s
 showEma           = input.bool(false, "Show EMA on Price")
 confirmOnClose    = input.bool(true, "BUY: Confirm on Bar Close", tooltip="Off = BUY can fire intrabar and disappear if price falls back (like ToS). On = only once the bar has closed.")
 showBuyBubble     = input.bool(true, "Show BUY Arrow + Bubble")
+buyKeepBars       = input.int(12, "BUY: Keep Last N Bars (0 = all)", minval=0, maxval=5000, tooltip="BUY arrows and bubbles older than this many bars are removed, so only recent BUYs stay on the chart. 0 = no bar limit (Current Day Only still applies).")
 buyTodayOnly      = input.bool(true, "BUY: Current Day Only", tooltip="On = BUY arrows and bubbles from earlier trading days are removed when a new trading day starts (18:00 ET on CME futures). Off = keep every BUY on the chart. Alerts are not affected.")
 showFactorLabels  = input.bool(true, "Show Per-Bar Factor Labels")
 showHistFactor    = input.bool(false, "Factor Labels on Historical Bars", tooltip="Off = only the live bar gets a factor label.")
@@ -75,11 +76,17 @@ showBuy = showBuyBubble and buyNow
 // so they are created once and updated / removed as the bar evolves.
 var label buyLbl = na
 var label buyArw = na
-var array<label> buyMarks = array.new<label>()   // every BUY arrow + bubble drawn this trading day
+var array<label> buyMarks = array.new<label>()   // every BUY arrow + bubble still on the chart
+var array<int>   buyMarkBars = array.new<int>()  // bar each mark was drawn on (for Keep Last N Bars)
 if buyTodayOnly and time_tradingday != time_tradingday[1]
     for m in buyMarks
         label.delete(m)
     buyMarks.clear()
+    buyMarkBars.clear()
+if buyKeepBars > 0
+    while buyMarkBars.size() > 0 and bar_index - buyMarkBars.first() >= buyKeepBars
+        label.delete(buyMarks.shift())
+        buyMarkBars.shift()
 if barstate.isnew
     buyLbl := na
     buyArw := na
@@ -90,6 +97,8 @@ if showBuy
         buyArw := label.new(bar_index, low - atr * 0.25, "", style=label.style_arrowup, color=color.green, size=size.normal)
         buyMarks.push(buyLbl)
         buyMarks.push(buyArw)
+        buyMarkBars.push(bar_index)
+        buyMarkBars.push(bar_index)
     else
         label.set_xy(buyLbl, bar_index, low - atr * 0.5)
         label.set_text(buyLbl, txt)

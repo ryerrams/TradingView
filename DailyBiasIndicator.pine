@@ -121,7 +121,7 @@ lblSizeIn      = input.string("Normal", "Label Text Size", options=["Small", "No
 letterSizeIn   = input.string("Normal", "Letter Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpL)
 letterKeepBars = input.int(10, "Bias Letters: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 showNeutralLtr = input.bool(false, "Show Neutral (N) Letters", group=grpL, tooltip="N = price is inside the prior value area (no directional lean). Off hides only the N letter; L/S/l/s still print, and the readout still shows 'Bias N'.")
-faKeepBars     = input.int(60, "Daily Bias Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
+faKeepBars     = input.int(12, "Daily Bias Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 sigKeepBars    = input.int(0, "Confluence / Stop / Target Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 bubbleKeepBars = input.int(60, "Today-POC Bubbles: keep only the last N bars (0 = all history)", minval=0, maxval=5000, group=grpL)
 bubbleOffset   = input.int(14, "Today-POC Bubble Offset (ticks)", minval=0, maxval=100, group=grpL)

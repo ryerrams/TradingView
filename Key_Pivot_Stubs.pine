@@ -19,7 +19,7 @@
 //  - Added: context help (input tooltips and hover tooltips on stub labels).
 //  - Added: Stub Offset, to move the stubs right of other indicators' tags.
 // =============================================================================
-indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_boxes_count=50, max_labels_count=50)
+indicator("Key Pivot Stubs", "KeyPivots", overlay=true, max_lines_count=50, max_boxes_count=50, max_labels_count=500)
 
 // -----------------------------------------------------------------------------
 // Inputs
@@ -43,6 +43,7 @@ shadeTransp    = input.int(85, "Shading Transparency", minval=0, maxval=100, gro
 
 GR = "Reclaim Markers"
 showReclaims = input.bool(true, "Show Reclaim Markers", group=GR, tooltip="Marks the first close back above S1/S2/S3 after price dipped below it.")
+reclaimKeepBars = input.int(12, "Keep Markers: last N bars (0 = all)", minval=0, maxval=5000, group=GR, tooltip="Reclaim markers older than this many bars are removed, so only recent reclaims stay on the chart. 0 = keep the full history.")
 reclaimDip   = input.string("Close below", "Dip Trigger", options=["Close below", "Wick below"], group=GR, tooltip="Close below: a bar must close under the support first. Wick below: any trade under it counts, so a hammer that closes back above fires on the same bar.")
 
 GC = "Colors"
@@ -136,9 +137,25 @@ recS1 = reclaim(s1)
 recS2 = reclaim(s2)
 recS3 = reclaim(s3)
 
-plotshape(showReclaims and showR1S1 and recS1, "S1 Reclaim", shape.triangleup, location.belowbar, colRec, text="S1", textcolor=colRec, size=size.small)
-plotshape(showReclaims and showR2S2 and recS2, "S2 Reclaim", shape.triangleup, location.belowbar, colRec, text="S2", textcolor=colRec, size=size.small)
-plotshape(showReclaims and showR3S3 and recS3, "S3 Reclaim", shape.triangleup, location.belowbar, colRec, text="S3", textcolor=colRec, size=size.small)
+// Markers are labels (not plotshape) so ones older than Keep Markers can be removed.
+var array<label> recLbls = array.new<label>()
+var array<int>   recBars = array.new<int>()
+var label recLive = na                 // live-bar marker, redrawn each tick until the bar closes
+if barstate.isnew
+    recLive := na
+string recTxt = (showR1S1 and recS1 ? "S1" : "") + (showR2S2 and recS2 ? (showR1S1 and recS1 ? "/" : "") + "S2" : "") + (showR3S3 and recS3 ? ((showR1S1 and recS1) or (showR2S2 and recS2) ? "/" : "") + "S3" : "")
+label.delete(recLive)
+recLive := na
+if showReclaims and recTxt != ""
+    recLive := label.new(bar_index, low, recTxt, yloc=yloc.belowbar, style=label.style_triangleup, color=colRec, textcolor=colRec, size=size.small)
+    if barstate.isconfirmed
+        recLbls.push(recLive)
+        recBars.push(bar_index)
+        recLive := na
+if reclaimKeepBars > 0
+    while recBars.size() > 0 and bar_index - recBars.first() >= reclaimKeepBars
+        label.delete(recLbls.shift())
+        recBars.shift()
 
 alertcondition(recS1, "S1 Reclaim", "{{ticker}} reclaimed S1 at {{close}}")
 alertcondition(recS2, "S2 Reclaim", "{{ticker}} reclaimed S2 at {{close}}")
