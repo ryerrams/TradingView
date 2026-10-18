@@ -37,7 +37,7 @@ factorSizeInput   = input.string("Small", "Factor Label Size", options=["Tiny", 
 labelPos          = input.string("Top Right", "Label Position", options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"])
 labelOffset       = input.float(6.0, "Label Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, tooltip="Pushes the label away from the pane edge. Stack it with other top-right panels without overlap (Soma ICT 0, this label 6, Daily Bias readout 10).")
 labelSizeInput    = input.string("Normal", "Label Text Size", options=["Small", "Normal", "Large"])
-stackLines        = input.int(4, "Stack Below (text lines)", minval=0, maxval=40, tooltip="Top positions: leave this many lines of small text above the label, so it sits under other top-right panels at any pane height. 4 = below the 2-line Soma ICT panel at Normal text size (use 3 for Small). 0 = use Label Edge Offset (% of pane) instead.")
+stackLines        = input.int(7, "Stack Below (text lines)", minval=0, maxval=40, tooltip="Top positions: leave this many lines of small text above the label, so it sits under other top-right panels at any pane height. 7 = below the Soma ICT panel and its edge offset at Normal text size. 0 = use Label Edge Offset (% of pane) instead.")
 
 // ── Calculation ─────────────────────────────────────────
 tr  = ta.tr(true)

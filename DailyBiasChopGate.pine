@@ -47,8 +47,11 @@ showShortSetups             = input.bool(true, "showShortSetups", group=g1)
 showZones                   = input.bool(true, "showZones", group=g1)
 valueAreaPercent            = input.int(68, "valueAreaPercent", minval=50, maxval=95, group=g1)
 showAlerts                  = input.bool(false, "showAlerts", group=g1)
+showConfluenceSignals       = input.bool(true, "showConfluenceSignals", group=g1, tooltip="master switch for ALL Daily/Hourly confluence output: arrows, bubbles, zones, trailing stop, stop-outs, continuation, extended targets, alerts")
+strongSignalsOnly           = input.bool(false, "strongSignalsOnly", group=g1, tooltip="yes = only STRONG LONG/SHORT, their exits and CHOP: EXIT? (also hides confluence). Signals and exits keep working.")
 toleranceMode               = input.string("ATRMultiple", "toleranceMode", options=["ATRMultiple", "FixedPoints"], group=g1)
 toleranceATRMultiple        = input.float(0.5, "toleranceATRMultiple", group=g1, tooltip="used when toleranceMode = ATRMultiple (self-scales to current volatility)")
+bool confOn = showConfluenceSignals and not strongSignalsOnly
 
 g2 = "Trailing Stop / Continuation / Extended Target"
 showTrailingStop          = input.bool(true, "showTrailingStop", group=g2)
@@ -68,6 +71,9 @@ strongOnCandidate       = input.bool(false, "strongOnCandidate", group=g3, toolt
 exitOnChopStart         = input.bool(false, "exitOnChopStart", group=g3, tooltip="exit a strong trade the moment a new chop window starts")
 exitOnOppositeCandidate = input.bool(true, "exitOnOppositeCandidate", group=g3, tooltip="exit as soon as price first closes out of the chop on the opposite side")
 exitAtSessionEnd        = input.bool(true, "exitAtSessionEnd", group=g3)
+exitOnOppositeSignal    = input.bool(true, "exitOnOppositeSignal", group=g3, tooltip="a plain FBO-Short/BD-Short closes a long, a plain FBD-Long/BO-Long closes a short")
+exitOnReleaseFail       = input.bool(true, "exitOnReleaseFail", group=g3, tooltip="close back through the chop box the trade broke out of")
+showPointsAtChopWarning = input.bool(false, "showPointsAtChopWarning", group=g3, tooltip="add the open points to each CHOP: EXIT? bubble (if exited here)")
 showChopBox             = input.bool(true, "showChopBox", group=g3)
 showStrongPanel         = input.bool(true, "showStrongPanel", group=g3)
 chopLookbackBars        = input.int(20, "chopLookbackBars", group=g3)
@@ -103,6 +109,7 @@ g5 = "Display"
 showPriorDayValueArea = input.bool(true, "showPriorDayValueArea", group=g5)
 showDiagnostics       = input.bool(true, "showDiagnostics", group=g5)
 showDebug             = input.bool(true, "showDebug", group=g5)
+showDayLowHighLines   = input.bool(false, "showDayLowHighLines — not in thinkScript", group=g5, tooltip="The red stepped DayLow / DayHigh lines that hug the lows and highs of the day's candles. Off by default (same as the Daily Bias indicator). The green / red tolerance bands (showZones) still hang off the day low / high.")
 profileRowTicks       = input.int(1, "Profile Row Size (ticks) — not in thinkScript", minval=1, maxval=100, group=g5, tooltip="thinkScript uses one tick per row (pricePerRow = TICKSIZE). Raise it only if the script gets slow on very wide-range charts.")
 
 // ── Symbol + timeframe gate: only the listed symbols, on intraday charts between the two limits; everything else draws nothing ──
@@ -621,8 +628,19 @@ lastPair := pairCond(sigLBar, sigLExp, relLBar, trigL, lastPairPrev, strongWindo
 bool pairNow = lastPair == barNo
 int  pairDir = not pairNow ? 0 : pairCond(sigLBar, sigLExp, relLBar, trigL, lastPairPrev, strongWindowBars) == 1 ? 1 : -1
 
-bool exitLongCond  = (chCandNow and chCandDir == -1 and exitOnOppositeCandidate) or (chReleased and chReleaseDir == -1) or (exitOnChopStart and chStarted) or (exitAtSessionEnd and dayCond)
-bool exitShortCond = (chCandNow and chCandDir == 1 and exitOnOppositeCandidate) or (chReleased and chReleaseDir == 1) or (exitOnChopStart and chStarted) or (exitAtSessionEnd and dayCond)
+// the chop box each release broke out of (a long is invalid back below its bottom, a short back above its top)
+var float relLBoxLo = 0.0
+var float relSBoxHi = 0.0
+relLBoxLo := chRelEv and chRelDir == 1 ? boxEdge(chopCodePrev, chopBoxBars, false, true) : relLBoxLo
+relSBoxHi := chRelEv and chRelDir == -1 ? boxEdge(chopCodePrev, chopBoxBars, true, true) : relSBoxHi
+bool relFailLong  = relLBoxLo > 0 and relLBoxLo < 100000000000 and close < relLBoxLo
+bool relFailShort = relSBoxHi > 0 and relSBoxHi < 100000000000 and close > relSBoxHi
+// a plain (not held) signal against the open trade
+bool oppLongPlain  = evLong and not heldNow and showPlainSignals
+bool oppShortPlain = evShort and not heldNow and showPlainSignals
+
+bool exitLongCond  = (exitOnReleaseFail and relFailLong) or (exitOnOppositeSignal and oppShortPlain) or (chCandNow and chCandDir == -1 and exitOnOppositeCandidate) or (chReleased and chReleaseDir == -1) or (exitOnChopStart and chStarted) or (exitAtSessionEnd and dayCond)
+bool exitShortCond = (exitOnReleaseFail and relFailShort) or (exitOnOppositeSignal and oppLongPlain) or (chCandNow and chCandDir == 1 and exitOnOppositeCandidate) or (chReleased and chReleaseDir == 1) or (exitOnChopStart and chStarted) or (exitAtSessionEnd and dayCond)
 
 // strongPos: 0 = flat, otherwise +/- entry price (sign = direction)
 var float strongPos = 0.0
@@ -637,6 +655,8 @@ bool tradeClosed = strongPosPrev != 0 and math.sign(strongPos) != math.sign(stro
 int  prevDir = int(math.sign(strongPosPrev))
 int  exitReason = not tradeClosed ? 0
      : strongPos != 0 ? 1
+     : exitOnReleaseFail and ((prevDir > 0 and relFailLong) or (prevDir < 0 and relFailShort)) ? 6
+     : exitOnOppositeSignal and ((prevDir > 0 and oppShortPlain) or (prevDir < 0 and oppLongPlain)) ? 7
      : chCandNow and chCandDir == -prevDir and exitOnOppositeCandidate ? 2
      : chReleased and chReleaseDir == -prevDir ? 3
      : exitOnChopStart and chStarted ? 4
@@ -663,6 +683,7 @@ strongWarned := tradeOpened or tradeClosed ? 0
      : strongWarnedPrev
 bool resolvedEvt = strongPos != 0 and strongWarnedPrev == 1 and chReleased and chReleaseDir == math.sign(strongPos)
 
+float warnPts = strongPos != 0 ? math.sign(strongPos) * (close - math.abs(strongPos)) : 0.0
 int openType = pairDir > 0 ? sigLType : sigSType
 int openCode = pairDir > 0 ? (openType == 2 ? 2 : 1) : (openType == 2 ? 4 : 3)
 
@@ -671,7 +692,7 @@ bool visFbo = kFbo == 1 and ((heldNow and showHeldSignals) or (not heldNow and s
 bool visFbd = kFbd == 1 and ((heldNow and showHeldSignals) or (not heldNow and showPlainSignals))
 bool visBo  = kBo == 1 and ((heldNow and showHeldSignals) or (not heldNow and showPlainSignals))
 bool visBd  = kBd == 1 and ((heldNow and showHeldSignals) or (not heldNow and showPlainSignals))
-bool dbOn = showDailyBiasBubbles
+bool dbOn = showDailyBiasBubbles and not strongSignalsOnly
 
 // top side (price = high): weight 1 each, STRONG weight 2
 bool tFbo = dbOn and visFbo
@@ -701,7 +722,7 @@ bool anyBot = bFbd or bPocX or bBtc or bRsBtc or bBo or bBdBtc
 int topTier = anyTop and anyTop[1] ? barNo % 3 : 0
 int botTier = anyBot and anyBot[1] ? barNo % 3 : 0
 
-int tBase = topTier + (kShortSig == 1 ? 2 : 0)
+int tBase = topTier + (confOn and kShortSig == 1 ? 2 : 0)
 int t1 = tBase
 int t2 = t1 + (tFbo ? 1 : 0)
 int t3 = t2 + (tPocX ? 1 : 0)
@@ -712,7 +733,7 @@ int t7 = t6 + (tBoStc ? 1 : 0)
 int t8 = t7 + (tStrongS ? 2 : 0)
 int t9 = t8 + (tExitL ? 1 : 0)
 int t10 = t9 + (tWarnL ? 1 : 0)
-int bBase = botTier + (kLongSig == 1 ? 2 : 0)
+int bBase = botTier + (confOn and kLongSig == 1 ? 2 : 0)
 int b1 = bBase
 int b2 = b1 + (bFbd ? 1 : 0)
 int b3 = b2 + (bPocX ? 1 : 0)
@@ -727,9 +748,10 @@ int b10 = b9 + (bWarnS ? 1 : 0)
 float topY = high + dbBubbleOffset
 float botY = low - dbBubbleOffset
 
+string warnTxt = showPointsAtChopWarning ? "  " + (warnPts >= 0 ? "+" : "") + str.tostring(math.round(warnPts, 1)) + " if exited here" : ""
 string strongSrc = openCode == 1 ? "FBD-Long" : openCode == 2 ? "BO-Long" : openCode == 3 ? "FBO-Short" : "BD-Short"
-string exitTxtDown = exitReason == 1 ? "flip" : exitReason == 2 ? "chop breaking down" : exitReason == 3 ? "chop broke down" : exitReason == 4 ? "chop window" : "session end"
-string exitTxtUp   = exitReason == 1 ? "flip" : exitReason == 2 ? "chop breaking up" : exitReason == 3 ? "chop broke up" : exitReason == 4 ? "chop window" : "session end"
+string exitTxtDown = exitReason == 1 ? "flip" : exitReason == 6 ? "release failed" : exitReason == 7 ? "opposite signal" : exitReason == 2 ? "chop breaking down" : exitReason == 3 ? "chop broke down" : exitReason == 4 ? "chop window" : "session end"
+string exitTxtUp   = exitReason == 1 ? "flip" : exitReason == 6 ? "release failed" : exitReason == 7 ? "opposite signal" : exitReason == 2 ? "chop breaking up" : exitReason == 3 ? "chop broke up" : exitReason == 4 ? "chop window" : "session end"
 
 // top bubbles
 bub(tFbo, topY + stackStep * t1, heldNow ? "FBO-Short (chop)" : "FBO-Short", heldNow ? color.gray : color.orange, true)
@@ -740,8 +762,8 @@ bub(tBd, topY + stackStep * t5, heldNow ? "BD-Short (chop)" : "BD-Short", heldNo
 bub(tBoStc, topY + stackStep * t6, "BO-STC", #FF8C00, true)
 bub(tStrongS, topY + stackStep * t7, "STRONG SHORT\n(" + strongSrc + " + chop down)", color.fuchsia, true)
 bub(tExitL, topY + stackStep * t8, "EXIT (" + exitTxtDown + ") " + fmt(exitPts), exitPts >= 0 ? color.green : color.red, true)
-bub(tWarnL, topY + stackStep * t9, "CHOP: EXIT?", color.orange, true)
-bub(tResS, topY + stackStep * t10, "chop resolved", #D3D3D3, true)
+bub(tWarnL, topY + stackStep * t9, "CHOP: EXIT?" + warnTxt, color.orange, true)
+bub(tResS and not strongSignalsOnly, topY + stackStep * t10, "chop resolved", #D3D3D3, true)
 // bottom bubbles
 bub(bFbd, botY - stackStep * b1, heldNow ? "FBD-Long (chop)" : "FBD-Long", heldNow ? color.gray : color.aqua, false)
 bub(bPocX, botY - stackStep * b2, "POC-X", color.yellow, false)
@@ -751,26 +773,26 @@ bub(bBo, botY - stackStep * b5, heldNow ? "BO-Long (chop)" : "BO-Long", heldNow 
 bub(bBdBtc, botY - stackStep * b6, "BD-BTC", #FF8C00, false)
 bub(bStrongL, botY - stackStep * b7, "STRONG LONG\n(" + strongSrc + " + chop up)", color.aqua, false)
 bub(bExitS, botY - stackStep * b8, "EXIT (" + exitTxtUp + ") " + fmt(exitPts), exitPts >= 0 ? color.green : color.red, false)
-bub(bWarnS, botY - stackStep * b9, "CHOP: EXIT?", color.orange, false)
-bub(bResL, botY - stackStep * b10, "chop resolved", #D3D3D3, false)
+bub(bWarnS, botY - stackStep * b9, "CHOP: EXIT?" + warnTxt, color.orange, false)
+bub(bResL and not strongSignalsOnly, botY - stackStep * b10, "chop resolved", #D3D3D3, false)
 
 // trailing-stop / continuation / extended-target / confluence bubbles
-bub(longStoppedOut, longTSPrev, "STOPPED OUT", color.aqua, false)
-bub(shortStoppedOut, shortTSPrev, "STOPPED OUT", color.fuchsia, true)
-bub(shortContinuation, high, "SHORT CONTINUATION", color.maroon, true)
-bub(longContinuation, low, "LONG CONTINUATION", #006400, false)
-bub(extendedTargetLongSignal, high, "Target 2 broken -> next: " + (na(target3Long) ? "none valid" : fmt(target3Long)), #90EE90, false)
-bub(extendedTargetShortSignal, low, "Target 2 broken -> next: " + (na(target3Short) ? "none valid" : fmt(target3Short)), #FF8080, true)
-bub(longSignal, low, "D/HOURLY CONFLUENCE LONG (" + str.tostring(countNearLow) + "h)" +
+bub(confOn and longStoppedOut, longTSPrev, "STOPPED OUT", color.aqua, false)
+bub(confOn and shortStoppedOut, shortTSPrev, "STOPPED OUT", color.fuchsia, true)
+bub(confOn and shortContinuation, high, "SHORT CONTINUATION", color.maroon, true)
+bub(confOn and longContinuation, low, "LONG CONTINUATION", #006400, false)
+bub(confOn and extendedTargetLongSignal, high, "Target 2 broken -> next: " + (na(target3Long) ? "none valid" : fmt(target3Long)), #90EE90, false)
+bub(confOn and extendedTargetShortSignal, low, "Target 2 broken -> next: " + (na(target3Short) ? "none valid" : fmt(target3Short)), #FF8080, true)
+bub(confOn and longSignal, low, "D/HOURLY CONFLUENCE LONG (" + str.tostring(countNearLow) + "h)" +
      "\nTarget 1 (immediate POC): " + fmt(dayPOC) +
      "\nTarget 2 (next POC): " + (na(target2Long) ? "none valid" : fmt(target2Long) + " (" + str.tostring(target2LongDaysBack) + "d back)"), color.green, false)
-bub(shortSignal, high, "D/HOURLY CONFLUENCE SHORT (" + str.tostring(countNearHigh) + "h)" +
+bub(confOn and shortSignal, high, "D/HOURLY CONFLUENCE SHORT (" + str.tostring(countNearHigh) + "h)" +
      "\nTarget 1 (immediate POC): " + fmt(dayPOC) +
      "\nTarget 2 (next POC): " + (na(target2Short) ? "none valid" : fmt(target2Short) + " (" + str.tostring(target2ShortDaysBack) + "d back)"), color.red, true)
 
 // ── Plots ───────────────────────────────────────────────
-plot(o(showTrailingStop and inLong ? longTrailingStop : na), "TrailingStopLong", color=color.aqua, linewidth=2, style=plot.style_linebr)
-plot(o(showTrailingStop and inShort ? shortTrailingStop : na), "TrailingStopShort", color=color.fuchsia, linewidth=2, style=plot.style_linebr)
+plot(o(confOn and showTrailingStop and inLong ? longTrailingStop : na), "TrailingStopLong", color=color.aqua, linewidth=2, style=plot.style_linebr)
+plot(o(confOn and showTrailingStop and inShort ? shortTrailingStop : na), "TrailingStopShort", color=color.fuchsia, linewidth=2, style=plot.style_linebr)
 
 pChopHi = plot(o(showChopBox and (chInChop or chInCand) ? boxEdge(chopCode, chopBoxBars, true, false) : na), "ChopBoxHi", color=color.maroon, linewidth=1)
 pChopLo = plot(o(showChopBox and (chInChop or chInCand) ? boxEdge(chopCode, chopBoxBars, false, false) : na), "ChopBoxLo", color=color.maroon, linewidth=1)
@@ -779,18 +801,20 @@ fill(pChopHi, pChopLo, color.new(color.maroon, 75), "ChopBox")
 plotshape(o(bStrongL ? low - stackStep * 0.5 : na), "StrongLongMark", shape.triangleup, location.absolute, color.aqua, size=size.small)
 plotshape(o(tStrongS ? high + stackStep * 0.5 : na), "StrongShortMark", shape.triangledown, location.absolute, color.fuchsia, size=size.small)
 
-pDayLow  = plot(o(lProfileDay), "DayLow", color=color.red, linewidth=2, style=plot.style_stepline)
-pDayHigh = plot(o(hProfileDay), "DayHigh", color=color.red, linewidth=2, style=plot.style_stepline)
+pDayLow  = plot(o(lProfileDay), "DayLowBase", display=display.none)
+pDayHigh = plot(o(hProfileDay), "DayHighBase", display=display.none)
+plot(o(showDayLowHighLines ? lProfileDay : na), "DayLow", color=color.red, linewidth=2, style=plot.style_stepline)
+plot(o(showDayLowHighLines ? hProfileDay : na), "DayHigh", color=color.red, linewidth=2, style=plot.style_stepline)
 plot(o(showPriorDayValueArea ? priorDayVAL : na), "PDayVAL", color=color.orange, linewidth=2, style=plot.style_stepline)
 plot(o(showPriorDayValueArea ? priorDayVAH : na), "PDayVAH", color=color.orange, linewidth=2, style=plot.style_stepline)
 
-pLongZoneTop    = plot(o(showZones ? lProfileDay + tol : na), "LongZoneTop", display=display.none)
-pShortZoneBottom = plot(o(showZones ? hProfileDay - tol : na), "ShortZoneBottom", display=display.none)
+pLongZoneTop    = plot(o(confOn and showZones ? lProfileDay + tol : na), "LongZoneTop", display=display.none)
+pShortZoneBottom = plot(o(confOn and showZones ? hProfileDay - tol : na), "ShortZoneBottom", display=display.none)
 fill(pDayLow, pLongZoneTop, color.new(color.green, 85), "LongZone")
 fill(pShortZoneBottom, pDayHigh, color.new(color.red, 85), "ShortZone")
 
-plotshape(longSignal and isActive, "LongMarker", shape.arrowup, location.belowbar, color.green, size=size.small)
-plotshape(shortSignal and isActive, "ShortMarker", shape.arrowdown, location.abovebar, color.red, size=size.small)
+plotshape(confOn and longSignal and isActive, "LongMarker", shape.arrowup, location.belowbar, color.green, size=size.small)
+plotshape(confOn and shortSignal and isActive, "ShortMarker", shape.arrowdown, location.abovebar, color.red, size=size.small)
 
 // ── Hidden diagnostic plots: readable at ANY historical bar via the crosshair / Data Window ──
 plot(o(countNearLow), "Diag_NearLowCount", display=display.data_window)
@@ -835,9 +859,9 @@ plot(o(t1HourVAL), "Diag_T1HourVAL", display=display.data_window)
 plot(o(t1HourVAH), "Diag_T1HourVAH", display=display.data_window)
 
 // ── Alerts (thinkScript Alert(..., Alert.BAR)): create one alert with "Any alert() function call" ──
-if alertsOn and extendedTargetLongSignal
+if alertsOn and confOn and extendedTargetLongSignal
     alert("Extended Target LONG", alert.freq_once_per_bar)
-if alertsOn and extendedTargetShortSignal
+if alertsOn and confOn and extendedTargetShortSignal
     alert("Extended Target SHORT", alert.freq_once_per_bar)
 if alertsOn and tradeOpened
     alert("STRONG " + (strongPos > 0 ? "LONG" : "SHORT"), alert.freq_once_per_bar)
@@ -845,9 +869,9 @@ if alertsOn and warnEvt
     alert("Chop window: consider exiting the strong trade", alert.freq_once_per_bar)
 if alertsOn and tradeClosed
     alert("Strong trade exit", alert.freq_once_per_bar)
-if alertsOn and longSignal
+if alertsOn and confOn and longSignal
     alert("Hourly Confluence LONG", alert.freq_once_per_bar)
-if alertsOn and shortSignal
+if alertsOn and confOn and shortSignal
     alert("Hourly Confluence SHORT", alert.freq_once_per_bar)
 
 // ── Labels (thinkScript AddLabel) as one table, same order: strong panel, diagnostics, debug ──

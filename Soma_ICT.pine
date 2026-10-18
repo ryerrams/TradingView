@@ -87,7 +87,7 @@ showStatus       = input.bool(true, "Show Action Panel", group=GA, tooltip="A pa
 panelStyle       = input.string("Compact", "Panel Style", options=["Compact", "Full"], group=GA, tooltip="Compact: one short status line plus the nearest liquidity. Hover the status for the full reason.\nFull: one row per check (Bias, EMAs, Killzone, Location), so you can see why the status is what it is.")
 panelPos         = input.string("Top Right", "Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GA)
 panelSize        = input.string("Normal", "Panel Text Size", options=["Tiny", "Small", "Normal", "Large"], group=GA, tooltip="Normal matches the Daily Bias readout and the ATR Stretch label.")
-panelOffset      = input.float(0.0, "Panel Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=GA, tooltip="Push the panel away from the pane edge. Use it to stack panels from several indicators in the same corner without overlap (for example: this panel 0, ATR Stretch 6, Daily Bias readout 10).")
+panelOffset      = input.float(3.0, "Panel Edge Offset (% of pane)", minval=0, maxval=50, step=0.5, group=GA, tooltip="Push the panel away from the pane edge. Use it to stack panels from several indicators in the same corner without overlap (for example: this panel 3, ATR Stretch 6, Daily Bias readout 10).")
 showLiquidityMap = input.bool(true, "Show Nearest Untaken Liquidity", group=GA, tooltip="Show the closest untaken liquidity line above and below price. These are likely targets, and places where a move may stall.")
 readyBars        = input.int(12, "Sweep Stays Fresh (bars)", minval=1, group=GA, tooltip="After a sweep, the 'location' check counts it for this many bars. After that the sweep is old news.")
 
