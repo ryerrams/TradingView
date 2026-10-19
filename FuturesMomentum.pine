@@ -1,0 +1,171 @@
+//@version=6
+indicator("FUTURES Momentum - Follows Momentum Style and Market Cycle", shorttitle="FUT Mom", overlay=false)
+
+// =========================
+// bulusufinances
+// Converted from thinkScript to Pine Script v6
+// =========================
+
+// ----- Colors -----
+upTrendColor   = color.green
+downTrendColor = color.red
+rsBuyBgColor   = color.new(color.rgb(170, 255, 170), 85)   // light green, mostly transparent
+rsSellBgColor  = color.new(color.rgb(255, 180, 180), 85)   // light red, mostly transparent
+
+// ----- Inputs -----
+fifteenMinMomentumInput = input.string("High", "15m Momentum Compare", options = ["High", "Low"], group = "Timeframe")
+proximityPercent        = input.float(10.0, "Proximity %", group = "Timeframe") // unused by original script logic too; kept for parity
+
+rsBenchmark       = input.symbol("SPY", "RS Benchmark", group = "Relative Strength")
+rsLength1         = input.int(21, "RS MA Length 1", group = "Relative Strength")
+rsLength2         = input.int(50, "RS MA Length 2", group = "Relative Strength")
+rsAvgType         = input.string("SMA", "RS MA Type", options = ["SMA", "EMA", "WMA"], group = "Relative Strength")
+
+rsShowDots        = input.bool(false, "Show RS New-High Dots", group = "Relative Strength")
+rsShowCross1      = input.bool(false, "Show RS x MA1 Crosses", group = "Relative Strength")
+rsShowCross2      = input.bool(false, "Show RS x MA2 Crosses", group = "Relative Strength")
+rsShowRatingLabel = input.bool(true,  "Show RS Rating Label", group = "Relative Strength")
+
+rsDotRowPct       = input.float(0.05, "RS Dot Row %", group = "Relative Strength")
+rsDotSize         = input.int(3, "RS Dot Size", group = "Relative Strength")
+
+rsLookbackHighs   = input.int(100, "RS New-High Lookback", group = "Relative Strength")
+rsRatingWindow    = input.int(126, "RS Rating Window", group = "Relative Strength")
+
+// ----- Timeframe Logic (HTF by design) -----
+// timeframe.in_seconds() with no args = current chart timeframe, as a "simple int"
+cTFsec  = timeframe.in_seconds()
+momHigh = fifteenMinMomentumInput == "High"
+
+mTF = cTFsec >= 604800 ? "M" :
+     cTFsec >= 86400  ? "W" :
+     cTFsec >= 3600   ? "D" :
+     cTFsec >= 900    ? (momHigh ? "120" : "60") :
+     cTFsec >= 300    ? "15" :
+     cTFsec >= 60     ? "5"  :
+                         "D"
+
+sTF = cTFsec >= 604800 ? "M" :
+     cTFsec >= 86400  ? "W" :
+     cTFsec >= 3600   ? "D" :
+     cTFsec >= 900    ? (momHigh ? "60" : "30") :
+     cTFsec >= 300    ? "15" :
+     cTFsec >= 60     ? "5"  :
+                         "D"
+
+// =================================================================
+// ==============  MOMENTUM core (compute first)  ==================
+// =================================================================
+// MACD(12,26,9) histogram * 3, evaluated on the target timeframe's own bars.
+// Returns na until 26 bars of history exist on that timeframe (mirrors the
+// original's !IsNaN(close[26]) guard).
+f_momentum(src) =>
+    haveBars = not na(src[26])
+    macdLine = ta.ema(src, 12) - ta.ema(src, 26)
+    signal   = ta.ema(macdLine, 9)
+    mom      = (macdLine - signal) * 3
+    haveBars ? mom : na
+
+momentumMain = request.security(syminfo.tickerid, mTF, f_momentum(close))
+momentumAlt  = request.security(syminfo.tickerid, sTF, f_momentum(close))
+
+// Safe series for pane bounds (when Alt is na, use main)
+safeMomentum = momentumMain
+m15Safe      = na(momentumAlt) ? safeMomentum : momentumAlt
+
+// =================================================================
+// =====================  RS PHASES (background)  ==================
+// =================================================================
+bClose = request.security(rsBenchmark, timeframe.period, close)
+okRS   = bClose != 0
+rs     = okRS ? close / bClose : na
+
+f_rsMA(src, len, maType) =>
+    switch maType
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        =>      ta.sma(src, len)
+
+rsMA1 = f_rsMA(rs, rsLength1, rsAvgType)
+rsMA2 = f_rsMA(rs, rsLength2, rsAvgType)
+
+rsBuy  = rs > rsMA1
+rsSell = not rsBuy
+
+// ---- Pane-aware bounds based on Momentum (NOT price!) ----
+// ThinkScript's HighestAll/LowestAll scan the whole loaded dataset; the
+// closest causal Pine equivalent is a running (expanding) extreme.
+combinedHi = na(safeMomentum) ? m15Safe : na(m15Safe) ? safeMomentum : math.max(safeMomentum, m15Safe)
+combinedLo = na(safeMomentum) ? m15Safe : na(m15Safe) ? safeMomentum : math.min(safeMomentum, m15Safe)
+
+var float paneHi = na
+var float paneLo = na
+if not na(combinedHi)
+    paneHi := na(paneHi) ? combinedHi : math.max(paneHi, combinedHi)
+if not na(combinedLo)
+    paneLo := na(paneLo) ? combinedLo : math.min(paneLo, combinedLo)
+
+paneRg = math.max(0.000001, paneHi - paneLo)
+
+topBand    = paneHi
+bottomBand = paneLo
+
+// ---- RS background (single fill, colored per-bar; replaces the two AddCloud calls) ----
+rsTopPlot = plot(topBand, display = display.none, editable = false)
+rsBotPlot = plot(bottomBand, display = display.none, editable = false)
+fill(rsTopPlot, rsBotPlot, color = rsBuy ? rsBuyBgColor : rsSellBgColor, title = "RS Phase Background")
+
+// =================================================================
+// ===================  MOMENTUM (plot visuals)  ===================
+// =================================================================
+// The original's switch/case state machine always resolves to "is momentum
+// falling right now", regardless of the prior state — collapsing to a
+// direct slope check.
+trendColor = safeMomentum < safeMomentum[1] ? downTrendColor : upTrendColor
+plot(safeMomentum, title = "Momentum", color = trendColor, style = plot.style_line, linewidth = 3)
+
+// ----- 15m Alternate Momentum (only drawn on 15m AND enough bars) -----
+show15Alt   = cTFsec == 900 and not na(momentumAlt)
+trendColor2 = momentumAlt < momentumAlt[1] ? downTrendColor : upTrendColor
+plot(show15Alt ? momentumAlt : na, title = "Momentum15Alt", color = trendColor2, style = plot.style_line, linewidth = 3)
+
+// ----- Zero Line -----
+plot(not na(momentumMain) ? 0.0 : na, title = "Zero", color = color.white, style = plot.style_line, linewidth = 1)
+
+// =================================================================
+// ======================  RS EXTRAS / SCANS  ======================
+// =================================================================
+rsNewHigh    = rs > ta.highest(rs[1], rsLookbackHighs)
+priceNewHigh = close > ta.highest(close[1], rsLookbackHighs)
+rsDotY       = bottomBand + paneRg * rsDotRowPct
+
+plot(rsShowDots and rsNewHigh ? rsDotY : na, title = "RS New High", style = plot.style_circles, color = color.green, linewidth = rsDotSize)
+plot(rsShowDots and rsNewHigh and not priceNewHigh ? rsDotY : na, title = "RS NH, Price Not", style = plot.style_circles, color = color.rgb(255, 192, 203), linewidth = rsDotSize)
+
+crossUp1   = ta.crossover(rs, rsMA1)
+crossDown1 = ta.crossunder(rs, rsMA1)
+crossUp2   = ta.crossover(rs, rsMA2)
+crossDown2 = ta.crossunder(rs, rsMA2)
+
+plotshape(rsShowCross1 and crossUp1   ? safeMomentum + paneRg * 0.02 : na, title = "RS x MA1 Up",   style = shape.arrowup,   location = location.absolute, color = color.green, size = size.tiny)
+plotshape(rsShowCross1 and crossDown1 ? safeMomentum - paneRg * 0.02 : na, title = "RS x MA1 Down", style = shape.arrowdown, location = location.absolute, color = color.red,   size = size.tiny)
+plotshape(rsShowCross2 and crossUp2   ? safeMomentum + paneRg * 0.02 : na, title = "RS x MA2 Up",   style = shape.arrowup,   location = location.absolute, color = color.new(color.green, 40), size = size.tiny)
+plotshape(rsShowCross2 and crossDown2 ? safeMomentum - paneRg * 0.02 : na, title = "RS x MA2 Down", style = shape.arrowdown, location = location.absolute, color = color.new(color.red, 40),   size = size.tiny)
+
+// ---- RS Rating (1-99) label ----
+rLo   = ta.lowest(rs, rsRatingWindow)
+rHi   = ta.highest(rs, rsRatingWindow)
+rSpan = rHi != rLo ? rHi - rLo : 1.0
+rPct  = 100 * (rs - rLo) / rSpan
+rs199 = math.round(math.max(1, math.min(99, rPct)))
+
+var table ratingTable = table.new(position.top_right, 1, 1)
+if barstate.islast and rsShowRatingLabel
+    ratingColor = rs199 >= 80 ? color.green : rs199 >= 50 ? color.yellow : color.red
+    table.cell(ratingTable, 0, 0, "RS " + str.tostring(int(rs199)), text_color = color.white, bgcolor = ratingColor)
+
+// ---- RS Scans (hidden; usable via Pine Screener) ----
+plot(rsNewHigh ? 1 : 0, title = "RS_NewHigh_Scan", display = display.none)
+plot(rsNewHigh and not priceNewHigh ? 1 : 0, title = "RS_NHBP_Scan", display = display.none)
+plot(rsBuy ? 1 : 0, title = "RS_AboveMA1_Scan", display = display.none)
+plot(rs199 >= 80 ? 1 : 0, title = "RS_Rating_Scan", display = display.none)
