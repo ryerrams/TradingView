@@ -34,7 +34,7 @@ indicator("Liquidity Sweep Reversion", shorttitle = "LSR", overlay = true, max_l
 //  - The thinkScript "R" bubble looks ahead with a fold. Pine cannot read future bars,
 //    so the R label is drawn gray on the raid bar and recolored (or deleted) on the
 //    bar where the sweep resolves. Same end result on history.
-//  - AddLabel rows are drawn in a table (top right).
+//  - AddLabel rows are drawn in a table (default bottom right; see "Panel position").
 //  - Alerts: use "Any alert() function call", or pick one of the alertcondition()s.
 // Needs extended-hours bars ON for ONH/ONL. Times are ET.
 // ============================================================================
@@ -99,6 +99,7 @@ showTradeLines = input.bool(true,  "Trade lines + exit R", group = G_VIS)
 showEMA        = input.bool(false, "Show EMA", group = G_VIS)
 showStats      = input.bool(false, "Backtest stats (A+ / B)", group = G_VIS)
 showLastSweep  = input.bool(true,  "Last sweep label", group = G_VIS)
+panelPos       = input.string("Bottom Right", "Panel position", options = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_VIS, tooltip = "Bottom Right keeps clear of Daily Bias Chop Gate (top left), Soma ICT / ATR Stretch (top right) and Soma Trendrun (bottom left)")
 alertsOn       = input.bool(true,  "Entry alerts", group = G_VIS)
 alertOnRaid    = input.bool(false, "Raid alerts", group = G_VIS)
 
@@ -665,7 +666,14 @@ lsStat := shS or shL ? (not inWin ? 2 : not flatNow ? 5 : 0) :
 bit(int v, int b) => math.floor(v / b) % 2 == 1
 
 // ---------------------------------------------------------------- labels (table)
-var table panel = table.new(position.top_right, 1, 8, border_width = 1)
+tblPos = switch panelPos
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+var table panel = table.new(tblPos, 1, 8, border_width = 1)
 cell(int row, bool show, string txt, color c) =>
     if show
         table.cell(panel, 0, row, txt, bgcolor = c, text_color = color.white, text_size = size.small, text_halign = text.align_left)
