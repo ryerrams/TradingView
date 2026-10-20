@@ -1,0 +1,722 @@
+//@version=6
+indicator("Liquidity Sweep Reversion", shorttitle = "LSR", overlay = true, max_labels_count = 500, max_bars_back = 500)
+
+// ============================================================================
+// LIQUIDITY SWEEP REVERSION  -  /NQ, /MNQ  (intraday: 1m / 2m / 5m)
+// Pine v6 port of the thinkScript study (same inputs, defaults and state machines).
+// ----------------------------------------------------------------------------
+// Trades ONLY a confirmed sweep of resting liquidity, faded back to EMA(28).
+//
+// A trade needs all 4 steps, in order:
+//  1. LIQUIDITY POOL  - an untaken level where stops rest:
+//       PDH/PDL  prior RTH high/low (skipped if overnight already took it)
+//       ONH/ONL  overnight (Globex) high/low
+//       AsH/AsL  Asia 20:00-24:00 ET,  LnH/LnL London 02:00-05:00 ET
+//       SWH/SWL  last 2 untaken swing highs/lows (pivot swingLeft / swingRight)
+//  2. RAID      - price trades at least minPenTicks beyond the level, but not
+//                 more than maxPenATR beyond it (further than that = real breakout)
+//  3. RECLAIM   - a candle CLOSES back inside the level within reclaimBars
+//  4. CONFIRM   - structure shift within confirmBars of the raid:
+//       MSS         close beyond the low/high of the leg that made the raid
+//       SweepCandle close beyond the sweep candle's opposite extreme (faster)
+//     The confirming candle must also have a body >= minBodyATR in the trade direction.
+//
+// Every confirmed sweep is graded:
+//   A+  sweep extreme >= minExtATR from EMA28 (measured on extTF, default 5m)
+//       -> target EMA28, needs reward:risk >= minRR
+//   B   everything else -> fixed target of targetR x risk (signalMode = AllSweeps only)
+// Then the HOLD: the next holdBars bars must not close back beyond the swept level or
+// make a new sweep extreme; entry is at the close of the last hold bar.
+//
+// Port notes (differences forced by Pine):
+//  - extTF EMA/ATR come from request.security on the PRIOR completed extTF bar
+//    (lookahead_on + [1]), so nothing repaints.
+//  - The thinkScript "R" bubble looks ahead with a fold. Pine cannot read future bars,
+//    so the R label is drawn gray on the raid bar and recolored (or deleted) on the
+//    bar where the sweep resolves. Same end result on history.
+//  - AddLabel rows are drawn in a table (top right).
+//  - Alerts: use "Any alert() function call", or pick one of the alertcondition()s.
+// Needs extended-hours bars ON for ONH/ONL. Times are ET.
+// ============================================================================
+
+TZ  = "America/New_York"
+BIG = 10000000.0
+
+// ---------------------------------------------------------------- inputs
+G_SES = "Sessions / window (ET, HHMM)"
+rthStart        = input.int(930,  "RTH start", group = G_SES)
+rthEnd          = input.int(1600, "RTH end", group = G_SES)
+entryHours      = input.string("AllHours", "Entry hours", options = ["AllHours", "RTHWindow"], group = G_SES, tooltip = "AllHours: trade around the clock except the 16:45-18:05 ET halt")
+tradeStart      = input.int(940,  "RTHWindow: entry start", group = G_SES)
+tradeEnd        = input.int(1530, "RTHWindow: entry end", group = G_SES)
+flatTime        = input.int(1555, "RTHWindow: flat time", group = G_SES, tooltip = "Open trades closed here (AllHours: closed at 16:50 ET)")
+
+G_LVL = "Liquidity pools"
+useSessionLevels = input.bool(true, "PDH/PDL + ONH/ONL", group = G_LVL)
+useAsiaLondon    = input.bool(true, "Asia + London highs/lows", group = G_LVL)
+useSwingLevels   = input.bool(true, "Untaken swing highs/lows", group = G_LVL)
+swingLeft        = input.int(10, "Swing left", minval = 1, group = G_LVL)
+swingRight       = input.int(3,  "Swing right", minval = 1, group = G_LVL)
+
+G_SW = "Sweep"
+minPenTicks  = input.int(1, "Min penetration (ticks)", group = G_SW)
+maxPenATR    = input.float(2.0, "Max penetration (ATR)", group = G_SW, tooltip = "Further than this beyond the swept level = breakout (ATR of extTF)")
+reclaimBars  = input.int(3, "Reclaim bars (extTF)", group = G_SW)
+confirmMode  = input.string("MSS", "Confirm mode", options = ["MSS", "SweepCandle"], group = G_SW)
+mssLength    = input.int(3, "MSS leg length", minval = 1, group = G_SW)
+confirmBars  = input.int(10, "Confirm bars (extTF)", group = G_SW)
+maxSetupBars = input.int(30, "Max setup bars (extTF)", group = G_SW)
+minBodyATR   = input.float(0.2, "Min confirm body (ATR, 0 = off)", group = G_SW)
+
+G_TR = "Grade / trade"
+emaLength       = input.int(28, "EMA length", group = G_TR)
+atrLength       = input.int(14, "ATR length", group = G_TR)
+atrType         = input.string("Wilders", "ATR average type", options = ["Wilders", "Simple", "Exponential", "Weighted", "Hull"], group = G_TR)
+minExtATR       = input.float(3.0, "A+ min extension (ATR)", group = G_TR)
+extTF           = input.timeframe("5", "Extension timeframe (extTF)", group = G_TR, tooltip = "Must be >= the chart timeframe")
+minRR           = input.float(1.5, "A+ min reward:risk", group = G_TR)
+maxRiskATR      = input.float(3.0, "Max stop (ATR)", group = G_TR)
+stopBufferTicks = input.int(4, "Stop buffer (ticks)", group = G_TR)
+targetMode      = input.string("LiveEMA", "Target mode", options = ["LiveEMA", "FixedAtEntry"], group = G_TR)
+targetEMA       = input.string("ExtTF_EMA", "Target EMA", options = ["ExtTF_EMA", "ChartEMA"], group = G_TR)
+signalMode      = input.string("ExtendedOnly", "Signal mode", options = ["ExtendedOnly", "AllSweeps"], group = G_TR, tooltip = "ExtendedOnly = trade A+ only")
+targetR         = input.float(2.0, "B-grade target (R)", group = G_TR)
+holdBars        = input.int(1, "Hold bars (0 = enter on confirm)", minval = 0, group = G_TR)
+moveToBE        = input.bool(false, "Stop to breakeven at 1R", group = G_TR)
+maxTradesPerDay = input.int(6, "Max trades per day", group = G_TR)
+
+G_VIS = "Display"
+markFilter     = input.string("APlusOnly", "Mark confirmed sweeps", options = ["APlusOnly", "InWindow", "All"], group = G_VIS)
+showLevels     = input.bool(false, "Show PD / ON / Asia / London levels", group = G_VIS)
+showRaids      = input.bool(false, "Wedge on every raid bar", group = G_VIS)
+showDeveloping = input.bool(true,  "R tag on raid bars", group = G_VIS, tooltip = "Gray while developing, recolors once it resolves")
+showDevZone    = input.bool(false, "Developing sweep zone", group = G_VIS)
+showSwingLines = input.bool(false, "Swing level lines", group = G_VIS)
+devLookahead   = input.int(150, "R tag max bars to resolve", group = G_VIS)
+showConfirms   = input.bool(true,  "Arrow + S on every confirm", group = G_VIS)
+showFiltered   = input.bool(false, "Gray arrow + reason on skips", group = G_VIS)
+showTradeLines = input.bool(true,  "Trade lines + exit R", group = G_VIS)
+showEMA        = input.bool(false, "Show EMA", group = G_VIS)
+showStats      = input.bool(false, "Backtest stats (A+ / B)", group = G_VIS)
+showLastSweep  = input.bool(true,  "Last sweep label", group = G_VIS)
+alertsOn       = input.bool(true,  "Entry alerts", group = G_VIS)
+alertOnRaid    = input.bool(false, "Raid alerts", group = G_VIS)
+
+// ---------------------------------------------------------------- colors
+cShort   = color.rgb(235, 50, 35)
+cLong    = color.rgb(60, 200, 80)
+cPD      = color.rgb(100, 150, 255)
+cON      = color.rgb(200, 120, 255)
+cAsia    = color.rgb(230, 200, 50)
+cLondon  = color.rgb(80, 200, 220)
+cSwing   = color.rgb(150, 150, 150)
+cRaid    = color.rgb(120, 120, 120)
+cEntry   = color.rgb(230, 230, 230)
+cStop    = color.rgb(235, 50, 35)
+cTarget  = color.rgb(230, 200, 50)
+cEMA     = color.rgb(200, 160, 60)
+cNeutral = color.rgb(140, 140, 140)
+cShortB  = color.rgb(255, 150, 60)
+cLongB   = color.rgb(60, 200, 200)
+
+// ---------------------------------------------------------------- helpers
+maType(src, len) =>
+    switch atrType
+        "Simple"      => ta.sma(src, len)
+        "Exponential" => ta.ema(src, len)
+        "Weighted"    => ta.wma(src, len)
+        "Hull"        => ta.hma(src, len)
+        => ta.rma(src, len)
+
+prevB(bool b) => bar_index == 0 ? b : b[1]
+
+tod = hour(time, TZ) * 100 + minute(time, TZ)
+fromT(int t) => tod >= t
+tillT(int t) => tod < t
+
+// ---------------------------------------------------------------- core series
+tick = syminfo.mintick
+pen  = minPenTicks * tick
+emaR = ta.ema(close, emaLength)
+ema  = na(emaR) ? close : emaR
+emaP = na(ema[1]) ? ema : ema[1]
+atrR = maType(ta.tr(true), atrLength)
+atr  = na(atrR) or atrR <= 0 ? math.max(high - low, tick) : atrR
+
+// extension reference: prior completed extTF bar (no look-ahead); chart values if extTF = chart TF
+chartSec = timeframe.in_seconds()
+extSec   = timeframe.in_seconds(extTF)
+useX     = extSec > chartSec
+[xEmaR, xAtrR] = request.security(syminfo.tickerid, extTF, [ta.ema(close, emaLength)[1], maType(ta.tr(true), atrLength)[1]], lookahead = barmerge.lookahead_on)
+eEma  = not useX ? ema : na(xEmaR) ? ema : xEmaR
+eAtr  = not useX ? atr : na(xAtrR) or xAtrR <= 0 ? atr : xAtrR
+eEmaP = na(eEma[1]) ? eEma : eEma[1]
+// bar-count windows are in extTF bars: on a 1m chart with extTF = 5m, 3 bars = 15 one-minute bars
+tfMult   = useX ? math.max(1, math.round(extSec / chartSec)) : 1
+reclaimN = reclaimBars * tfMult
+confirmN = confirmBars * tfMult
+setupN   = maxSetupBars * tfMult
+upD = (high - eEma) / eAtr
+dnD = (low  - eEma) / eAtr
+
+// ---------------------------------------------------------------- sessions
+rth     = fromT(rthStart) and tillT(rthEnd)
+rthP    = prevB(rth)
+rthOpen = rth and not rthP
+onOpen  = not rth and rthP
+allH    = entryHours == "AllHours"
+inWin   = allH ? not (fromT(1645) and tillT(1805)) : fromT(tradeStart) and tillT(tradeEnd)
+inHold  = allH ? not (fromT(1650) and tillT(1800)) : fromT(rthStart) and tillT(flatTime)
+inHoldP = prevB(inHold)
+dayReset = allH ? inHold and not inHoldP : rthOpen   // new trading day: 18:00 ET (AllHours) or RTH open
+
+// levels only count once a full session has been seen on the chart
+var bool  rthSeen = false
+var bool  onSeen  = false
+var float rthHi = high
+var float rthLo = low
+var float pdh   = BIG
+var float pdl   = -BIG
+var float onHiR = high
+var float onLoR = low
+if bar_index > 0
+    rthSeenP = rthSeen
+    rthHiP   = rthHi
+    rthLoP   = rthLo
+    rthSeen := rthSeen or rthOpen
+    onSeen  := onSeen or onOpen
+    rthHi := rthOpen ? high : rth ? math.max(rthHi, high) : rthHi
+    rthLo := rthOpen ? low  : rth ? math.min(rthLo, low)  : rthLo
+    if rthOpen
+        pdh := rthSeenP ? rthHiP : BIG
+        pdl := rthSeenP ? rthLoP : -BIG
+    onHiR := onOpen ? high : not rth ? math.max(onHiR, high) : onHiR
+    onLoR := onOpen ? low  : not rth ? math.min(onLoR, low)  : onLoR
+onH = onSeen ? onHiR : BIG
+onL = onSeen ? onLoR : -BIG
+
+// ---------------------------------------------------------------- session pools (active = untaken)
+// PDH/PDL start the day active only if the overnight session did not already take them
+var bool pdhA = false
+var bool pdlA = false
+var bool onhA = false
+var bool onlA = false
+pdhArm = rthOpen ? onH < pdh + pen : pdhA
+pdlArm = rthOpen ? onL > pdl - pen : pdlA
+onhArm = rthOpen ? true : onhA
+onlArm = rthOpen ? true : onlA
+rPDH = useSessionLevels and rth and pdhArm and high >= pdh + pen
+rPDL = useSessionLevels and rth and pdlArm and low  <= pdl - pen
+rONH = useSessionLevels and rth and onhArm and high >= onH + pen
+rONL = useSessionLevels and rth and onlArm and low  <= onL - pen
+if bar_index > 0
+    pdhA := rth and pdhArm and high < pdh + pen
+    pdlA := rth and pdlArm and low  > pdl - pen
+    onhA := rth and onhArm and high < onH + pen
+    onlA := rth and onlArm and low  > onL - pen
+
+// ---------------------------------------------------------------- Asia / London pools
+// level = that session's high/low, live from the session's end until price trades through it
+inAsia  = fromT(2000)
+inLdn   = fromT(200) and tillT(500)
+inAsiaP = prevB(inAsia)
+inLdnP  = prevB(inLdn)
+asBeg   = inAsia and not inAsiaP
+ldBeg   = inLdn  and not inLdnP
+asEnd   = not inAsia and inAsiaP
+ldEnd   = not inLdn  and inLdnP
+var bool  asSeen = false
+var bool  ldSeen = false
+var float asRunH = high
+var float asRunL = low
+var float ldRunH = high
+var float ldRunL = low
+var float asH = BIG
+var float asL = -BIG
+var float lnH = BIG
+var float lnL = -BIG
+if bar_index > 0
+    if asEnd
+        asH := asSeen ? asRunH : BIG
+        asL := asSeen ? asRunL : -BIG
+    if ldEnd
+        lnH := ldSeen ? ldRunH : BIG
+        lnL := ldSeen ? ldRunL : -BIG
+    asSeen := asSeen or asBeg
+    ldSeen := ldSeen or ldBeg
+    asRunH := asBeg ? high : inAsia ? math.max(asRunH, high) : asRunH
+    asRunL := asBeg ? low  : inAsia ? math.min(asRunL, low)  : asRunL
+    ldRunH := ldBeg ? high : inLdn  ? math.max(ldRunH, high) : ldRunH
+    ldRunL := ldBeg ? low  : inLdn  ? math.min(ldRunL, low)  : ldRunL
+
+var bool ashA = false
+var bool aslA = false
+var bool lnhA = false
+var bool lnlA = false
+ashArm = asEnd ? true : ashA
+aslArm = asEnd ? true : aslA
+lnhArm = ldEnd ? true : lnhA
+lnlArm = ldEnd ? true : lnlA
+rASH = useAsiaLondon and ashArm and high >= asH + pen
+rASL = useAsiaLondon and aslArm and low  <= asL - pen
+rLNH = useAsiaLondon and lnhArm and high >= lnH + pen
+rLNL = useAsiaLondon and lnlArm and low  <= lnL - pen
+if bar_index > 0
+    ashA := ashArm and high < asH + pen
+    aslA := aslArm and low  > asL - pen
+    lnhA := lnhArm and high < lnH + pen
+    lnlA := lnlArm and low  > lnL - pen
+
+// ---------------------------------------------------------------- swing pools (2 slots per side)
+hiR  = ta.highest(high, swingRight)
+hiL  = ta.highest(high[swingRight + 1], swingLeft)
+loR  = ta.lowest(low, swingRight)
+loL  = ta.lowest(low[swingRight + 1], swingLeft)
+isPH = high[swingRight] > hiR and high[swingRight] >= hiL
+isPL = low[swingRight]  < loR and low[swingRight]  <= loL
+
+var float ph1  = BIG
+var bool  ph1A = false
+var float ph2  = BIG
+var bool  ph2A = false
+var float pl1  = -BIG
+var bool  pl1A = false
+var float pl2  = -BIG
+var bool  pl2A = false
+ph1AP = ph1A
+ph2AP = ph2A
+pl1AP = pl1A
+pl2AP = pl2A
+ph1P  = ph1
+pl1P  = pl1
+ph1Arm = isPH ? true : ph1AP
+ph2Arm = isPH ? (ph1AP ? true : ph2AP) : ph2AP
+pl1Arm = isPL ? true : pl1AP
+pl2Arm = isPL ? (pl1AP ? true : pl2AP) : pl2AP
+if bar_index > 0
+    ph1 := isPH ? high[swingRight] : ph1
+    ph2 := isPH ? (ph1AP ? ph1P : ph2) : ph2
+    ph1A := ph1Arm and high < ph1 + pen
+    ph2A := ph2Arm and high < ph2 + pen
+    pl1 := isPL ? low[swingRight] : pl1
+    pl2 := isPL ? (pl1AP ? pl1P : pl2) : pl2
+    pl1A := pl1Arm and low > pl1 - pen
+    pl2A := pl2Arm and low > pl2 - pen
+rSH1 = useSwingLevels and ph1Arm and high >= ph1 + pen
+rSH2 = useSwingLevels and ph2Arm and high >= ph2 + pen
+rSL1 = useSwingLevels and pl1Arm and low  <= pl1 - pen
+rSL2 = useSwingLevels and pl2Arm and low  <= pl2 - pen
+
+// ---------------------------------------------------------------- raids this bar
+raidUp = rPDH or rONH or rSH1 or rSH2 or rASH or rLNH
+upOut  = math.max(rPDH ? pdh : 0, rONH ? onH : 0, rSH1 ? ph1 : 0, rSH2 ? ph2 : 0, rASH ? asH : 0, rLNH ? lnH : 0)
+upIn   = math.min(rPDH ? pdh : BIG, rONH ? onH : BIG, rSH1 ? ph1 : BIG, rSH2 ? ph2 : BIG, rASH ? asH : BIG, rLNH ? lnH : BIG)
+upType = (rPDH ? 1 : 0) + (rONH ? 2 : 0) + (rSH1 ? 4 : 0) + (rSH2 ? 8 : 0) + (rASH ? 16 : 0) + (rLNH ? 32 : 0)
+
+raidDn = rPDL or rONL or rSL1 or rSL2 or rASL or rLNL
+dnOut  = math.min(rPDL ? pdl : BIG, rONL ? onL : BIG, rSL1 ? pl1 : BIG, rSL2 ? pl2 : BIG, rASL ? asL : BIG, rLNL ? lnL : BIG)
+dnIn   = math.max(rPDL ? pdl : 0, rONL ? onL : 0, rSL1 ? pl1 : 0, rSL2 ? pl2 : 0, rASL ? asL : 0, rLNL ? lnL : 0)
+dnType = (rPDL ? 1 : 0) + (rONL ? 2 : 0) + (rSL1 ? 4 : 0) + (rSL2 ? 8 : 0) + (rASL ? 16 : 0) + (rLNL ? 32 : 0)
+
+legLoR = ta.lowest(low[1], mssLength)
+legHiR = ta.highest(high[1], mssLength)
+legLo  = na(legLoR) ? low  : legLoR
+legHi  = na(legHiR) ? high : legHiR
+isMSS  = confirmMode == "MSS"
+
+// ---------------------------------------------------------------- SHORT setup (sweep of highs)
+// state: 0 idle, 1 raided (needs close back below), 2 reclaimed (needs MSS), 3 confirmed this bar
+var int   sState = 0
+var float sExt   = na
+var float sOut   = 0.0
+var float sIn    = 0.0
+var float sMss   = 0.0
+var int   sBars  = 0
+var int   sAge   = 0
+var float sDist  = 0.0
+var int   sType  = 0
+sPrev   = sState
+sLive   = sPrev == 1 or sPrev == 2
+sExtP   = na(sExt) ? high : sExt
+sNewExt = not raidUp and sLive and high > sExtP
+sExt   := raidUp ? high : sLive ? math.max(sExtP, high) : sExtP
+sOut   := raidUp ? upOut : sOut     // outermost level taken
+sIn    := raidUp ? upIn  : sIn      // must close back below this
+sMss   := raidUp or sNewExt ? (isMSS ? legLo : low) : sMss
+sRearm  = not raidUp and sPrev == 2 and close > sIn   // closed back above after reclaiming: deeper push, keep watching
+sBars  := raidUp or sRearm or sNewExt ? 0 : sLive ? sBars + 1 : sBars
+sAge   := raidUp ? 0 : sLive ? sAge + 1 : sAge
+sDist  := raidUp ? upD : sLive ? math.max(sDist, upD) : sDist
+sType  := raidUp ? upType : sType
+sPenOK  = sExt - sOut <= maxPenATR * eAtr
+sTrig   = close < math.min(sMss, sIn) and open - close >= minBodyATR * eAtr
+sState := raidUp ? (not sPenOK ? 0 : close < sIn ? (sTrig ? 3 : 2) : 1) :
+     sPrev == 1 ? (not sPenOK or sAge > setupN ? 0 : close < sIn ? (sTrig ? 3 : 2) : sBars >= reclaimN ? 0 : 1) :
+     sPrev == 2 ? (not sPenOK or sAge > setupN ? 0 : close > sIn ? 1 : sTrig ? 3 : sBars >= confirmN ? 0 : 2) : 0
+
+// ---------------------------------------------------------------- LONG setup (sweep of lows)
+var int   lState = 0
+var float lExt   = na
+var float lOut   = 0.0
+var float lIn    = 0.0
+var float lMss   = 0.0
+var int   lBars  = 0
+var int   lAge   = 0
+var float lDist  = 0.0
+var int   lType  = 0
+lPrev   = lState
+lLive   = lPrev == 1 or lPrev == 2
+lExtP   = na(lExt) ? low : lExt
+lNewExt = not raidDn and lLive and low < lExtP
+lExt   := raidDn ? low : lLive ? math.min(lExtP, low) : lExtP
+lOut   := raidDn ? dnOut : lOut
+lIn    := raidDn ? dnIn  : lIn
+lMss   := raidDn or lNewExt ? (isMSS ? legHi : high) : lMss
+lRearm  = not raidDn and lPrev == 2 and close < lIn   // closed back below after reclaiming: deeper push, keep watching
+lBars  := raidDn or lRearm or lNewExt ? 0 : lLive ? lBars + 1 : lBars
+lAge   := raidDn ? 0 : lLive ? lAge + 1 : lAge
+lDist  := raidDn ? dnD : lLive ? math.min(lDist, dnD) : lDist
+lType  := raidDn ? dnType : lType
+lPenOK  = lOut - lExt <= maxPenATR * eAtr
+lTrig   = close > math.max(lMss, lIn) and close - open >= minBodyATR * eAtr
+lState := raidDn ? (not lPenOK ? 0 : close > lIn ? (lTrig ? 3 : 2) : 1) :
+     lPrev == 1 ? (not lPenOK or lAge > setupN ? 0 : close > lIn ? (lTrig ? 3 : 2) : lBars >= reclaimN ? 0 : 1) :
+     lPrev == 2 ? (not lPenOK or lAge > setupN ? 0 : close < lIn ? 1 : lTrig ? 3 : lBars >= confirmN ? 0 : 2) : 0
+
+// ================================================================ SIGNAL
+candS  = sState == 3
+candL  = lState == 3
+cSExt  = sExt
+cSDist = sDist
+cSLvl  = sIn
+cLExt  = lExt
+cLDist = lDist
+cLLvl  = lIn
+cfAS   = candS and cSDist >= minExtATR
+cfAL   = candL and cLDist <= -minExtATR
+// which confirmations are drawn (markFilter); trades are always drawn
+shS = candS and (markFilter == "All" or (markFilter == "APlusOnly" and cfAS) or (markFilter == "InWindow" and inWin))
+shL = candL and (markFilter == "All" or (markFilter == "APlusOnly" and cfAL) or (markFilter == "InWindow" and inWin))
+
+// ================================================================ HOLD + TRADE ENGINE
+// pending: a confirmed sweep waiting out holdBars. Cancelled by a close back beyond the
+// swept level or a new extreme beyond the sweep. Entry at the close of the last hold bar.
+var int   tDir    = 0
+var float tEntry  = na
+var float tStop   = na
+var float tRisk   = na
+var float tTgtFix = na
+var int   tTier   = 0
+var int   tCount  = 0
+var int   pDir    = 0
+var int   pBars   = 0
+var float pExt    = na
+var float pDist   = 0.0
+var float pLvl    = na
+var int   pTag    = 0
+
+tDirP = tDir
+tEntP = na(tEntry) ? close : tEntry
+tStpP = na(tStop) ? close : tStop
+tRskP = na(tRisk) or tRisk <= 0 ? atr : tRisk
+tTgtP = na(tTgtFix) ? ema : tTgtFix
+tTieP = tTier
+tCntP = tCount
+pDirP = pDir
+pBarP = pBars
+pExtP = na(pExt) ? close : pExt
+pDisP = pDist
+pLvlP = na(pLvl) ? close : pLvl
+pTagP = pTag
+
+// ---- exits of an open trade
+useXEma  = targetEMA == "ExtTF_EMA"
+liveTgt  = targetMode == "LiveEMA"
+emaRefP  = useXEma ? eEmaP : emaP
+tgtPx    = tTieP == 1 and liveTgt ? emaRefP : tTgtP
+stopHitS = tDirP == -1 and high >= tStpP
+stopHitL = tDirP ==  1 and low  <= tStpP
+tgtHitS  = tDirP == -1 and low  <= tgtPx
+tgtHitL  = tDirP ==  1 and high >= tgtPx
+timeOut  = tDirP != 0 and not inHold
+exitNow  = stopHitS or stopHitL or tgtHitS or tgtHitL or timeOut
+exitPx   = stopHitS ? math.max(open, tStpP) : stopHitL ? math.min(open, tStpP) :
+     tgtHitS ? math.min(open, tgtPx) : tgtHitL ? math.max(open, tgtPx) : close
+exitR    = exitNow ? (tDirP == 1 ? exitPx - tEntP : tEntP - exitPx) / tRskP : 0.0
+flatNow  = tDirP == 0 or exitNow
+
+// ---- pending setups
+dayCount  = dayReset ? 0 : tCntP
+startS    = candS and not candL and pDirP == 0 and flatNow and inWin
+startL    = candL and not candS and pDirP == 0 and flatNow and inWin
+pendS     = pDirP == -1
+pendL     = pDirP ==  1
+holdFailS = pendS and (high > pExtP or close > pLvlP)
+holdFailL = pendL and (low < pExtP or close < pLvlP)
+barsNow   = startS or startL ? 0 : pendS or pendL ? pBarP + 1 : 0
+readyS    = (startS and holdBars == 0) or (pendS and not holdFailS and barsNow >= holdBars)
+readyL    = (startL and holdBars == 0) or (pendL and not holdFailL and barsNow >= holdBars)
+
+// values for the setup being evaluated now
+eExtS  = startS ? cSExt  : pExtP
+eDistS = startS ? cSDist : pDisP
+eExtL  = startL ? cLExt  : pExtP
+eDistL = startL ? cLDist : pDisP
+
+// ---- grading + filters at the entry bar
+emaRef  = useXEma ? eEma : ema
+sStopPx = eExtS + stopBufferTicks * tick
+sRisk   = sStopPx - close
+sAplus  = eDistS >= minExtATR
+sRRema  = sRisk > 0 ? (close - emaRef) / sRisk : 0.0
+sTgt    = sAplus ? emaRef : close - targetR * sRisk
+sWhy    = sRisk <= 0 or sRisk > maxRiskATR * eAtr ? 3 :
+     not sAplus and signalMode == "ExtendedOnly" ? 1 :
+     sAplus and sRRema < minRR ? 2 :
+     not inWin or dayCount >= maxTradesPerDay ? 4 : 0
+lStopPx = eExtL - stopBufferTicks * tick
+lRisk   = close - lStopPx
+lAplus  = eDistL <= -minExtATR
+lRRema  = lRisk > 0 ? (emaRef - close) / lRisk : 0.0
+lTgt    = lAplus ? emaRef : close + targetR * lRisk
+lWhy    = lRisk <= 0 or lRisk > maxRiskATR * eAtr ? 3 :
+     not lAplus and signalMode == "ExtendedOnly" ? 1 :
+     lAplus and lRRema < minRR ? 2 :
+     not inWin or dayCount >= maxTradesPerDay ? 4 : 0
+newS = readyS and sWhy == 0
+newL = readyL and lWhy == 0
+
+pDir  := readyS or readyL or holdFailS or holdFailL ? 0 : startS ? -1 : startL ? 1 : pDirP
+pBars := barsNow
+pExt  := startS ? cSExt  : startL ? cLExt  : pExtP
+pDist := startS ? cSDist : startL ? cLDist : pDisP
+pLvl  := startS ? cSLvl  : startL ? cLLvl  : pLvlP
+pTag  := startS ? sType  : startL ? lType  : pTagP
+
+tDir    := newS ? -1 : newL ? 1 : exitNow ? 0 : tDirP
+tEntry  := newS or newL ? close : tEntP
+tRisk   := newS ? sRisk : newL ? lRisk : tRskP
+tTgtFix := newS ? sTgt : newL ? lTgt : tTgtP
+tTier   := newS ? (sAplus ? 1 : 2) : newL ? (lAplus ? 1 : 2) : tTieP
+tStop   := newS ? sStopPx : newL ? lStopPx :
+     moveToBE and tDirP == -1 and low  <= tEntP - tRskP ? math.min(tStpP, tEntP) :
+     moveToBE and tDirP ==  1 and high >= tEntP + tRskP ? math.max(tStpP, tEntP) : tStpP
+tCount  := dayCount + (newS or newL ? 1 : 0)
+
+// ---------------------------------------------------------------- stats per grade
+isWin  = exitNow and exitR >  0.1
+isLoss = exitNow and exitR < -0.1
+exA    = exitNow and tTieP == 1
+exB    = exitNow and tTieP == 2
+var int   cntA   = 0
+var int   winA   = 0
+var int   lossA  = 0
+var float sumRA  = 0.0
+var int   cntB   = 0
+var int   winB   = 0
+var int   lossB  = 0
+var float sumRB  = 0.0
+var int   nConf  = 0
+var int   nHoldF = 0
+cntA   += exA ? 1 : 0
+winA   += exA and isWin ? 1 : 0
+lossA  += exA and isLoss ? 1 : 0
+sumRA  += exA ? exitR : 0.0
+cntB   += exB ? 1 : 0
+winB   += exB and isWin ? 1 : 0
+lossB  += exB and isLoss ? 1 : 0
+sumRB  += exB ? exitR : 0.0
+nConf  += startS or startL ? 1 : 0
+nHoldF += holdFailS or holdFailL ? 1 : 0
+
+// ---------------------------------------------------------------- level plots
+plot(showLevels and useSessionLevels and rth and pdh < BIG  ? pdh : na, "PDH", cPD, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useSessionLevels and rth and pdl > -BIG ? pdl : na, "PDL", cPD, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useSessionLevels and rth and onH < BIG  ? onH : na, "ONH", cON, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useSessionLevels and rth and onL > -BIG ? onL : na, "ONL", cON, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useAsiaLondon and ashA and asH < BIG  ? asH : na, "Asia H",   cAsia,   style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useAsiaLondon and aslA and asL > -BIG ? asL : na, "Asia L",   cAsia,   style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useAsiaLondon and lnhA and lnH < BIG  ? lnH : na, "London H", cLondon, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showLevels and useAsiaLondon and lnlA and lnL > -BIG ? lnL : na, "London L", cLondon, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+swOn = showLevels and showSwingLines and useSwingLevels
+plot(swOn and ph1A and ph1 < BIG  ? ph1 : na, "Swing H1", cSwing, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(swOn and ph2A and ph2 < BIG  ? ph2 : na, "Swing H2", cSwing, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(swOn and pl1A and pl1 > -BIG ? pl1 : na, "Swing L1", cSwing, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(swOn and pl2A and pl2 > -BIG ? pl2 : na, "Swing L2", cSwing, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showEMA ? ema : na, "EMA", cEMA, display = display.pane)
+
+// ---------------------------------------------------------------- developing sweeps (gray until confirmed)
+// A sweep is "developing" from the raid until it confirms + holds, or fails.
+devS    = sState == 1 or sState == 2 or pDir == -1
+devL    = lState == 1 or lState == 2 or pDir ==  1
+devSExt = pDir == -1 ? pExt : sExt
+devSLvl = pDir == -1 ? pLvl : sIn
+devLExt = pDir ==  1 ? pExt : lExt
+devLLvl = pDir ==  1 ? pLvl : lIn
+plot(showDevZone and devS and devSExt > 0   ? devSExt : na, "Dev ext S", cNeutral, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showDevZone and devS and devSLvl < BIG ? devSLvl : na, "Dev lvl S", cNeutral, style = plot.style_linebr, display = display.pane)
+plot(showDevZone and devL and devLExt < BIG ? devLExt : na, "Dev ext L", cNeutral, style = plot.style_linebr, linestyle = plot.linestyle_dashed, display = display.pane)
+plot(showDevZone and devL and devLLvl > 0   ? devLLvl : na, "Dev lvl L", cNeutral, style = plot.style_linebr, display = display.pane)
+
+// R tag on the raid bar: gray while developing, then red/green if the sweep was traded or
+// marked, deleted if it was skipped / failed. Same outcome order as the thinkScript fold:
+// 1 traded, 5 marked confirm, 2 confirmed but not marked, 3 failed (new raid or no longer developing).
+var label rLblS = na
+var label rLblL = na
+var int   rAgeS = 0
+var int   rAgeL = 0
+outNow(bool newX, bool shX, bool anyConf, bool raidX, bool devX, bool first) =>
+    newX ? 1 : shX ? 5 : anyConf ? 2 : not first and raidX ? 3 : not first and not devX ? 3 : 0
+resolveR(label lbl, int out, color c) =>
+    if not na(lbl)
+        if out == 1 or out == 5
+            label.set_color(lbl, c)
+        else if out != 0
+            label.delete(lbl)
+    out != 0
+
+if not na(rLblS)
+    rAgeS += 1
+    if rAgeS >= devLookahead
+        label.delete(rLblS)
+        rLblS := na
+    else if resolveR(rLblS, outNow(newS, shS, readyS or holdFailS or candS, raidUp, devS, false), cShort)
+        rLblS := na
+if not na(rLblL)
+    rAgeL += 1
+    if rAgeL >= devLookahead
+        label.delete(rLblL)
+        rLblL := na
+    else if resolveR(rLblL, outNow(newL, shL, readyL or holdFailL or candL, raidDn, devL, false), cLong)
+        rLblL := na
+if showDeveloping and raidUp
+    rLblS := label.new(bar_index, high, "R", color = cNeutral, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+    rAgeS := 0
+    if resolveR(rLblS, outNow(newS, shS, readyS or holdFailS or candS, raidUp, devS, true), cShort)
+        rLblS := na
+if showDeveloping and raidDn
+    rLblL := label.new(bar_index, low, "R", color = cNeutral, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+    rAgeL := 0
+    if resolveR(rLblL, outNow(newL, shL, readyL or holdFailL or candL, raidDn, devL, true), cLong)
+        rLblL := na
+
+// ---------------------------------------------------------------- raid / signal markers
+plotshape(showRaids and raidUp, "Raid high", shape.triangleup,   location.abovebar, cRaid, size = size.tiny)
+plotshape(showRaids and raidDn, "Raid low",  shape.triangledown, location.belowbar, cRaid, size = size.tiny)
+
+// ---- sweep CONFIRMED (structure shift done) - shown on every confirmation, in or out of the window
+plotshape(showConfirms and shS and cfAS,     "Confirm short A+", shape.arrowdown, location.abovebar, cShort,  text = "S", size = size.normal)
+plotshape(showConfirms and shS and not cfAS, "Confirm short B",  shape.arrowdown, location.abovebar, cShortB, text = "S", size = size.normal)
+plotshape(showConfirms and shL and cfAL,     "Confirm long A+",  shape.arrowup,   location.belowbar, cLong,   text = "S", size = size.normal)
+plotshape(showConfirms and shL and not cfAL, "Confirm long B",   shape.arrowup,   location.belowbar, cLongB,  text = "S", size = size.normal)
+
+// confirmed sweeps that were not traded, with the reason
+sIgnored = candS and inWin and not flatNow   // already in a trade
+lIgnored = candL and inWin and not flatNow
+sSkip = showFiltered and ((readyS and sWhy != 0) or holdFailS)
+lSkip = showFiltered and ((readyL and lWhy != 0) or holdFailL)
+plotshape(sSkip, "Short skipped", shape.arrowdown, location.abovebar, cNeutral)
+plotshape(lSkip, "Long skipped",  shape.arrowup,   location.belowbar, cNeutral)
+skipWhy(bool fail, bool ignored, int why, float dist, float rr, string sgn) =>
+    fail ? "failed hold" : ignored ? "in trade" :
+     why == 1 ? "B, ext " + sgn + str.tostring(dist, "#.#") + "x" :
+     why == 2 ? "RR " + str.tostring(rr, "#.#") :
+     why == 3 ? "stop wide" : "window / max per day"
+if sSkip
+    label.new(bar_index, high, "skip: " + skipWhy(holdFailS, sIgnored, sWhy, eDistS, sRRema, "+"), color = cNeutral, textcolor = color.white, style = label.style_label_down, size = size.small)
+if lSkip
+    label.new(bar_index, low, "skip: " + skipWhy(holdFailL, lIgnored, lWhy, eDistL, lRRema, ""), color = cNeutral, textcolor = color.white, style = label.style_label_up, size = size.small)
+
+// ---- entries
+plotshape(newS, "Entry short", shape.labeldown, location.abovebar, sAplus ? cShort : cShortB, text = "E", textcolor = color.white, size = size.tiny)
+plotshape(newL, "Entry long",  shape.labelup,   location.belowbar, lAplus ? cLong  : cLongB,  text = "E", textcolor = color.white, size = size.tiny)
+
+// ---------------------------------------------------------------- trade lines + exits
+inTrade = showTradeLines and tDir != 0
+plot(inTrade ? tEntry : na, "Entry",  cEntry,  style = plot.style_linebr, display = display.pane)
+plot(inTrade ? tStop  : na, "Stop",   cStop,   style = plot.style_linebr, display = display.pane)
+plot(inTrade ? (tTier == 1 and liveTgt ? emaRef : tTgtFix) : na, "Target", cTarget, 2, plot.style_linebr, display = display.pane)
+
+exitTxt = (exitR > 0 ? "+" : "") + str.tostring(exitR, "#.#") + "R"
+exitCol = isWin ? cLong : isLoss ? cShort : cNeutral
+if showTradeLines and exitNow and tDirP == -1
+    label.new(bar_index, low, exitTxt, color = exitCol, textcolor = color.white, style = label.style_label_up, size = size.small)
+if showTradeLines and exitNow and tDirP == 1
+    label.new(bar_index, high, exitTxt, color = exitCol, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// ---------------------------------------------------------------- last sweep (one label)
+var int   lsDir  = 0
+var float lsPx   = 0.0
+var float lsStop = 0.0
+var bool  lsA    = false
+var int   lsType = 0
+var float lsDist = 0.0
+var int   lsStat = 0   // 0 holding, 1 traded, 2 outside window, 3 failed hold, 4 skipped by filter, 5 in a trade already
+if shS or shL
+    lsDir  := shS ? -1 : 1
+    lsPx   := close
+    lsStop := shS ? cSExt + stopBufferTicks * tick : cLExt - stopBufferTicks * tick
+    lsA    := shS ? cfAS : cfAL
+    lsType := shS ? sType : lType
+    lsDist := shS ? cSDist : cLDist
+lsStat := shS or shL ? (not inWin ? 2 : not flatNow ? 5 : 0) :
+     newS or newL ? 1 : holdFailS or holdFailL ? 3 : readyS or readyL ? 4 : lsStat
+
+bit(int v, int b) => math.floor(v / b) % 2 == 1
+
+// ---------------------------------------------------------------- labels (table)
+var table panel = table.new(position.top_right, 1, 8, border_width = 1)
+cell(int row, bool show, string txt, color c) =>
+    if show
+        table.cell(panel, 0, row, txt, bgcolor = c, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    else
+        table.cell(panel, 0, row, "")
+
+if barstate.islast
+    longLs = lsDir == 1
+    lsTxt = "LAST SWEEP: " + (longLs ? "LONG " : "SHORT ") + (lsA ? "A+ " : "B ") +
+         (bit(lsType, 1)  ? (longLs ? "PDL " : "PDH ") : "") + (bit(lsType, 2)  ? (longLs ? "ONL " : "ONH ") : "") +
+         (bit(lsType, 16) ? (longLs ? "AsL " : "AsH ") : "") + (bit(lsType, 32) ? (longLs ? "LnL " : "LnH ") : "") +
+         (bit(lsType, 4) or bit(lsType, 8) ? "Swing " : "") +
+         "@ " + str.tostring(lsPx, format.mintick) + " | stop " + str.tostring(lsStop, format.mintick) + " | " + str.tostring(lsDist, "#.#") + "x | " +
+         (lsStat == 1 ? "TRADED" : lsStat == 2 ? "outside window" : lsStat == 3 ? "failed hold" : lsStat == 4 ? "skipped" : lsStat == 5 ? "already in a trade" : "holding...")
+    lsCol = longLs ? (lsA ? cLong : cLongB) : (lsA ? cShort : cShortB)
+    cell(0, showLastSweep and lsDir != 0, lsTxt, lsCol)
+    cell(1, showStats and (sState == 1 or sState == 2),
+         "SHORT setup: " + (sState == 1 ? "highs swept, needs close < " + str.tostring(sIn, format.mintick) : "reclaimed, needs close < " + str.tostring(math.min(sMss, sIn), format.mintick)), cShort)
+    cell(2, showStats and (lState == 1 or lState == 2),
+         "LONG setup: " + (lState == 1 ? "lows swept, needs close > " + str.tostring(lIn, format.mintick) : "reclaimed, needs close > " + str.tostring(math.max(lMss, lIn), format.mintick)), cLong)
+    cell(3, showStats and pDir != 0,
+         (pDir == -1 ? "SHORT" : "LONG") + " confirmed - holding " + str.tostring(pBars) + "/" + str.tostring(holdBars) +
+         ", cancel on close " + (pDir == -1 ? "> " : "< ") + str.tostring(pLvl, format.mintick), pDir == -1 ? cShortB : cLongB)
+    cell(4, showStats and tDir != 0,
+         (tDir == 1 ? "IN LONG " : "IN SHORT ") + (tTier == 1 ? "A+ " : "B ") + str.tostring(tEntry, format.mintick) + "  stop " + str.tostring(tStop, format.mintick) +
+         "  tgt " + str.tostring(tTier == 1 and liveTgt ? emaRef : tTgtFix, format.mintick), tDir == 1 ? cLong : cShort)
+    cell(5, showStats,
+         "A+: " + str.tostring(cntA) + " tr | W " + str.tostring(winA) + " L " + str.tostring(lossA) + " | " + str.tostring(cntA > 0 ? math.round(100.0 * winA / cntA) : 0) + "% | " + str.tostring(sumRA, "#.#") + "R",
+         sumRA > 0 ? cLong : sumRA < 0 ? cShort : cNeutral)
+    cell(6, showStats,
+         "B: " + str.tostring(cntB) + " tr | W " + str.tostring(winB) + " L " + str.tostring(lossB) + " | " + str.tostring(cntB > 0 ? math.round(100.0 * winB / cntB) : 0) + "% | " + str.tostring(sumRB, "#.#") + "R",
+         sumRB > 0 ? cLongB : sumRB < 0 ? cShort : cNeutral)
+    cell(7, showStats, "Confirmed in window: " + str.tostring(nConf) + " | failed hold: " + str.tostring(nHoldF), cNeutral)
+
+// ---------------------------------------------------------------- alerts
+if alertsOn and newS and sAplus
+    alert("SWEEP SHORT A+ - target EMA" + str.tostring(emaLength), alert.freq_once_per_bar)
+if alertsOn and newL and lAplus
+    alert("SWEEP LONG A+ - target EMA" + str.tostring(emaLength), alert.freq_once_per_bar)
+if alertsOn and newS and not sAplus
+    alert("SWEEP SHORT B - target " + str.tostring(targetR) + "R", alert.freq_once_per_bar)
+if alertsOn and newL and not lAplus
+    alert("SWEEP LONG B - target " + str.tostring(targetR) + "R", alert.freq_once_per_bar)
+if alertOnRaid and raidUp
+    alert("Highs raided - watching for reclaim", alert.freq_once_per_bar)
+if alertOnRaid and raidDn
+    alert("Lows raided - watching for reclaim", alert.freq_once_per_bar)
+
+alertcondition(newS and sAplus,     "Sweep short A+", "SWEEP SHORT A+ - target EMA")
+alertcondition(newL and lAplus,     "Sweep long A+",  "SWEEP LONG A+ - target EMA")
+alertcondition(newS and not sAplus, "Sweep short B",  "SWEEP SHORT B - target R multiple")
+alertcondition(newL and not lAplus, "Sweep long B",   "SWEEP LONG B - target R multiple")
+alertcondition(raidUp, "Highs raided", "Highs raided - watching for reclaim")
+alertcondition(raidDn, "Lows raided",  "Lows raided - watching for reclaim")
