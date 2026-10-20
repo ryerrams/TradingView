@@ -34,7 +34,7 @@ indicator("Liquidity Sweep Reversion", shorttitle = "LSR", overlay = true, max_l
 //  - The thinkScript "R" bubble looks ahead with a fold. Pine cannot read future bars,
 //    so the R label is drawn gray on the raid bar and recolored (or deleted) on the
 //    bar where the sweep resolves. Same end result on history.
-//  - AddLabel rows are drawn in a table (default bottom right; see "Panel position").
+//  - AddLabel rows are drawn in a table, stacked under the other top-right panels.
 //  - Alerts: use "Any alert() function call", or pick one of the alertcondition()s.
 // Needs extended-hours bars ON for ONH/ONL. Times are ET.
 // ============================================================================
@@ -99,7 +99,10 @@ showTradeLines = input.bool(true,  "Trade lines + exit R", group = G_VIS)
 showEMA        = input.bool(false, "Show EMA", group = G_VIS)
 showStats      = input.bool(false, "Backtest stats (A+ / B)", group = G_VIS)
 showLastSweep  = input.bool(true,  "Last sweep label", group = G_VIS)
-panelPos       = input.string("Bottom Right", "Panel position", options = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_VIS, tooltip = "Bottom Right keeps clear of Daily Bias Chop Gate (top left), Soma ICT / ATR Stretch (top right) and Soma Trendrun (bottom left)")
+lastSweepMins  = input.int(180, "Hide last sweep after (minutes)", minval = 0, group = G_VIS, tooltip = "The label disappears this long after the sweep confirmed, unless that sweep is still holding or its trade is still open. 0 = never hide.")
+panelPos       = input.string("Top Right", "Panel position", options = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_VIS)
+panelSizeIn    = input.string("Large", "Panel text size", options = ["Small", "Normal", "Large"], group = G_VIS)
+stackLines     = input.int(10, "Stack below (text lines)", minval = 0, maxval = 40, group = G_VIS, tooltip = "Top positions: leave this many lines of small text above the panel, so it sits under the other top-right panels (Soma ICT + ATR Stretch 'Px vs 28EMA') with a gap. Raise it if they still overlap, lower it to move the panel up.")
 alertsOn       = input.bool(true,  "Entry alerts", group = G_VIS)
 alertOnRaid    = input.bool(false, "Raid alerts", group = G_VIS)
 
@@ -652,6 +655,7 @@ var float lsStop = 0.0
 var bool  lsA    = false
 var int   lsType = 0
 var float lsDist = 0.0
+var int   lsTime = 0
 var int   lsStat = 0   // 0 holding, 1 traded, 2 outside window, 3 failed hold, 4 skipped by filter, 5 in a trade already
 if shS or shL
     lsDir  := shS ? -1 : 1
@@ -660,6 +664,7 @@ if shS or shL
     lsA    := shS ? cfAS : cfAL
     lsType := shS ? sType : lType
     lsDist := shS ? cSDist : cLDist
+    lsTime := time_close
 lsStat := shS or shL ? (not inWin ? 2 : not flatNow ? 5 : 0) :
      newS or newL ? 1 : holdFailS or holdFailL ? 3 : readyS or readyL ? 4 : lsStat
 
@@ -673,12 +678,15 @@ tblPos = switch panelPos
     "Bottom Left"   => position.bottom_left
     "Bottom Center" => position.bottom_center
     => position.bottom_right
-var table panel = table.new(tblPos, 1, 8, border_width = 1)
+panelTop  = str.startswith(panelPos, "Top")
+panelSize = panelSizeIn == "Small" ? size.small : panelSizeIn == "Normal" ? size.normal : size.large
+// row 0: transparent spacer (top positions) so the panel stacks under the other top-right panels
+var table panel = table.new(tblPos, 1, 9, border_width = 1)
 cell(int row, bool show, string txt, color c) =>
     if show
-        table.cell(panel, 0, row, txt, bgcolor = c, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+        table.cell(panel, 0, row + 1, txt, bgcolor = c, text_color = color.white, text_size = panelSize, text_halign = text.align_left)
     else
-        table.cell(panel, 0, row, "")
+        table.cell(panel, 0, row + 1, "")
 
 if barstate.islast
     longLs = lsDir == 1
@@ -688,8 +696,20 @@ if barstate.islast
          (bit(lsType, 4) or bit(lsType, 8) ? "Swing " : "") +
          "@ " + str.tostring(lsPx, format.mintick) + " | stop " + str.tostring(lsStop, format.mintick) + " | " + str.tostring(lsDist, "#.#") + "x | " +
          (lsStat == 1 ? "TRADED" : lsStat == 2 ? "outside window" : lsStat == 3 ? "failed hold" : lsStat == 4 ? "skipped" : lsStat == 5 ? "already in a trade" : "holding...")
+    lsAgeMin = math.floor((timenow - lsTime) / 60000)
+    lsAgeTxt = lsAgeMin < 60 ? str.tostring(lsAgeMin) + "m ago" : str.tostring(math.floor(lsAgeMin / 60)) + "h " + str.tostring(lsAgeMin % 60) + "m ago"
+    lsTxt := lsTxt + " | " + str.format_time(lsTime, "HH:mm", TZ) + " ET, " + lsAgeTxt
+    lsLive = lsStat == 0 or (lsStat == 1 and tDir != 0)
+    lsFresh = lastSweepMins == 0 or lsAgeMin <= lastSweepMins or lsLive
+    if panelTop and stackLines > 0
+        string sp = " "
+        for k = 2 to stackLines
+            sp += "\n "
+        table.cell(panel, 0, 0, sp, text_size = size.small, bgcolor = color.new(color.black, 100))
+    else
+        table.cell(panel, 0, 0, "")
     lsCol = longLs ? (lsA ? cLong : cLongB) : (lsA ? cShort : cShortB)
-    cell(0, showLastSweep and lsDir != 0, lsTxt, lsCol)
+    cell(0, showLastSweep and lsDir != 0 and lsFresh, lsTxt, lsCol)
     cell(1, showStats and (sState == 1 or sState == 2),
          "SHORT setup: " + (sState == 1 ? "highs swept, needs close < " + str.tostring(sIn, format.mintick) : "reclaimed, needs close < " + str.tostring(math.min(sMss, sIn), format.mintick)), cShort)
     cell(2, showStats and (lState == 1 or lState == 2),
