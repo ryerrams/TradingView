@@ -709,7 +709,14 @@ if barstate.islast
     else
         table.cell(panel, 0, 0, "")
     lsCol = longLs ? (lsA ? cLong : cLongB) : (lsA ? cShort : cShortB)
-    cell(0, showLastSweep and lsDir != 0 and lsFresh, lsTxt, lsCol)
+    // nothing recent: one gray status line, naming a setup that is still building
+    building = sState == 1 ? "SHORT building: needs close < " + str.tostring(sIn, format.mintick) :
+         sState == 2 ? "SHORT building: needs close < " + str.tostring(math.min(sMss, sIn), format.mintick) :
+         lState == 1 ? "LONG building: needs close > " + str.tostring(lIn, format.mintick) :
+         lState == 2 ? "LONG building: needs close > " + str.tostring(math.max(lMss, lIn), format.mintick) : ""
+    idleTxt = "SWEEP: " + (building != "" ? building : "none" + (lastSweepMins > 0 ? " in last " + str.tostring(lastSweepMins) + "m" : "") + " · watching")
+    showLs = lsDir != 0 and lsFresh
+    cell(0, showLastSweep, showLs ? lsTxt : idleTxt, showLs ? lsCol : cNeutral)
     cell(1, showStats and (sState == 1 or sState == 2),
          "SHORT setup: " + (sState == 1 ? "highs swept, needs close < " + str.tostring(sIn, format.mintick) : "reclaimed, needs close < " + str.tostring(math.min(sMss, sIn), format.mintick)), cShort)
     cell(2, showStats and (lState == 1 or lState == 2),
