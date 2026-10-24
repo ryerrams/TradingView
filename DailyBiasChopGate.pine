@@ -75,7 +75,7 @@ exitOnOppositeSignal    = input.bool(true, "exitOnOppositeSignal", group=g3, too
 exitOnReleaseFail       = input.bool(true, "exitOnReleaseFail", group=g3, tooltip="close back through the chop box the trade broke out of")
 showPointsAtChopWarning = input.bool(false, "showPointsAtChopWarning", group=g3, tooltip="add the open points to each CHOP: EXIT? bubble (if exited here)")
 showChopBox             = input.bool(true, "showChopBox", group=g3)
-showStrongPanel         = input.bool(true, "showStrongPanel", group=g3)
+showStrongPanel         = input.bool(false, "showStrongPanel", group=g3)
 chopLookbackBars        = input.int(20, "chopLookbackBars", group=g3)
 chopRankBars            = input.int(300, "chopRankBars", maxval=300, group=g3, tooltip="max 300")
 chopAtrPeriod           = input.int(14, "chopAtrPeriod", group=g3)
@@ -106,10 +106,13 @@ gS = "Symbols"
 activeOn = input.string("NQ, MNQ", "Active On (symbol roots)", group=gS, tooltip="Comma-separated symbol roots where this indicator runs. NQ covers NQ1! and every NQ contract month, MNQ the same for micros. The point inputs (zone buffer, stall rebound, fixed tolerance) are NQ-sized, so other markets need them rescaled. Empty = run everywhere.")
 
 g5 = "Display"
-showPriorDayValueArea = input.bool(true, "showPriorDayValueArea", group=g5)
-showDiagnostics       = input.bool(true, "showDiagnostics", group=g5)
-showDebug             = input.bool(true, "showDebug", group=g5)
+showPriorDayValueArea = input.bool(true, "showPriorDayValueArea", group=g5, tooltip="Prior day VAL / VAH. Drawn flat for each day and broken at the day roll, so there are no vertical jumps (the thinkScript draws a continuous stepped line).")
+showDiagnostics       = input.bool(false, "showDiagnostics", group=g5)
+showDebug             = input.bool(false, "showDebug", group=g5)
 showDayLowHighLines   = input.bool(false, "showDayLowHighLines — not in thinkScript", group=g5, tooltip="The red stepped DayLow / DayHigh lines that hug the lows and highs of the day's candles. Off by default (same as the Daily Bias indicator). The green / red tolerance bands (showZones) still hang off the day low / high.")
+showLevelTags         = input.bool(true, "showLevelTags — not in thinkScript", group=g5, tooltip="Name + price tags for today's dVAH / dPOC / dVAL and the prior day's pVAH / pPOC / pVAL, at the right edge of the chart with a short dotted stub to each.")
+tagOffToday           = input.int(4, "Today Tag Offset (bars right of last bar) — not in thinkScript", minval=1, maxval=200, group=g5, tooltip="Right-edge columns: today +4, prior day +11, leaving room for the Soma Trendrun entry / stop tags further right. Raise these if the tags touch when you zoom out.")
+tagOffPrior           = input.int(11, "Prior Day Tag Offset (bars right of last bar) — not in thinkScript", minval=1, maxval=200, group=g5)
 profileRowTicks       = input.int(1, "Profile Row Size (ticks) — not in thinkScript", minval=1, maxval=100, group=g5, tooltip="thinkScript uses one tick per row (pricePerRow = TICKSIZE). Raise it only if the script gets slow on very wide-range charts.")
 
 // ── Symbol + timeframe gate: only the listed symbols, on intraday charts between the two limits; everything else draws nothing ──
@@ -805,8 +808,38 @@ pDayLow  = plot(o(lProfileDay), "DayLowBase", display=display.none)
 pDayHigh = plot(o(hProfileDay), "DayHighBase", display=display.none)
 plot(o(showDayLowHighLines ? lProfileDay : na), "DayLow", color=color.red, linewidth=2, style=plot.style_stepline)
 plot(o(showDayLowHighLines ? hProfileDay : na), "DayHigh", color=color.red, linewidth=2, style=plot.style_stepline)
-plot(o(showPriorDayValueArea ? priorDayVAL : na), "PDayVAL", color=color.orange, linewidth=2, style=plot.style_stepline)
-plot(o(showPriorDayValueArea ? priorDayVAH : na), "PDayVAH", color=color.orange, linewidth=2, style=plot.style_stepline)
+plot(o(showPriorDayValueArea and not dayCond ? priorDayVAL : na), "PDayVAL", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(o(showPriorDayValueArea and not dayCond ? priorDayVAH : na), "PDayVAH", color=color.orange, linewidth=2, style=plot.style_linebr)
+
+// Level tags at the right edge, between the last bar and the Soma Trendrun entry / stop tags: today's dVAH / dPOC / dVAL and
+// the prior day's pVAH / pPOC / pVAL, each with a short dotted stub running to its tag (same columns as the Daily Bias indicator)
+var array<label> tagLbls = array.new<label>()
+var array<line>  tagLns  = array.new<line>()
+f_tag(float y, string nm, color c, int off) =>
+    if not na(y)
+        array.push(tagLns, line.new(bar_index - 8, y, bar_index + off - 1, y, color=color.new(c, 30), style=line.style_dotted, width=1))
+        array.push(tagLbls, label.new(bar_index + off, y, nm + " " + fmt(y), style=label.style_label_left, color=color.new(#0B0E11, 20), textcolor=c, size=size.small))
+if barstate.islast
+    for l in tagLbls
+        label.delete(l)
+    for k in tagLns
+        line.delete(k)
+    array.clear(tagLbls)
+    array.clear(tagLns)
+    if isActive and showLevelTags
+        float tagVah = na
+        float tagVal = na
+        if dayHist.size() > 0 and not na(dayPocIdx)
+            [tvahI, tvalI] = valueArea(dayHist, dayPocIdx, vaPct)
+            tagVah := tvahI * rowSize
+            tagVal := tvalI * rowSize
+        f_tag(tagVah, "dVAH", #4DD0E1, tagOffToday)
+        f_tag(dayPOC, "dPOC", color.yellow, tagOffToday)
+        f_tag(tagVal, "dVAL", #4DD0E1, tagOffToday)
+        f_tag(poc1, "pPOC", color.yellow, tagOffPrior)
+        if showPriorDayValueArea
+            f_tag(priorDayVAH, "pVAH", color.orange, tagOffPrior)
+            f_tag(priorDayVAL, "pVAL", color.orange, tagOffPrior)
 
 pLongZoneTop    = plot(o(confOn and showZones ? lProfileDay + tol : na), "LongZoneTop", display=display.none)
 pShortZoneBottom = plot(o(confOn and showZones ? hProfileDay - tol : na), "ShortZoneBottom", display=display.none)
@@ -875,14 +908,18 @@ if alertsOn and confOn and shortSignal
     alert("Hourly Confluence SHORT", alert.freq_once_per_bar)
 
 // ── Labels (thinkScript AddLabel) as one table, same order: strong panel, diagnostics, debug ──
-var table panel = table.new(position.top_left, 1, 24, bgcolor=color.new(#161A22, 8), frame_color=color.new(#2A2E39, 0), frame_width=1)
-if barstate.islast and not isActive
+// The table is rebuilt on the last bar with exactly the rows that are switched on, so turning every panel off leaves no empty dark box
+var table panel = na
+int nRows = not isActive ? 1 : (showStrongPanel ? 3 : 0) + (showDiagnostics ? 10 : 0) + (showDebug ? 2 : 0)
+if barstate.islast
+    if not na(panel)
+        table.delete(panel)
+    panel := nRows > 0 ? table.new(position.top_left, 1, nRows, bgcolor=color.new(#161A22, 8), frame_color=color.new(#2A2E39, 0), frame_width=1) : na
+if barstate.islast and not isActive and not na(panel)
     string tfMsg = not symOk ? "DBCG is off on " + syminfo.root + ": it runs on " + activeOn + " only. Change Active On under Symbols."
          : "DBCG is off on this chart (" + timeframe.period + "): it paints on " + str.tostring(minTfMinutes) + "-" + str.tostring(maxTfMinutes) + " minute charts. Change the limits under Timeframes."
     table.cell(panel, 0, 0, tfMsg, text_color=color.gray, text_size=size.small, text_halign=text.align_left)
-    for i = 1 to 23
-        table.cell(panel, 0, i, "")
-if barstate.islast and isActive
+if barstate.islast and isActive and not na(panel)
     int r = 0
     if showStrongPanel
         string chopTxt = "Chop: " + (not chScored ? "warming up" : chInChop ? "CHOP (signals held)" : chInCand ? "breaking " + (chopCode > 0 ? "up" : "down") : chWarn ? "warning" : "normal") + "  score " + str.tostring(chScore, "#")
@@ -923,7 +960,4 @@ if barstate.islast and isActive
         table.cell(panel, 0, r, "DBG code " + str.tostring(chopCode) + " pos " + str.tostring(strongPos) + " lastPair " + str.tostring(lastPair) + " sigL " + str.tostring(sigLBar) + " sigS " + str.tostring(sigSBar) + " relL " + str.tostring(relLBar) + " relS " + str.tostring(relSBar), text_color=#D3D3D3, text_size=size.small, text_halign=text.align_left)
         r += 1
         table.cell(panel, 0, r, "DBG held " + str.tostring(heldNow) + " evL " + str.tostring(evLong) + " evS " + str.tostring(evShort) + " atr " + fmt(chAtr) + " step " + fmt(stackStep) + " t1 " + str.tostring(t1) + " b1 " + str.tostring(b1) + " trades " + str.tostring(strongTrades) + " heldCnt " + str.tostring(heldCount), text_color=#D3D3D3, text_size=size.small, text_halign=text.align_left)
-        r += 1
-    while r < 24
-        table.cell(panel, 0, r, "")
         r += 1
